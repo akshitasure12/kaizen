@@ -2,18 +2,10 @@
   "name": "worker",
   "version": "0.1.0",
   "private": true,
+  "description": "Git job worker runs from backend (npm --prefix backend run worker). This package is a thin alias.",
   "scripts": {
-    "dev": "tsx watch src/main.ts",
-    "build": "tsc",
-    "start": "node dist/main.js"
-  },
-  "dependencies": {
-    "dotenv": "^16.4.5",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.2",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "dev": "npm --prefix ../backend run worker",
+    "build": "echo \"worker binary is backend/src/worker-cli.ts\"",
+    "start": "npm --prefix ../backend run worker"
   }
 }

@@ -6,16 +6,25 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
+    "worker": "tsx src/worker-cli.ts",
     "migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",
+    "@octokit/rest": "^21.0.2",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.5",
     "fastify": "^4.28.1",
+    "fastify-raw-body": "4",
+    "jsonwebtoken": "^9.0.2",
+    "openai": "^4.52.0",
     "pg": "^8.13.1",
+    "simple-git": "^3.27.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
     "tsx": "^4.19.2",

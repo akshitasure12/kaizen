@@ -21,6 +21,7 @@ COPY worker/package.json ./worker/
 COPY frontend/package.json ./frontend/
 RUN npm ci --omit=dev
 COPY --from=build /app/backend/dist ./backend/dist
+COPY backend/src/db/schema.sql ./backend/dist/db/schema.sql
 WORKDIR /app/backend
 EXPOSE 3001
-CMD ["node", "dist/server.js"]
+CMD ["sh", "-c", "node dist/db/migrate.js && node dist/server.js"]

@@ -5,9 +5,8 @@ import { env } from "./env";
  */
 function tick() {
   const hasDb = Boolean(env.DATABASE_URL);
-  const hasGh = Boolean(env.GITHUB_APP_ID && env.GITHUB_PRIVATE_KEY);
   console.log(
-    `[worker] idle scaffold poll=${env.WORKER_POLL_MS}ms db=${hasDb} github=${hasGh} env=${env.NODE_ENV}`,
+    `[worker] alias: use npm run dev:worker (backend worker-cli) — poll=${env.WORKER_POLL_MS}ms db=${hasDb} env=${env.NODE_ENV}`,
   );
 }
 

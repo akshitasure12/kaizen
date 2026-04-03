@@ -11,8 +11,6 @@ const envSchema = z.object({
   DATABASE_URL: z.string().url().optional(),
   WORKER_POLL_MS: z.coerce.number().int().positive().default(5000),
   OPENAI_API_KEY: z.string().optional(),
-  GITHUB_APP_ID: z.string().optional(),
-  GITHUB_PRIVATE_KEY: z.string().optional(),
 });
 
 export type WorkerEnv = z.infer<typeof envSchema>;

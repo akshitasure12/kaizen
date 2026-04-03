@@ -18,13 +18,12 @@ const envSchema = z.object({
   DATABASE_URL: z.string().url().optional(),
   JWT_SECRET: z.string().min(1).optional(),
   OPENAI_API_KEY: z.string().optional(),
-  GITHUB_APP_ID: z.string().optional(),
-  GITHUB_CLIENT_ID: z.string().optional(),
-  GITHUB_CLIENT_SECRET: z.string().optional(),
   GITHUB_WEBHOOK_SECRET: z.string().optional(),
-  GITHUB_PRIVATE_KEY: z.string().optional(),
   CORS_ORIGIN: z.string().default("*"),
   INTERNAL_SERVICE_SECRET: z.string().optional(),
+  JWT_EXPIRES_IN: z.string().optional(),
+  GIT_TMP_ROOT: z.string().optional(),
+  WORKER_POLL_MS: z.coerce.number().int().positive().default(5000),
 });
 
 export type AppEnv = z.infer<typeof envSchema>;

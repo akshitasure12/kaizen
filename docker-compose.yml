@@ -26,7 +26,7 @@ services:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: "3001"
-      DATABASE_URL: postgresql://kaizen:kaizen@postgres:5432/kaizen
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
       JWT_SECRET: docker-compose-dev-only-use-a-long-random-secret-32chars-min
       CORS_ORIGIN: "*"
     depends_on:
@@ -40,7 +40,7 @@ services:
       dockerfile: worker/Dockerfile
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://kaizen:kaizen@postgres:5432/kaizen
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
       WORKER_POLL_MS: "10000"
     depends_on:
       postgres:

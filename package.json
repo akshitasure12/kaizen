@@ -2,18 +2,21 @@
   "name": "kaizen",
   "version": "0.1.0",
   "private": true,
-  "workspaces": ["backend", "frontend", "worker"],
+  "workspaces": [
+    "backend",
+    "frontend",
+    "worker"
+  ],
   "scripts": {
     "dev": "npm run dev:api",
     "dev:api": "npm --prefix backend run dev",
     "dev:frontend": "npm --prefix frontend run dev",
-    "dev:worker": "npm --prefix worker run dev",
-    "build": "npm --prefix backend run build && npm --prefix worker run build && npm --prefix frontend run build",
+    "dev:worker": "npm --prefix backend run worker",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
     "build:backend": "npm --prefix backend run build",
     "build:frontend": "npm --prefix frontend run build",
-    "build:worker": "npm --prefix worker run build",
     "start:api": "npm --prefix backend run start",
-    "start:worker": "npm --prefix worker run start",
+    "start:worker": "npm --prefix backend run worker",
     "start:frontend": "npm --prefix frontend run start",
     "migrate": "npm --prefix backend run migrate",
     "compose:up": "docker compose up -d postgres",
@@ -21,5 +24,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "fastify-raw-body": "^5.0.0"
   }
 }

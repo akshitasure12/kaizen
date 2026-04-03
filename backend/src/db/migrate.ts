@@ -1,9 +1,7 @@
-/**
- * Single entrypoint for DB migrations (plan Phase 4).
- * Add versioned SQL or a runner here; scaffold only verifies connectivity.
- */
-import { config as loadDotenv } from "dotenv";
+import fs from "fs";
+import path from "path";
 import pg from "pg";
+import { config as loadDotenv } from "dotenv";
 import { findRootEnvPath } from "../lib/find-root-env";
 
 const rootEnv = findRootEnvPath();
@@ -14,14 +12,16 @@ const url = process.env.DATABASE_URL;
 
 async function main() {
   if (!url) {
-    console.log("migrate: DATABASE_URL not set — nothing to do (scaffold).");
-    process.exit(0);
+    console.error("migrate: DATABASE_URL is required.");
+    process.exit(1);
   }
+  const schemaPath = path.join(__dirname, "schema.sql");
+  const sql = fs.readFileSync(schemaPath, "utf-8");
   const client = new pg.Client({ connectionString: url });
   await client.connect();
   try {
-    await client.query("SELECT 1");
-    console.log("migrate: database reachable; no migration files applied yet.");
+    await client.query(sql);
+    console.log("migrate: schema.sql applied.");
   } finally {
     await client.end();
   }
