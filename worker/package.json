@@ -1,11 +1,12 @@
 {
-  "name": "worker",
+  "name": "kaizen-worker",
   "version": "0.1.0",
   "private": true,
-  "description": "Git job worker runs from backend (npm --prefix backend run worker). This package is a thin alias.",
+  "packageManager": "bun@1.2.5",
+  "description": "Git job worker runs from backend (bun run --cwd ../backend worker). This package is a thin alias.",
   "scripts": {
-    "dev": "npm --prefix ../backend run worker",
+    "dev": "bun run --cwd ../backend worker",
     "build": "echo \"worker binary is backend/src/worker-cli.ts\"",
-    "start": "npm --prefix ../backend run worker"
+    "start": "bun run --cwd ../backend worker"
   }
 }
