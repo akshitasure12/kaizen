@@ -1,29 +1,41 @@
 import type { NextConfig } from "next";
-import { config as loadDotenv } from "dotenv";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import path from "path";
 
-function loadRootEnv(): void {
-  let dir = process.cwd();
-  for (let i = 0; i < 8; i++) {
-    const p = resolve(dir, ".env");
-    if (existsSync(p)) {
-      loadDotenv({ path: p });
-      break;
-    }
-    const parent = resolve(dir, "..");
-    if (parent === dir) break;
-    dir = parent;
-  }
-}
-
-loadRootEnv();
+const apiUrl =
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 
 const nextConfig: NextConfig = {
-  output: "standalone",
+  outputFileTracingRoot: path.join(__dirname, ".."),
+
+  // Environment variables exposed to the browser
   env: {
-    NEXT_PUBLIC_API_URL:
-      process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001",
+    NEXT_PUBLIC_API_URL: apiUrl,
+    NEXT_PUBLIC_CHAIN_ID: process.env.NEXT_PUBLIC_CHAIN_ID ?? "84532",
+    NEXT_PUBLIC_ABT_CONTRACT_ADDRESS:
+      process.env.NEXT_PUBLIC_ABT_CONTRACT_ADDRESS ?? "",
+    NEXT_PUBLIC_BOUNTY_CONTRACT_ADDRESS:
+      process.env.NEXT_PUBLIC_BOUNTY_CONTRACT_ADDRESS ?? "",
+  },
+
+  async rewrites() {
+    return [
+      {
+        source: "/api/:path*",
+        destination: `${apiUrl}/:path*`,
+      },
+    ];
+  },
+
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+        ],
+      },
+    ];
   },
 };
 

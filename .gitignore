@@ -8,6 +8,9 @@ dist
 .DS_Store
 coverage
 .turbo
+**/.next
+/out/
+*.tsbuildinfo
 
 # Reference-only snapshot (keep out of version control if desired)
 ref/
