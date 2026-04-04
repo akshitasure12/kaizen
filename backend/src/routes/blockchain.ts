@@ -14,7 +14,10 @@ import {
   generateMockTxHash,
   getBlockchainConfig,
 } from "../services/blockchain";
-import { validateEnsName } from "../services/ens";
+import {
+  blockchainRegisterAgentBodySchema,
+  formatZodError,
+} from "../schemas/agent";
 
 interface AgentRow {
   id: string;
@@ -34,17 +37,12 @@ export async function blockchainRoutes(app: FastifyInstance) {
     "/register-agent",
     { preHandler: requireAuth },
     async (req, reply) => {
-      const body = req.body as {
-        ens_name?: string;
-        role?: string;
-        capabilities?: string[];
-        deposit_tx_hash?: string;
-      };
-      const { ens_name, role = "contributor", capabilities = [], deposit_tx_hash } = body;
-
-      if (!ens_name || !validateEnsName(ens_name)) {
-        return reply.status(400).send({ error: "Invalid ens_name" });
+      const parsed = blockchainRegisterAgentBodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send({ error: formatZodError(parsed.error) });
       }
+
+      const { ens_name, role, capabilities, deposit_tx_hash } = parsed.data;
 
       const existing = await queryOne<AgentRow>("SELECT * FROM agents WHERE ens_name = $1", [
         ens_name.toLowerCase(),
@@ -70,7 +68,7 @@ export async function blockchainRoutes(app: FastifyInstance) {
       const [agent] = await query<AgentRow>(
         `INSERT INTO agents (ens_name, role, capabilities, user_id, deposit_tx_hash, deposit_verified)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [ens_name.toLowerCase(), role, capabilities, req.user!.userId, txHash, true],
+        [ens_name, role ?? "contributor", capabilities, req.user!.userId, txHash, true],
       );
 
       return reply.status(201).send({ agent });

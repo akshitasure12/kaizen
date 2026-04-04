@@ -12,6 +12,9 @@ import { judgeSubmission, storeJudgement, judgeAllSubmissions, Scorecard } from 
 import * as sdk from '../sdk';
 import * as bountyService from '../services/bounty';
 import { rankAgentsForIssue } from '../services/agent-assignment';
+import { enqueueGitJob } from '../services/git-job-enqueue';
+import { getGitHubLinkForRepo } from '../services/github-integration';
+import { buildResolvePlan, PlannedChildWork } from '../services/resolve-orchestration';
 
 interface Issue {
   id: string;
@@ -26,6 +29,25 @@ interface Issue {
   created_by: string;
   closed_at: string | null;
   created_at: string;
+}
+
+interface ResolvedAgent {
+  id: string;
+  ens_name: string;
+}
+
+interface IssueWithAssignedEns extends Issue {
+  assigned_agent_ens: string | null;
+}
+
+interface ChildIssueRow {
+  id: string;
+  title: string;
+  body: string;
+  status: Issue['status'];
+  scorecard: Scorecard;
+  assigned_agent_id: string | null;
+  assigned_agent_ens: string | null;
 }
 
 export async function issueRoutes(app: FastifyInstance) {
@@ -522,6 +544,300 @@ export async function issueRoutes(app: FastifyInstance) {
     return { issue_id: issue.id, suggestions };
   });
 
+  app.post('/:repoId/issues/:issueId/resolve', { preHandler: requireAuth }, async (req, reply) => {
+    const { repoId, issueId } = req.params as any;
+    const body = (req.body || {}) as {
+      mode?: 'plan_only' | 'execute';
+      agent_ens?: string;
+      base_branch?: string;
+      fanout_children?: boolean;
+      idempotency_key?: string;
+      max_attempts?: number;
+      decomposition?: {
+        children?: Array<{
+          title?: string;
+          body?: string;
+          scorecard?: unknown;
+          estimated_effort?: number;
+          agent_ens?: string;
+        }>;
+      };
+    };
+
+    const mode = body.mode === 'plan_only' ? 'plan_only' : 'execute';
+
+    const issue = await queryOne<IssueWithAssignedEns>(
+      `SELECT i.*, a.ens_name as assigned_agent_ens
+       FROM issues i
+       LEFT JOIN agents a ON i.assigned_agent_id = a.id
+       WHERE i.id = $1 AND i.repo_id = $2`,
+      [issueId, repoId],
+    );
+    if (!issue) {
+      return reply.status(404).send({ error: 'Issue not found' });
+    }
+    if (issue.status === 'closed' || issue.status === 'cancelled') {
+      return reply.status(400).send({ error: 'Cannot resolve a closed/cancelled issue' });
+    }
+
+    const requestedChildren = normalizeRequestedChildren(
+      body.decomposition?.children,
+      validateScorecard(issue.scorecard),
+    );
+    if (Array.isArray(body.decomposition?.children) && body.decomposition.children.length === 1) {
+      return reply.status(400).send({ error: 'Provide at least two child specs for decomposition' });
+    }
+
+    const children = await query<ChildIssueRow>(
+      `SELECT c.id,
+              c.title,
+              c.body,
+              c.status,
+              c.scorecard,
+              c.assigned_agent_id,
+              a.ens_name as assigned_agent_ens
+       FROM issues c
+       LEFT JOIN agents a ON c.assigned_agent_id = a.id
+       WHERE c.parent_issue_id = $1
+       ORDER BY c.created_at ASC`,
+      [issueId],
+    );
+
+    const agentCache = new Map<string, ResolvedAgent>();
+    let selectedAgent: ResolvedAgent | null = null;
+
+    if (body.agent_ens && body.agent_ens.trim().length > 0) {
+      selectedAgent = await resolveAgentByEns(body.agent_ens.trim(), agentCache);
+      if (!selectedAgent) {
+        return reply.status(404).send({ error: `Agent not found: ${body.agent_ens}` });
+      }
+    } else if (issue.assigned_agent_id && issue.assigned_agent_ens) {
+      selectedAgent = {
+        id: issue.assigned_agent_id,
+        ens_name: issue.assigned_agent_ens,
+      };
+      agentCache.set(issue.assigned_agent_ens.toLowerCase(), selectedAgent);
+    } else {
+      selectedAgent = await pickTopAgentForIssue(issue.title, issue.body || '');
+      if (selectedAgent) {
+        agentCache.set(selectedAgent.ens_name.toLowerCase(), selectedAgent);
+      }
+    }
+
+    const plan = buildResolvePlan(
+      {
+        title: issue.title,
+        body: issue.body || '',
+        scorecard: validateScorecard(issue.scorecard),
+        existing_child_count: children.length,
+      },
+      {
+        requested_children: requestedChildren,
+        fanout_children: body.fanout_children,
+      },
+    );
+    const resolvedPlan = {
+      ...plan,
+      suggested_agent_ens: selectedAgent?.ens_name || null,
+    };
+
+    if (mode === 'plan_only') {
+      return {
+        mode,
+        issue_id: issue.id,
+        plan: resolvedPlan,
+      };
+    }
+
+    const link = await getGitHubLinkForRepo(repoId);
+    if (!link) {
+      return reply.status(400).send({
+        error: 'Repository is not linked to a GitHub App installation. Use POST /integrations/github/link first.',
+      });
+    }
+
+    const baseBranch = body.base_branch?.trim() || link.default_branch || 'main';
+    const maxAttempts = body.max_attempts && body.max_attempts > 0 ? body.max_attempts : undefined;
+
+    if (resolvedPlan.path === 'single_agent') {
+      if (!selectedAgent) {
+        return reply.status(400).send({ error: 'No available agent found for assignment' });
+      }
+
+      await assignIssueToAgent(issue.id, selectedAgent.id);
+      const job = await enqueueGitJob({
+        issue_id: issue.id,
+        repo_id: repoId,
+        user_id: req.user!.userId,
+        agent_id: selectedAgent.id,
+        base_branch: baseBranch,
+        max_attempts: maxAttempts,
+        idempotency_key: body.idempotency_key ?? null,
+        payload: {
+          orchestration: {
+            mode: 'single_agent',
+            plan_complexity_score: resolvedPlan.complexity_score,
+          },
+        },
+      });
+
+      return reply.status(job.deduped ? 200 : 201).send({
+        mode,
+        issue_id: issue.id,
+        plan: resolvedPlan,
+        jobs: [
+          {
+            issue_id: issue.id,
+            job_id: job.id,
+            status: job.status,
+            deduped: job.deduped,
+            agent_ens: selectedAgent.ens_name,
+          },
+        ],
+      });
+    }
+
+    if (resolvedPlan.path === 'reuse_children') {
+      const jobs: Array<{ issue_id: string; job_id: string; status: string; deduped: boolean; agent_ens: string }> = [];
+
+      for (const child of children) {
+        const assigned = await pickAgentForChildIssue(child, selectedAgent, agentCache);
+        if (!assigned) {
+          return reply.status(400).send({
+            error: `No available agent found for child issue ${child.id}`,
+          });
+        }
+
+        await assignIssueToAgent(child.id, assigned.id);
+        const childKey = body.idempotency_key ? `${body.idempotency_key}:${child.id}` : null;
+        const job = await enqueueGitJob({
+          issue_id: child.id,
+          repo_id: repoId,
+          user_id: req.user!.userId,
+          agent_id: assigned.id,
+          base_branch: baseBranch,
+          max_attempts: maxAttempts,
+          idempotency_key: childKey,
+          payload: {
+            orchestration: {
+              mode: 'reuse_children',
+              parent_issue_id: issue.id,
+              plan_complexity_score: resolvedPlan.complexity_score,
+            },
+          },
+        });
+
+        jobs.push({
+          issue_id: child.id,
+          job_id: job.id,
+          status: job.status,
+          deduped: job.deduped,
+          agent_ens: assigned.ens_name,
+        });
+      }
+
+      await query(
+        `UPDATE issues
+         SET status = CASE WHEN status = 'open' THEN 'in_progress' ELSE status END
+         WHERE id = $1`,
+        [issue.id],
+      );
+
+      return reply.status(201).send({
+        mode,
+        issue_id: issue.id,
+        plan: resolvedPlan,
+        jobs,
+      });
+    }
+
+    const createdChildren: Array<{
+      issue_id: string;
+      title: string;
+      agent_ens: string;
+      job_id: string | null;
+      deduped: boolean;
+      status: string | null;
+    }> = [];
+
+    for (let i = 0; i < resolvedPlan.children.length; i += 1) {
+      const childPlan = resolvedPlan.children[i]!;
+      const [created] = await query<Issue>(
+        `INSERT INTO issues (repo_id, title, body, scorecard, created_by, parent_issue_id, root_issue_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          repoId,
+          childPlan.title,
+          childPlan.body,
+          validateScorecard(childPlan.scorecard),
+          req.user!.userId,
+          issue.id,
+          issue.root_issue_id || issue.id,
+        ],
+      );
+
+      const assigned = await pickAgentForPlannedChild(childPlan, selectedAgent, agentCache);
+      if (!assigned) {
+        return reply.status(400).send({
+          error: `No available agent found for child issue plan: ${childPlan.title}`,
+        });
+      }
+
+      await assignIssueToAgent(created.id, assigned.id);
+
+      let jobId: string | null = null;
+      let deduped = false;
+      let jobStatus: string | null = null;
+      if (resolvedPlan.fanout_children) {
+        const childKey = body.idempotency_key ? `${body.idempotency_key}:${created.id}` : null;
+        const job = await enqueueGitJob({
+          issue_id: created.id,
+          repo_id: repoId,
+          user_id: req.user!.userId,
+          agent_id: assigned.id,
+          base_branch: baseBranch,
+          max_attempts: maxAttempts,
+          idempotency_key: childKey,
+          payload: {
+            orchestration: {
+              mode: 'new_children',
+              parent_issue_id: issue.id,
+              child_index: i,
+              plan_complexity_score: resolvedPlan.complexity_score,
+            },
+          },
+        });
+        jobId = job.id;
+        deduped = job.deduped;
+        jobStatus = job.status;
+      }
+
+      createdChildren.push({
+        issue_id: created.id,
+        title: created.title,
+        agent_ens: assigned.ens_name,
+        job_id: jobId,
+        deduped,
+        status: jobStatus,
+      });
+    }
+
+    await query(
+      `UPDATE issues
+       SET status = CASE WHEN status = 'open' THEN 'in_progress' ELSE status END
+       WHERE id = $1`,
+      [issue.id],
+    );
+
+    return reply.status(201).send({
+      mode,
+      issue_id: issue.id,
+      plan: resolvedPlan,
+      created_children: createdChildren,
+    });
+  });
+
   /**
    * Close issue and trigger judge
    * 
@@ -998,6 +1314,102 @@ function allocateChildBounties(
   );
 
   return allocations;
+}
+
+function normalizeRequestedChildren(
+  rawChildren: Array<{
+    title?: string;
+    body?: string;
+    scorecard?: unknown;
+    estimated_effort?: number;
+    agent_ens?: string;
+  }> | undefined,
+  fallbackScorecard: Scorecard,
+): PlannedChildWork[] {
+  if (!Array.isArray(rawChildren)) return [];
+
+  return rawChildren
+    .filter((child) => child && typeof child.title === 'string' && child.title.trim().length > 0)
+    .map((child) => ({
+      title: child.title!.trim(),
+      body: child.body?.trim() || '',
+      estimated_effort: Math.max(1, Math.round(Number(child.estimated_effort || 1))),
+      scorecard: validateScorecard(child.scorecard ?? fallbackScorecard),
+      agent_ens: child.agent_ens?.trim() || undefined,
+    }));
+}
+
+async function resolveAgentByEns(
+  ensName: string,
+  cache: Map<string, ResolvedAgent>,
+): Promise<ResolvedAgent | null> {
+  const key = ensName.toLowerCase();
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const agent = await sdk.getAgent(ensName);
+  if (!agent) return null;
+  const resolved: ResolvedAgent = {
+    id: agent.id,
+    ens_name: agent.ens_name,
+  };
+  cache.set(key, resolved);
+  return resolved;
+}
+
+async function pickTopAgentForIssue(issueTitle: string, issueBody: string): Promise<ResolvedAgent | null> {
+  const ranked = await rankAgentsForIssue({
+    issueTitle,
+    issueBody,
+    limit: 1,
+  });
+  if (!ranked[0]) return null;
+  return {
+    id: ranked[0].id,
+    ens_name: ranked[0].ens_name,
+  };
+}
+
+async function pickAgentForChildIssue(
+  child: ChildIssueRow,
+  fallback: ResolvedAgent | null,
+  cache: Map<string, ResolvedAgent>,
+): Promise<ResolvedAgent | null> {
+  if (child.assigned_agent_id && child.assigned_agent_ens) {
+    const key = child.assigned_agent_ens.toLowerCase();
+    const existing: ResolvedAgent = {
+      id: child.assigned_agent_id,
+      ens_name: child.assigned_agent_ens,
+    };
+    cache.set(key, existing);
+    return existing;
+  }
+
+  if (fallback) return fallback;
+  return pickTopAgentForIssue(child.title, child.body || '');
+}
+
+async function pickAgentForPlannedChild(
+  childPlan: PlannedChildWork,
+  fallback: ResolvedAgent | null,
+  cache: Map<string, ResolvedAgent>,
+): Promise<ResolvedAgent | null> {
+  if (childPlan.agent_ens) {
+    const explicit = await resolveAgentByEns(childPlan.agent_ens, cache);
+    if (explicit) return explicit;
+  }
+  if (fallback) return fallback;
+  return pickTopAgentForIssue(childPlan.title, childPlan.body || '');
+}
+
+async function assignIssueToAgent(issueId: string, agentId: string): Promise<void> {
+  await query(
+    `UPDATE issues
+     SET assigned_agent_id = $1,
+         status = CASE WHEN status = 'open' THEN 'in_progress' ELSE status END
+     WHERE id = $2`,
+    [agentId, issueId],
+  );
 }
 
 async function rollupParentIssueStatus(issueId: string): Promise<void> {

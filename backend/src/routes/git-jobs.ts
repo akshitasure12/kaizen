@@ -6,7 +6,8 @@ import { FastifyInstance } from "fastify";
 import { query, queryOne } from "../db/client";
 import { env } from "../env";
 import { requireAuth } from "../middleware/auth";
-import { getGitHubLinkForRepo, getGitHubTokenForUser } from "../services/github-integration";
+import { enqueueGitJob } from "../services/git-job-enqueue";
+import { getGitHubLinkForRepo } from "../services/github-integration";
 
 function hasInternalAccess(headerValue: string | string[] | undefined): boolean {
   if (!env.INTERNAL_SERVICE_SECRET) return false;
@@ -51,13 +52,11 @@ export async function gitJobRoutes(app: FastifyInstance) {
       }
 
       const link = await getGitHubLinkForRepo(repoId);
-      const tok = await getGitHubTokenForUser(req.user!.userId);
-      if (!link || !tok) {
+      if (!link) {
         return reply
           .status(400)
           .send({
-            error:
-              "Set repository GitHub remote (PATCH /repositories/:id/github) and user PAT (PATCH /auth/github-api-key)",
+            error: "Repository is not linked to a GitHub App installation. Use POST /integrations/github/link first.",
           });
       }
 
@@ -94,48 +93,16 @@ export async function gitJobRoutes(app: FastifyInstance) {
       }
 
       const createJob = async (targetIssueId: string, targetAgentId: string, dedupeKey: string | null) => {
-        if (dedupeKey) {
-          const existing = await queryOne<{ id: string; status: string }>(
-            `SELECT id, status
-             FROM git_jobs
-             WHERE idempotency_key = $1
-             LIMIT 1`,
-            [dedupeKey],
-          );
-          if (existing) {
-            return { id: existing.id, status: existing.status, deduped: true };
-          }
-        }
-
-        const [job] = await query<{ id: string }>(
-          `INSERT INTO git_jobs (
-             issue_id,
-             repo_id,
-             user_id,
-             agent_id,
-             base_branch,
-             status,
-             stage,
-             payload,
-             max_attempts,
-             idempotency_key
-           )
-           VALUES ($1, $2, $3, $4, $5, 'pending', 'pending', $6::jsonb, $7, $8)
-           RETURNING id`,
-          [
-            targetIssueId,
-            repoId,
-            req.user!.userId,
-            targetAgentId,
-            base_branch ?? link.default_branch ?? "main",
-            JSON.stringify({}),
-            max_attempts && max_attempts > 0 ? Math.floor(max_attempts) : env.WORKER_MAX_ATTEMPTS,
-            dedupeKey,
-          ],
-        );
-
-        await query(`UPDATE issues SET git_job_id = $1 WHERE id = $2`, [job.id, targetIssueId]);
-        return { id: job.id, status: "pending", deduped: false };
+        return enqueueGitJob({
+          issue_id: targetIssueId,
+          repo_id: repoId,
+          user_id: req.user!.userId,
+          agent_id: targetAgentId,
+          base_branch: base_branch ?? link.default_branch ?? "main",
+          max_attempts: max_attempts && max_attempts > 0 ? Math.floor(max_attempts) : env.WORKER_MAX_ATTEMPTS,
+          idempotency_key: dedupeKey,
+          payload: {},
+        });
       };
 
       if (shouldFanout) {
@@ -252,10 +219,11 @@ export async function gitJobRoutes(app: FastifyInstance) {
     const body = (req.body as { branch_name?: string; github_pr_number?: number } | undefined) ?? {};
     const [row] = await query<{ id: string; status: string; stage: string }>(
       `UPDATE git_jobs
-       SET status = 'done',
+       SET status = 'completed',
            stage = 'completed',
            branch_name = COALESCE($1, branch_name),
            github_pr_number = COALESCE($2, github_pr_number),
+           lease_token = NULL,
            lease_owner = NULL,
            lease_expires_at = NULL,
            retry_after = NULL,
@@ -306,6 +274,7 @@ export async function gitJobRoutes(app: FastifyInstance) {
              THEN NOW() + (($4::bigint || ' milliseconds')::interval)
              ELSE NULL
            END,
+           lease_token = NULL,
            lease_owner = NULL,
            lease_expires_at = NULL,
            updated_at = NOW()

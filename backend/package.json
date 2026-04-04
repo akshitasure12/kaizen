@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "bun --watch src/server.ts",
     "build": "tsc",
+    "test": "vitest run",
+    "test:gemini": "vitest run tests/gemini-orchestration.test.ts tests/embeddings.test.ts tests/judge.test.ts",
     "start": "bun dist/server.js",
     "worker": "bun src/worker-cli.ts",
     "migrate": "bun src/db/migrate.ts"
@@ -29,6 +31,7 @@
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.2"
   }
 }
