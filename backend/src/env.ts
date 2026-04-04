@@ -32,6 +32,14 @@ const envSchema = z.object({
   JWT_EXPIRES_IN: z.string().optional(),
   GIT_TMP_ROOT: z.string().optional(),
   WORKER_POLL_MS: z.coerce.number().int().positive().default(5000),
+  // Base Sepolia JSON-RPC (enables on-chain agent deposit verification)
+  BASE_SEPOLIA_RPC_URL: z.string().optional(),
+  // AgentBranchToken — required for deposit verification when RPC is set
+  ABT_CONTRACT_ADDRESS: z.string().optional(),
+  // BountyPayment escrow — optional; exposed in /blockchain/config
+  BOUNTY_CONTRACT_ADDRESS: z.string().optional(),
+  // Treasury override for /blockchain/treasury when not reading from token
+  TREASURY_ADDRESS: z.string().optional(),
   WORKER_CONCURRENCY: z.coerce.number().int().positive().default(1),
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   WORKER_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),

@@ -12,7 +12,17 @@ coverage
 **/.next
 /out/
 *.tsbuildinfo
+
+# Blockchain / Foundry (contracts/ — see contracts/.gitignore for details)
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+contracts/.env
+contracts/.env.*
+!contracts/.env.example
+
 */AGENTS.md
+
 # Reference-only snapshot (keep out of version control if desired)
 ref/
 demo-ready_github_git_1c5a63f4.plan.md

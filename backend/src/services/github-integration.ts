@@ -60,3 +60,105 @@ export async function setUserGithubApiKey(userId: string, apiKey: string | null)
   const v = apiKey?.trim() || null;
   await query("UPDATE users SET github_api_key = $1 WHERE id = $2", [v, userId]);
 }
+
+/** Parsed `Link` header from GitHub pagination (e.g. rel="next"). */
+export function parseGitHubLinkHeader(linkHeader: string | null): {
+  next?: string;
+  prev?: string;
+  first?: string;
+  last?: string;
+} {
+  if (!linkHeader?.trim()) return {};
+  const out: Record<string, string> = {};
+  for (const part of linkHeader.split(",")) {
+    const section = part.trim();
+    const urlMatch = section.match(/^<([^>]+)>/);
+    const relMatch = section.match(/rel="([^"]+)"/);
+    if (urlMatch && relMatch) out[relMatch[1]] = urlMatch[1];
+  }
+  return out;
+}
+
+export interface GitHubAccessibleRepo {
+  id: number;
+  name: string;
+  full_name: string;
+  default_branch: string;
+  private: boolean;
+  html_url: string;
+}
+
+export interface GitHubUserReposPage {
+  items: GitHubAccessibleRepo[];
+  page: number;
+  per_page: number;
+  has_next: boolean;
+  has_prev: boolean;
+}
+
+/**
+ * One page of repos the token can access (`GET /user/repos`).
+ */
+export async function fetchGitHubUserReposPage(
+  accessToken: string,
+  opts: { page: number; per_page: number },
+): Promise<
+  | { ok: true; data: GitHubUserReposPage }
+  | { ok: false; status: number; githubMessage?: string }
+> {
+  const { page, per_page } = opts;
+  const url = new URL("https://api.github.com/user/repos");
+  url.searchParams.set("page", String(page));
+  url.searchParams.set("per_page", String(per_page));
+  url.searchParams.set("sort", "updated");
+
+  const res = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+
+  const link = parseGitHubLinkHeader(res.headers.get("link"));
+
+  if (!res.ok) {
+    let githubMessage: string | undefined;
+    try {
+      const j = (await res.json()) as { message?: string };
+      if (typeof j?.message === "string") githubMessage = j.message;
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, status: res.status, githubMessage };
+  }
+
+  const raw = (await res.json()) as Array<{
+    id: number;
+    name: string;
+    full_name: string;
+    default_branch: string | null;
+    private: boolean;
+    html_url?: string;
+  }>;
+
+  const items: GitHubAccessibleRepo[] = raw.map((r) => ({
+    id: r.id,
+    name: r.name,
+    full_name: r.full_name,
+    default_branch: r.default_branch?.trim() || "main",
+    private: r.private,
+    html_url: typeof r.html_url === "string" ? r.html_url : `https://github.com/${r.full_name}`,
+  }));
+
+  return {
+    ok: true,
+    data: {
+      items,
+      page,
+      per_page,
+      has_next: Boolean(link.next),
+      has_prev: Boolean(link.prev),
+    },
+  };
+}

@@ -1,0 +1,19 @@
+# Foundry — build outputs
+cache/
+out/
+
+# Broadcast logs (may include deployer addresses; review before committing)
+broadcast/
+
+# Local secrets (deploy keys, RPC URLs with API keys)
+.env
+.env.*
+!.env.example
+
+# Coverage (forge coverage / solidity-coverage)
+coverage/
+coverage.json
+lcov.info
+
+# Misc
+*.log
