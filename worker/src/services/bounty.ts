@@ -10,6 +10,7 @@ export interface IssueBounty {
   winner_agent_id: string | null;
   judge_payout_fraction?: number | null;
   github_judge_verdict?: unknown;
+  is_mock_judge?: boolean | null;
   payout_status?: string | null;
   github_pr_number?: number | null;
   merge_webhook_delivery_id?: string | null;
@@ -49,16 +50,18 @@ export async function persistGitHubJudgeOnBounty(
   bountyId: string,
   verdict: unknown,
   codeQualityScore: number,
+  isMockJudge: boolean,
 ): Promise<void> {
-  const fraction = payoutFractionFromCodeQuality(codeQualityScore);
+  const fraction = isMockJudge ? 0 : payoutFractionFromCodeQuality(codeQualityScore);
   await query(
     `UPDATE issue_bounties
      SET github_judge_verdict = $1::jsonb,
          judge_payout_fraction = $2,
+         is_mock_judge = $3,
          status = 'judging',
          payout_status = 'awaiting_merge'
-     WHERE id = $3`,
-    [verdict as object, fraction, bountyId],
+     WHERE id = $4`,
+    [verdict as object, fraction, isMockJudge, bountyId],
   );
 }
 

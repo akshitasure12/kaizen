@@ -19,6 +19,26 @@ const envSchema = z.object({
   WORKER_BASE_RETRY_MS: z.coerce.number().int().positive().default(5000),
   WORKER_MAX_RETRY_MS: z.coerce.number().int().positive().default(60000),
   WORKER_INSTANCE_ID: z.string().optional(),
+  WORKER_LOOP_MAX_CYCLES: z.coerce.number().int().min(1).max(6).default(2),
+  WORKER_COMMAND_TIMEOUT_MS: z.coerce.number().int().min(1000).max(15 * 60 * 1000).default(120000),
+  WORKER_COMMAND_MAX_LENGTH: z.coerce.number().int().min(20).max(1000).default(400),
+  WORKER_COMMAND_MAX_OUTPUT_BYTES: z.coerce.number().int().min(1024).max(256000).default(60000),
+  WORKER_TOOL_MAX_COMMANDS: z.coerce.number().int().min(1).max(20).default(6),
+  WORKER_ALLOWED_COMMANDS: z
+    .string()
+    .default("rg,sed,find,cat,ls,npm,bun,pnpm,yarn,pytest,vitest,node,python,python3,go,cargo")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((entry) => entry.trim().toLowerCase())
+        .filter((entry) => entry.length > 0),
+    ),
+  WORKER_MEMORY_COMMIT_ENABLED: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  BACKEND_API_URL: z.string().url().default("http://localhost:3001"),
+  INTERNAL_SERVICE_SECRET: z.string().optional(),
   WORKER_DRY_RUN: z.string().optional().default("false").transform((value) =>
     ["true", "1", "yes", "on"].includes(value.toLowerCase()),
   ),
@@ -53,6 +73,11 @@ export type WorkerEnv = z.infer<typeof envSchema>;
 const parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
   console.error("Invalid worker environment:", parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+if (parsed.data.WORKER_ALLOWED_COMMANDS.length === 0) {
+  console.error("Invalid worker environment: WORKER_ALLOWED_COMMANDS must include at least one command");
   process.exit(1);
 }
 

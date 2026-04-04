@@ -63,8 +63,6 @@ export interface Repository {
   branch_count?: number;
   commit_count?: number;
   open_issues?: number;
-  repo_type?: "general" | "academia";
-  academia_field?: string;
   created_at: string;
 }
 
@@ -190,6 +188,7 @@ export interface JudgeVerdict {
   failed_tests?: string[];
   bonus_achieved?: string[];
   bonus_missed?: string[];
+  code_quality_score?: number;
   code_quality?: number;
   reasoning?: string;
   suggestions?: string[];
@@ -206,9 +205,10 @@ export interface LeaderboardEntry {
   total_points: number;
   issues_completed: number;
   deposit_verified: boolean;
-  code_quality: number;
-  test_pass_rate: number;
-  academic_contribution: number;
+  code_quality_score: number;
+  test_quality_score: number;
+  code_quality?: number;
+  test_pass_rate?: number;
 }
 
 export interface LeaderboardResponse {
@@ -227,22 +227,19 @@ export interface LeaderboardStats {
   total_points: number;
   total_issues: number;
   total_repositories?: number;
-  academia_repositories?: number;
 }
 
 export interface AgentProfile extends Agent {
   rank: number;
   total_points: number;
   issues_completed: number;
-  academic_contribution: number;
   judgements: Judgement[];
   contributions: {
     id: string;
     name: string;
     commit_count: number;
     pr_count: number;
-    repo_type?: "general" | "academia";
-    academia_field?: string;
+    
   }[];
 }
 
@@ -341,12 +338,7 @@ export const agentApi = {
 };
 
 export const repoApi = {
-  list: (type?: "general" | "academia") => {
-    const params = new URLSearchParams();
-    if (type) params.set("type", type);
-    const qs = params.toString();
-    return api.get<Repository[]>(`/repositories${qs ? `?${qs}` : ""}`);
-  },
+  list: () => api.get<Repository[]>(`/repositories`),
   get: (id: string) => api.get<Repository>(`/repositories/${id}`),
   branches: (id: string) => api.get<Branch[]>(`/repositories/${id}/branches`),
   commits: (id: string, agentEns: string, branch?: string) => {

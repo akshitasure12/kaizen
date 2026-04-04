@@ -5,14 +5,12 @@
  * v2 adds: semantic commits, reasoning graph, replay traces
  * v3 adds: knowledge context for multi-agent collaboration handoffs
  * v5 adds: failure memory, workflow hooks, security scanning
- * v6 adds: repository types (general vs academia), multi-sort leaderboard
+ * v6 adds: multi-sort leaderboard
  */
 
 import { query, queryOne } from '../db/client';
 import { storeContent, retrieveContent } from '../services/fileverse';
 import { validateEnsName } from '../services/ens';
-import * as bountyService from '../services/bounty';
-import { repositoryHasGitHubLink } from '../services/github-integration';
 import { processCommitSemantics, generateEmbedding, isEmbeddingsEnabled } from '../services/embeddings';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -35,10 +33,6 @@ export interface Repository {
   description: string;
   owner_agent_id: string;
   bounty_pool: number;
-  /** Repository type: 'general' (with bounty) or 'academia' (no bounty, has field tag) */
-  repo_type: 'general' | 'academia';
-  /** Academic field/niche for academia repos (e.g., 'Machine Learning', 'Cryptography'). NULL for general repos. */
-  academia_field: string | null;
   created_at: string;
 }
 
@@ -99,6 +93,12 @@ export interface FailureContext {
   root_cause?: string;
   /** Severity: low = minor inconvenience, medium = blocks progress, high = critical failure */
   severity?: 'low' | 'medium' | 'high';
+  /** Concrete, actionable fixes that should be attempted next */
+  corrective_actions?: string[];
+  /** Hard constraints for the next attempt generated from this failure */
+  next_attempt_constraints?: string[];
+  /** Optional short examples/snippets from failing evidence */
+  related_examples?: string[];
 }
 
 export interface Commit {
@@ -203,23 +203,15 @@ export async function createRepository(
   name: string,
   ownerEns: string,
   description: string = '',
-  _initialPermissionIgnored: PermissionLevel = 'public',
-  options: { repoType?: 'general' | 'academia'; academiaField?: string } = {}
+  _initialPermissionIgnored: PermissionLevel = 'public'
 ): Promise<Repository> {
-  const { repoType = 'general', academiaField } = options;
-
-  // Validate academia repos
-  if (repoType === 'academia') {
-    if (!academiaField) throw new Error('academia_field is required for academia repositories');
-  }
-
   const owner = await getAgent(ownerEns);
   if (!owner) throw new Error(`Agent not found: ${ownerEns}`);
 
   const [repo] = await query<Repository>(
-    `INSERT INTO repositories (name, description, owner_agent_id, repo_type, academia_field, bounty_pool)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [name, description, owner.id, repoType, academiaField ?? null, repoType === 'academia' ? 0 : 0]
+    `INSERT INTO repositories (name, description, owner_agent_id, bounty_pool)
+     VALUES ($1, $2, $3, $4) RETURNING *`,
+    [name, description, owner.id, 0]
   );
 
   // Automatically create the main branch
@@ -750,8 +742,7 @@ export async function openPullRequest(
   sourceBranchName: string,
   targetBranchName: string,
   description: string,
-  authorEns: string,
-  bountyAmount: number = 0
+  authorEns: string
 ): Promise<PullRequest> {
   const author = await getAgent(authorEns);
   if (!author) throw new Error(`Agent not found: ${authorEns}`);
@@ -769,15 +760,10 @@ export async function openPullRequest(
   if (!target) throw new Error(`Branch "${targetBranchName}" not found`);
 
   const [pr] = await query<PullRequest>(
-    `INSERT INTO pull_requests (repo_id, source_branch_id, target_branch_id, author_agent_id, description, bounty_amount)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [repoId, source.id, target.id, author.id, description, bountyAmount]
+    `INSERT INTO pull_requests (repo_id, source_branch_id, target_branch_id, author_agent_id, description)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [repoId, source.id, target.id, author.id, description]
   );
-
-  // Escrow bounty if provided
-  if (bountyAmount > 0) {
-    await bountyService.escrow(repoId, author.id, bountyAmount, pr.id);
-  }
 
   return pr;
 }
@@ -799,12 +785,6 @@ export async function mergePullRequest(
      WHERE id = $2 RETURNING *`,
     [reviewer.id, prId]
   );
-
-  // GitHub-linked repos: DB merge is not a real Git merge — do not release pool bounty here.
-  const githubLinked = await repositoryHasGitHubLink(pr.repo_id);
-  if (pr.bounty_amount > 0 && !githubLinked) {
-    await bountyService.release(pr.repo_id, pr.author_agent_id, pr.bounty_amount, prId);
-  }
 
   // Bump reviewer reputation for completing a review
   await query(

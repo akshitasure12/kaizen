@@ -14,12 +14,15 @@ interface OutcomeAggRow {
   total_count: string;
   merged_count: string;
   avg_payout_fraction: string | null;
+  avg_outcome_score: string | null;
 }
 
 interface RecentPenaltyRow {
   agent_id: string;
   recent_closed_without_merge_count: string;
   recent_failure_count: string;
+  recent_penalty_score: string | null;
+  reflection_required_count: string;
 }
 
 export interface RankedAgent {
@@ -30,6 +33,8 @@ export interface RankedAgent {
   performance_score: number;
   merge_rate: number;
   quality_score: number;
+  penalty_score: number;
+  reflection_load: number;
 }
 
 function tokenize(text: string): string[] {
@@ -68,7 +73,8 @@ export async function rankAgentsForIssue(params: {
       `SELECT agent_id,
               COUNT(*)::text as total_count,
               COUNT(*) FILTER (WHERE merged = true)::text as merged_count,
-              AVG(payout_fraction)::text as avg_payout_fraction
+              AVG(payout_fraction)::text as avg_payout_fraction,
+              AVG(outcome_score)::text as avg_outcome_score
        FROM agent_outcomes
        GROUP BY agent_id`,
     ),
@@ -80,7 +86,19 @@ export async function rankAgentsForIssue(params: {
               WHERE merged = false
                 AND (failure_category = 'closed_without_merge' OR failure_category IS NULL)
             )::text AS recent_closed_without_merge_count,
-            COUNT(*) FILTER (WHERE merged = false)::text AS recent_failure_count
+            COUNT(*) FILTER (WHERE merged = false)::text AS recent_failure_count,
+            AVG(
+              CASE
+                WHEN outcome_score < 0 THEN ABS(outcome_score)
+                WHEN merged = true THEN GREATEST(0, 0.35 - payout_fraction) * 0.5
+                ELSE 0
+              END
+            )::text AS recent_penalty_score,
+            COUNT(*) FILTER (
+              WHERE outcome_score < 0
+                 OR payout_fraction < 0.35
+                 OR failure_category IS NOT NULL
+            )::text AS reflection_required_count
      FROM agent_outcomes
      WHERE created_at >= NOW() - INTERVAL '30 days'
      GROUP BY agent_id`,
@@ -101,16 +119,29 @@ export async function rankAgentsForIssue(params: {
     const merged = outcome ? Number(outcome.merged_count) : 0;
     const mergeRate = total > 0 ? clamp01(merged / total) : 0.5;
     const quality = outcome?.avg_payout_fraction != null ? clamp01(Number(outcome.avg_payout_fraction)) : 0.5;
+    const avgOutcomeScore = outcome?.avg_outcome_score != null ? Number(outcome.avg_outcome_score) : 0.25;
+    const outcomeReliability = clamp01((avgOutcomeScore + 1) / 2);
     const repNorm = clamp01(Number(agent.reputation_score ?? 0) / 100);
     const recentClosedWithoutMerge = penalty ? Number(penalty.recent_closed_without_merge_count) : 0;
     const recentFailures = penalty ? Number(penalty.recent_failure_count) : 0;
+    const directPenalty = penalty?.recent_penalty_score != null ? clamp01(Number(penalty.recent_penalty_score)) : 0;
+    const reflectionLoad = penalty
+      ? Math.min(0.2, Number(penalty.reflection_required_count || "0") * 0.02)
+      : 0;
 
     const penaltyUnit = env.REPUTATION_NO_MERGE_PENALTY;
-    const penaltyScore = clamp01(
+    const countPenalty = clamp01(
       Math.min(0.4, recentClosedWithoutMerge * penaltyUnit + recentFailures * (penaltyUnit / 3)),
     );
+    const penaltyScore = clamp01(Math.min(0.75, directPenalty + reflectionLoad + countPenalty));
 
-    const rawPerformance = clamp01(0.4 * repNorm + 0.3 * mergeRate + 0.3 * quality - penaltyScore);
+    const rawPerformance = clamp01(
+      0.32 * repNorm +
+      0.24 * mergeRate +
+      0.24 * quality +
+      0.2 * outcomeReliability -
+      penaltyScore,
+    );
     const performance = Math.min(
       env.ASSIGNMENT_PERF_CAP,
       Math.max(env.ASSIGNMENT_PERF_FLOOR, rawPerformance),
@@ -125,6 +156,8 @@ export async function rankAgentsForIssue(params: {
       performance_score: performance,
       merge_rate: mergeRate,
       quality_score: quality,
+      penalty_score: penaltyScore,
+      reflection_load: reflectionLoad,
     };
   });
 

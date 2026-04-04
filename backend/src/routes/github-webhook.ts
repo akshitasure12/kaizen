@@ -1,14 +1,16 @@
 import crypto from "crypto";
 import { FastifyInstance, FastifyRequest } from "fastify";
-import { pool } from "../db/client";
+import { pool, queryOne } from "../db/client";
 import { env } from "../env";
+import * as sdk from "../sdk";
 import {
   applyGitHubMergePayoutInTransaction,
   findIssueBountyByGithubPr,
   payoutFractionFromCodeQuality,
   refundBountyOnGitHubCloseWithoutMergeInTransaction,
 } from "../services/bounty";
-import { recordAgentOutcomeInTransaction } from "../services/agent-outcomes";
+import { deriveCorrectiveActionsForOutcome, recordAgentOutcomeInTransaction } from "../services/agent-outcomes";
+import { finalizeIssueLifecycleAfterSettlement } from "../services/issue-lifecycle";
 
 type ReqRaw = FastifyRequest & { rawBody?: Buffer };
 
@@ -46,6 +48,123 @@ function toNormalizedJudgeScore(verdict: unknown): number | null {
   const score = (verdict as { code_quality_score?: unknown }).code_quality_score;
   if (typeof score !== "number") return null;
   return Math.min(1, Math.max(0, (score - 1) / 9));
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    ordered.push(normalized);
+  }
+  return ordered;
+}
+
+function buildNextAttemptConstraints(correctiveActions: string[]): string[] {
+  return uniqueStrings([
+    "Run strict verification commands and ensure zero failed tests before requesting merge.",
+    "Address reviewer comments within one iteration and keep the PR active until settlement.",
+    "Document root cause and recovery steps in KAIZEN_AGENT.md before retry.",
+    ...correctiveActions.map((action) => `Follow-up action: ${action}`),
+  ]).slice(0, 10);
+}
+
+async function persistLossReflectionMemory(params: {
+  repoId: string;
+  issueId: string;
+  bountyId: string;
+  agentId: string;
+  gitJobId?: string | null;
+  settlementKey: string;
+  reason: string;
+  failureCategory?: string | null;
+  judgeVerdict?: unknown;
+  payoutFraction: number;
+}): Promise<void> {
+  const agent = await queryOne<{ ens_name: string }>(
+    "SELECT ens_name FROM agents WHERE id = $1",
+    [params.agentId],
+  );
+  if (!agent) return;
+
+  const job = params.gitJobId
+    ? await queryOne<{ branch_name: string | null; base_branch: string | null }>(
+        "SELECT branch_name, base_branch FROM git_jobs WHERE id = $1",
+        [params.gitJobId],
+      )
+    : null;
+
+  const branchName = (job?.branch_name || `agent/${params.issueId.slice(0, 8)}-loss-reflection`).trim();
+  if (!branchName) return;
+
+  const branchExists = await queryOne<{ id: string }>(
+    "SELECT id FROM branches WHERE repo_id = $1 AND name = $2",
+    [params.repoId, branchName],
+  );
+
+  if (!branchExists) {
+    const requestedBase = (job?.base_branch || "main").trim() || "main";
+    const baseExists = await queryOne<{ id: string }>(
+      "SELECT id FROM branches WHERE repo_id = $1 AND name = $2",
+      [params.repoId, requestedBase],
+    );
+    const baseBranch = baseExists ? requestedBase : "main";
+    await sdk.createBranch(params.repoId, branchName, baseBranch, agent.ens_name);
+  }
+
+  const correctiveActions = deriveCorrectiveActionsForOutcome({
+    merged: false,
+    payoutFraction: params.payoutFraction,
+    failureCategory: params.failureCategory,
+    judgeVerdict: params.judgeVerdict,
+  });
+  const constraints = buildNextAttemptConstraints(correctiveActions);
+
+  await sdk.commitMemory(
+    params.repoId,
+    branchName,
+    JSON.stringify(
+      {
+        issue_id: params.issueId,
+        bounty_id: params.bountyId,
+        settlement_key: params.settlementKey,
+        reason: params.reason,
+        failure_category: params.failureCategory || "closed_without_merge",
+        corrective_actions: correctiveActions,
+        next_attempt_constraints: constraints,
+        generated_at: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+    `loss reflection: issue ${params.issueId.slice(0, 8)} settled without payout`,
+    agent.ens_name,
+    {
+      skipSemantics: true,
+      reasoningType: "conclusion",
+      knowledgeContext: {
+        decisions: [
+          `Loss event captured for bounty ${params.bountyId}`,
+          `Failure category: ${params.failureCategory || "closed_without_merge"}`,
+        ],
+        next_steps: correctiveActions,
+        handoff_summary:
+          "Apply the corrective actions and constraints before accepting the next similar assignment.",
+      },
+      failureContext: {
+        failed: true,
+        error_type: "bounty_loss",
+        error_detail: params.reason,
+        failed_approach: "Previous bounty attempt failed to settle successfully",
+        root_cause: params.failureCategory || params.reason,
+        severity: "high",
+        corrective_actions: correctiveActions,
+        next_attempt_constraints: constraints,
+      },
+    },
+  );
 }
 
 export async function githubWebhookRoutes(app: FastifyInstance) {
@@ -225,7 +344,7 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
           await client.query(
             `UPDATE issue_bounties
              SET settlement_key = $1,
-                 settlement_status = 'failed_non_merge'
+                 payout_status = 'failed_non_merge'
              WHERE id = $2`,
             [settlementKey, bounty.id],
           );
@@ -240,7 +359,43 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
             [outcomeStatus, eventId],
           );
 
+          await finalizeIssueLifecycleAfterSettlement({
+            issueId: bounty.issue_id,
+            merged: false,
+            mergedPrNumber: pr.number,
+            gitJobId: issue.git_job_id,
+            client,
+          });
+
           await client.query("COMMIT");
+
+          if (issue.assigned_agent_id) {
+            try {
+              await persistLossReflectionMemory({
+                repoId: issue.repo_id,
+                issueId: bounty.issue_id,
+                bountyId: bounty.id,
+                agentId: issue.assigned_agent_id,
+                gitJobId: issue.git_job_id,
+                settlementKey,
+                reason: "Pull request closed without merge; bounty settled as failed_non_merge.",
+                failureCategory: "closed_without_merge",
+                judgeVerdict: bounty.github_judge_verdict,
+                payoutFraction: 0,
+              });
+            } catch (reflectionError) {
+              req.log.error(
+                {
+                  err: reflectionError,
+                  issueId: bounty.issue_id,
+                  bountyId: bounty.id,
+                  settlementKey,
+                },
+                "Failed to persist loss reflection memory",
+              );
+            }
+          }
+
           return { ok: true, refunded: true };
         }
 
@@ -268,7 +423,7 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
             await client.query(
               `UPDATE issue_bounties
                SET settlement_key = $1,
-                   settlement_status = 'hold'
+                   payout_status = 'hold'
                WHERE id = $2`,
               [settlementKey, bounty.id],
             );
@@ -289,6 +444,14 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
         }
 
         if (!issue.assigned_agent_id) {
+          await finalizeIssueLifecycleAfterSettlement({
+            issueId: bounty.issue_id,
+            merged: true,
+            mergedPrNumber: pr.number,
+            gitJobId: issue.git_job_id,
+            client,
+          });
+
           await client.query(
             `UPDATE merge_settlement_events
              SET payout_status = 'failed',
@@ -305,8 +468,9 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
 
         const codeQualityScore = (bounty.github_judge_verdict as { code_quality_score?: unknown } | null)
           ?.code_quality_score;
-        let payoutFractionForOutcome = Number(bounty.judge_payout_fraction ?? 0);
-        if (typeof codeQualityScore === "number") {
+        const isMockJudge = Boolean(bounty.is_mock_judge);
+        let payoutFractionForOutcome = isMockJudge ? 0 : Number(bounty.judge_payout_fraction ?? 0);
+        if (!isMockJudge && typeof codeQualityScore === "number") {
           payoutFractionForOutcome = payoutFractionFromCodeQuality(codeQualityScore);
           await client.query(
             `UPDATE issue_bounties
@@ -322,6 +486,9 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
           deliveryId,
         });
 
+        const payoutStatus = payout.reason === "blocked_mock_judge" ? "blocked_mock_judge" : "paid";
+        const failureCategory = payout.reason === "blocked_mock_judge" ? "blocked_mock_judge" : null;
+
         const outcome = await recordAgentOutcomeInTransaction(client, {
           agentId: issue.assigned_agent_id,
           issueId: bounty.issue_id,
@@ -332,26 +499,34 @@ export async function githubWebhookRoutes(app: FastifyInstance) {
           payoutFraction: payoutFractionForOutcome,
           payoutAmount: payout.paid,
           judgeScore: judgeScoreNormalized,
-          failureCategory: null,
+          failureCategory,
         });
 
         await client.query(
           `UPDATE issue_bounties
            SET settlement_key = $1,
-               settlement_status = 'paid'
-           WHERE id = $2`,
-          [settlementKey, bounty.id],
+               payout_status = $2
+           WHERE id = $3`,
+          [settlementKey, payoutStatus, bounty.id],
         );
 
         await client.query(
           `UPDATE merge_settlement_events
-           SET payout_status = 'paid',
-               outcome_status = $1,
+           SET payout_status = $1,
+               outcome_status = $2,
                processed_at = NOW(),
                updated_at = NOW()
-           WHERE id = $2`,
-          [outcome.skipped ? "applied" : "applied", eventId],
+           WHERE id = $3`,
+          [payoutStatus, outcome.skipped ? "applied" : "applied", eventId],
         );
+
+        await finalizeIssueLifecycleAfterSettlement({
+          issueId: bounty.issue_id,
+          merged: true,
+          mergedPrNumber: pr.number,
+          gitJobId: issue.git_job_id,
+          client,
+        });
 
         await client.query("COMMIT");
         return { ok: true, payout };

@@ -48,15 +48,9 @@ CREATE TABLE IF NOT EXISTS repositories (
   description TEXT,
   owner_agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   bounty_pool NUMERIC(18, 4) DEFAULT 0,
-  repo_type VARCHAR(20) NOT NULL DEFAULT 'general',
-  academia_field VARCHAR(255) DEFAULT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  CONSTRAINT chk_academia_field CHECK (
-    (repo_type = 'academia' AND academia_field IS NOT NULL) OR repo_type != 'academia'
-  )
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_repositories_repo_type ON repositories(repo_type);
 
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_owner VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_repo VARCHAR(255);
@@ -228,6 +222,7 @@ ALTER TABLE issues ADD COLUMN IF NOT EXISTS parent_issue_id UUID REFERENCES issu
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS root_issue_id UUID REFERENCES issues(id) ON DELETE SET NULL;
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS github_issue_number INTEGER;
 ALTER TABLE issues ADD COLUMN IF NOT EXISTS git_job_id UUID;
+ALTER TABLE issues ADD COLUMN IF NOT EXISTS settlement_finalized_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_issues_parent ON issues(parent_issue_id) WHERE parent_issue_id IS NOT NULL;
 
@@ -286,6 +281,7 @@ CREATE TABLE IF NOT EXISTS issue_bounties (
 ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS github_pr_number INTEGER;
 ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS judge_payout_fraction NUMERIC(8, 7);
 ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS github_judge_verdict JSONB;
+ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS is_mock_judge BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS payout_status VARCHAR(32) DEFAULT 'internal';
 ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS merge_webhook_delivery_id VARCHAR(255);
 
@@ -295,7 +291,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_bounties_merge_delivery
 CREATE INDEX IF NOT EXISTS idx_issue_bounties_github_pr ON issue_bounties(github_pr_number) WHERE github_pr_number IS NOT NULL;
 
 ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS settlement_key VARCHAR(255);
-ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS settlement_status VARCHAR(32) DEFAULT 'pending';
+ALTER TABLE issue_bounties DROP COLUMN IF EXISTS settlement_status;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_bounties_settlement_key
   ON issue_bounties(settlement_key) WHERE settlement_key IS NOT NULL;
@@ -457,6 +453,8 @@ ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_error_classification VARCHAR(
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS judge_comment_id BIGINT;
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS diff_summary_json JSONB;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS settlement_finalized_at TIMESTAMPTZ;
 
 DO $$
 BEGIN
@@ -529,6 +527,32 @@ CREATE INDEX IF NOT EXISTS idx_git_jobs_retry_after ON git_jobs(retry_after) WHE
 CREATE INDEX IF NOT EXISTS idx_git_jobs_branch_name ON git_jobs(branch_name) WHERE branch_name IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_git_jobs_judge_comment_id
   ON git_jobs(judge_comment_id) WHERE judge_comment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS tool_execution_logs (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  git_job_id UUID NOT NULL REFERENCES git_jobs(id) ON DELETE CASCADE,
+  phase VARCHAR(16) NOT NULL CHECK (phase IN ('edit', 'verify', 'fix')),
+  cycle INTEGER NOT NULL DEFAULT 1,
+  command_text TEXT NOT NULL,
+  command_bin VARCHAR(128),
+  command_args_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  execution_status VARCHAR(16) NOT NULL DEFAULT 'executed' CHECK (execution_status IN ('executed', 'blocked')),
+  exit_code INTEGER,
+  signal VARCHAR(32),
+  timed_out BOOLEAN NOT NULL DEFAULT FALSE,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  stdout_tail TEXT,
+  stderr_tail TEXT,
+  blocked_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_execution_logs_job_created
+  ON tool_execution_logs(git_job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_execution_logs_job_phase
+  ON tool_execution_logs(git_job_id, phase);
+CREATE INDEX IF NOT EXISTS idx_tool_execution_logs_status
+  ON tool_execution_logs(execution_status, created_at DESC);
 
 -- FK issues.git_job_id → git_jobs (after git_jobs exists)
 DO $$
