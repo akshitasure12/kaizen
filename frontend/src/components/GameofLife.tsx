@@ -65,6 +65,7 @@ export default function GameOfLifeBackground({
   refillDensity = 0.12,
 }: GameOfLifeBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mouseRef = useRef<{ x: number; y: number } | null>(null);
 
   const gaussianProb = useCallback(
     (dx: number, dy: number, sx: number, sy: number) =>
@@ -191,6 +192,55 @@ export default function GameOfLifeBackground({
       }
     };
 
+    // ─── Cursor repulsion ────────────────────────────────────────────────────
+    const REPEL_RADIUS = 6; // cells
+    const REPEL_FORCE  = 3; // extra cells pushed beyond radius
+
+    const repelCells = () => {
+      const mouse = mouseRef.current;
+      if (!mouse) return;
+      const mcx = mouse.x / cellSize;
+      const mcy = mouse.y / cellSize;
+
+      const r0 = Math.max(0, Math.floor(mcy - REPEL_RADIUS - 1));
+      const r1 = Math.min(rows - 1, Math.ceil(mcy + REPEL_RADIUS + 1));
+      const c0 = Math.max(0, Math.floor(mcx - REPEL_RADIUS - 1));
+      const c1 = Math.min(cols - 1, Math.ceil(mcx + REPEL_RADIUS + 1));
+
+      for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+          const idx = r * cols + c;
+          if (!grid[idx]) continue;
+          const dx = c + 0.5 - mcx;
+          const dy = r + 0.5 - mcy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d >= REPEL_RADIUS) continue;
+
+          // Kill at current position
+          grid[idx] = 0;
+
+          // Push direction (away from cursor)
+          const len = d < 0.01 ? 1 : d;
+          const nx = dx / len;
+          const ny = dy / len;
+          const push = REPEL_RADIUS - d + REPEL_FORCE;
+          const tc = Math.round(c + nx * push);
+          const tr = Math.round(r + ny * push);
+          if (tc >= 0 && tc < cols && tr >= 0 && tr < rows) {
+            grid[tr * cols + tc] = 1;
+          }
+        }
+      }
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      mouseRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
+    const handleMouseLeave = () => {
+      mouseRef.current = null;
+    };
+
     const countNeighbours = (c: number, r: number) => {
       let n = 0;
       for (let dy = -1; dy <= 1; dy++) {
@@ -250,6 +300,7 @@ export default function GameOfLifeBackground({
 
     const loop = (t: number) => {
       animId = requestAnimationFrame(loop);
+      repelCells();
       draw();
       if (t - lastTick >= tickInterval) {
         step();
@@ -265,11 +316,15 @@ export default function GameOfLifeBackground({
 
     handleResize();
     window.addEventListener("resize", handleResize);
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseleave", handleMouseLeave);
     animId = requestAnimationFrame(loop);
 
     return () => {
       cancelAnimationFrame(animId);
       window.removeEventListener("resize", handleResize);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseleave", handleMouseLeave);
     };
   }, [cellSize, cellColor, bgColor, tickInterval, initialDensity,
       focalPoint?.x, focalPoint?.y, densityThreshold, refillDensity]);

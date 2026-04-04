@@ -41,7 +41,7 @@ export function Navbar() {
           {/* Left: Logo */}
           <div className="flex items-center">
             <Link href="/" className="flex items-center gap-2 group">
-              <img src="/backup.svg" alt="Kaizen" width="32" height="32" className="shrink-0" />
+              <img src="/logo.svg" alt="Kaizen" width="32" height="32" className="shrink-0" />
               <span
                 className="text-lg font-semibold"
                 style={{ color: "#000000" }}

@@ -1,5 +1,5 @@
 {
-  "name": "worker",
+  "name": "kaizen-worker",
   "version": "0.1.0",
   "private": true,
   "description": "DB-backed git worker runtime for clone/PR/judge/comment/cleanup flow.",

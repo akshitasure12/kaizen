@@ -11,7 +11,8 @@ export function HeroSection() {
   };
 
   return (
-    <div className="absolute inset-0 pointer-events-none flex items-center justify-start pl-12 pt-5">
+    <div className="absolute inset-0 pointer-events-none flex items-center pt-5">
+      <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
       <div className="pointer-events-auto flex flex-col items-start gap-8">
         <div className="flex flex-col gap-2">
         {/* Tagline */}
@@ -117,6 +118,7 @@ export function HeroSection() {
         </div>
         </div>
       </div>
+    </div>
     </div>
   );
 }

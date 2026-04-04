@@ -1,13 +1,14 @@
 {
-  "name": "backend",
+  "name": "kaizen-backend",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.2.5",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "bun --watch src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js",
-    "worker": "npm --prefix ../worker run dev",
-    "migrate": "tsx src/db/migrate.ts"
+    "start": "bun dist/server.js",
+    "worker": "bun src/worker-cli.ts",
+    "migrate": "bun src/db/migrate.ts"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",
@@ -28,7 +29,6 @@
     "@types/jsonwebtoken": "^9.0.6",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
 }

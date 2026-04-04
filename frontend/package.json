@@ -1,7 +1,8 @@
 {
-  "name": "agentbranch-frontend",
+  "name": "kaizen-frontend",
   "version": "6.0.0",
   "private": true,
+  "packageManager": "bun@1.2.5",
   "scripts": {
     "dev": "next dev --port 5173",
     "build": "next build",
