@@ -25,7 +25,8 @@ export function Navbar() {
   };
 
   const isActive = (href: string) => {
-    if (href === "/dashboard") return pathname === "/" || pathname === "/dashboard";
+    if (href === "/dashboard")
+      return pathname === "/" || pathname === "/dashboard";
     return pathname.startsWith(href);
   };
 
@@ -47,7 +48,13 @@ export function Navbar() {
           {/* Left: Logo */}
           <div className="flex items-center">
             <Link href="/" className="flex items-center gap-2 group">
-              <img src="/logo.svg" alt="Kaizen" width="32" height="32" className="shrink-0" />
+              <img
+                src="/logo.svg"
+                alt="Kaizen"
+                width="32"
+                height="32"
+                className="shrink-0"
+              />
               <span
                 className="text-lg font-semibold"
                 style={{ color: "var(--fg-default)" }}
@@ -144,7 +151,13 @@ export function Navbar() {
         {/* Mobile: flex layout (logo left, hamburger right) */}
         <div className="flex h-16 items-center justify-between md:hidden">
           <Link href="/" className="flex items-center gap-2">
-            <img src="/logo.svg" alt="AgentBranch" width="32" height="32" className="shrink-0" />
+            <img
+              src="/logo.svg"
+              alt="AgentBranch"
+              width="32"
+              height="32"
+              className="shrink-0"
+            />
             <span
               className="text-lg font-semibold"
               style={{ color: "var(--fg-default)" }}
@@ -199,7 +212,12 @@ export function Navbar() {
               onClick={() => setMobileOpen(!mobileOpen)}
               aria-label="Toggle menu"
             >
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+              >
                 {mobileOpen ? (
                   <path
                     fillRule="evenodd"
@@ -220,7 +238,10 @@ export function Navbar() {
 
         {/* Mobile nav dropdown */}
         {mobileOpen && (
-          <nav className="md:hidden pb-4 border-t" style={{ borderColor: "var(--border-muted)" }}>
+          <nav
+            className="md:hidden pb-4 border-t"
+            style={{ borderColor: "var(--border-muted)" }}
+          >
             <div className="flex flex-col gap-1 pt-3">
               {NAV_ITEMS.map((item) => (
                 <Link
