@@ -1,7 +1,55 @@
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
-import { fetchGitHubUserReposPage, getGitHubTokenForUser } from "../services/github-integration";
+import {
+  getGitHubTokenForUser,
+  upsertGithubInstallation,
+} from "../services/github-integration";
+
+type FetchGitHubUserReposPageResult =
+  | { ok: true; status: number; data: unknown }
+  | { ok: false; status: number; githubMessage?: string };
+
+async function fetchGitHubUserReposPage(
+  accessToken: string,
+  params: { page: number; per_page: number },
+): Promise<FetchGitHubUserReposPageResult> {
+  const query = new URLSearchParams({
+    page: String(params.page),
+    per_page: String(params.per_page),
+  });
+
+  const response = await fetch(`https://api.github.com/user/repos?${query.toString()}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+
+  if (!response.ok) {
+    let githubMessage: string | undefined;
+    try {
+      const err = (await response.json()) as { message?: string };
+      githubMessage = err.message;
+    } catch {
+      githubMessage = undefined;
+    }
+
+    return {
+      ok: false,
+      status: response.status,
+      githubMessage,
+    };
+  }
+
+  const data = (await response.json()) as unknown;
+  return {
+    ok: true,
+    status: response.status,
+    data,
+  };
+}
 
 const reposQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -23,9 +71,9 @@ export async function githubIntegrationRoutes(app: FastifyInstance) {
 
       const installationId = Number(body.installation_id);
       const accountLogin = body.account_login?.trim();
-      const appId = Number(body.app_id || env.GITHUB_APP_ID || 0);
+      const appId = Number(body.app_id || process.env.GITHUB_APP_ID || 0);
       const pemEncrypted = body.pem_encrypted?.trim() || "configured-via-env";
-      const webhookSecret = body.webhook_secret?.trim() || env.GITHUB_WEBHOOK_SECRET || "";
+      const webhookSecret = body.webhook_secret?.trim() || process.env.GITHUB_WEBHOOK_SECRET || "";
 
       if (!Number.isFinite(installationId) || installationId <= 0) {
         return reply.status(400).send({ error: "installation_id is required" });

@@ -153,7 +153,6 @@ export async function setUserGithubApiKey(userId: string, apiKey: string | null)
   await query("UPDATE users SET github_api_key = $1 WHERE id = $2", [v, userId]);
 }
 
-<<<<<<< HEAD
 export async function getGitHubTokenForUser(userId: string): Promise<string | null> {
   const u = await queryOne<{ github_api_key: string | null }>(
     "SELECT github_api_key FROM users WHERE id = $1",
@@ -222,7 +221,8 @@ export async function upsertGithubRepoLink(input: {
      WHERE id = $4`,
     [input.owner, input.name, input.defaultBranch, input.repositoryId],
   );
-=======
+}
+
 export async function validateGitHubToken(
   token: string,
 ): Promise<
@@ -394,5 +394,4 @@ export async function fetchGitHubUserReposPage(
       has_prev: Boolean(link.prev),
     },
   };
->>>>>>> f5b8b26d702940eef5fa639b950c19e6dc66bfe1
 }
