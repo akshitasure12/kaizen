@@ -8,6 +8,7 @@ dist
 .DS_Store
 coverage
 .turbo
+.github
 **/.next
 /out/
 *.tsbuildinfo
@@ -19,7 +20,7 @@ contracts/broadcast/
 contracts/.env
 contracts/.env.*
 !contracts/.env.example
-
+*/AGENTS.md
 # Reference-only snapshot (keep out of version control if desired)
 ref/
 demo-ready_github_git_1c5a63f4.plan.md

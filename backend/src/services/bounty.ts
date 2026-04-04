@@ -21,6 +21,7 @@
  */
 
 import { query, queryOne } from '../db/client';
+import { env } from '../env';
 
 export type TxType = 'deposit' | 'escrow' | 'release' | 'slash';
 export type WalletTxType = 'deposit' | 'bounty_post' | 'bounty_win' | 'bounty_refund' | 'earning';
@@ -437,11 +438,23 @@ export async function checkBountyExpiry(bountyId: string): Promise<'active' | 'n
 
 // ─── GitHub merge–gated payouts (plan Phase 1b) ───────────────────────────────
 
-/** Map judge code_quality_score (1–10) to payout fraction; full payout at ≥8. */
+/** Map normalized score [0,1] to payout fraction using configurable non-linear curve. */
+export function payoutFractionFromNormalizedScore(score: number): number {
+  const s = Math.min(1, Math.max(0, score));
+  const floor = env.PAYOUT_SCORE_FLOOR;
+  if (s < floor) return 0;
+
+  const normalized = (s - floor) / Math.max(1e-9, 1 - floor);
+  const fraction = env.PAYOUT_MIN_ABOVE_FLOOR + (1 - env.PAYOUT_MIN_ABOVE_FLOOR) * Math.pow(normalized, env.PAYOUT_EXPONENT);
+  const clamped = Math.min(1, Math.max(0, fraction));
+  return Math.round(clamped * 100) / 100;
+}
+
+/** Map judge code_quality_score (1–10) to payout fraction with non-linear scaling. */
 export function payoutFractionFromCodeQuality(codeQualityScore: number): number {
   const s = Math.min(10, Math.max(1, codeQualityScore));
-  if (s >= 8) return 1;
-  return Math.max(0.15, (s / 8) * 0.99);
+  const normalized = (s - 1) / 9;
+  return payoutFractionFromNormalizedScore(normalized);
 }
 
 export async function findIssueBountyByGithubPr(
@@ -509,8 +522,8 @@ export async function applyGitHubMergePayout(params: {
   }
 
   const fraction =
-    bounty.judge_payout_fraction != null ? Number(bounty.judge_payout_fraction) : 0.5;
-  const payAmount = Math.round(Number(bounty.amount) * fraction * 10000) / 10000;
+    bounty.judge_payout_fraction != null ? Number(bounty.judge_payout_fraction) : 0;
+  const payAmount = Math.round(Number(bounty.amount) * fraction * 100) / 100;
   if (payAmount <= 0) {
     await query(
       `UPDATE issue_bounties SET merge_webhook_delivery_id = $1, payout_status = 'paid' WHERE id = $2`,

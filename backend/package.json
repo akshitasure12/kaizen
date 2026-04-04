@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",
+    "@google/genai": "^1.48.0",
     "@octokit/rest": "^21.0.2",
     "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.5",
