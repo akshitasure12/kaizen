@@ -8,6 +8,7 @@ import { env } from "../env";
 import { requireAuth } from "../middleware/auth";
 import { enqueueGitJob } from "../services/git-job-enqueue";
 import { getGitHubLinkForRepo } from "../services/github-integration";
+import * as sdk from "../sdk";
 
 function hasInternalAccess(
   headerValue: string | string[] | undefined,
@@ -21,6 +22,10 @@ function requireInternal(req: { headers: Record<string, unknown> }): boolean {
   return hasInternalAccess(
     req.headers["x-internal-service-secret"] as string | string[] | undefined,
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 export async function gitJobRoutes(app: FastifyInstance) {
@@ -339,5 +344,165 @@ export async function gitJobRoutes(app: FastifyInstance) {
     );
     if (!row) return reply.status(404).send({ error: "Job not found" });
     return row;
+  });
+
+  app.post("/internal/git-jobs/:id/memory-commit", async (req, reply) => {
+    if (!requireInternal(req as { headers: Record<string, unknown> })) {
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
+
+    const { id } = req.params as { id: string };
+    const body = (req.body || {}) as {
+      branch_name?: string;
+      message?: string;
+      content?: string;
+      skip_semantics?: boolean;
+      reasoning_type?: "knowledge" | "hypothesis" | "experiment" | "conclusion" | "trace";
+      trace?: unknown;
+      knowledge_context?: unknown;
+      failure_context?: unknown;
+    };
+
+    if (!body.message || !body.content) {
+      return reply.status(400).send({ error: "message and content are required" });
+    }
+
+    const job = await queryOne<{
+      id: string;
+      issue_id: string;
+      repo_id: string;
+      agent_id: string;
+      base_branch: string;
+      branch_name: string | null;
+      payload: Record<string, unknown> | null;
+    }>(
+      `SELECT id, issue_id, repo_id, agent_id, base_branch, branch_name, payload
+       FROM git_jobs
+       WHERE id = $1`,
+      [id],
+    );
+    if (!job) {
+      return reply.status(404).send({ error: "Job not found" });
+    }
+
+    const agent = await queryOne<{ ens_name: string }>(
+      `SELECT ens_name FROM agents WHERE id = $1`,
+      [job.agent_id],
+    );
+    if (!agent) {
+      return reply.status(404).send({ error: "Agent not found" });
+    }
+
+    if (isRecord(job.payload) && typeof job.payload.memory_commit_id === "string") {
+      return {
+        commit_id: job.payload.memory_commit_id,
+        branch_name:
+          typeof job.payload.memory_commit_branch === "string"
+            ? job.payload.memory_commit_branch
+            : body.branch_name || job.branch_name || null,
+        author_ens: agent.ens_name,
+        deduped: true,
+      };
+    }
+
+    const branchName = (body.branch_name || job.branch_name || `agent/${job.issue_id.slice(0, 8)}-memory`).trim();
+    if (!branchName) {
+      return reply.status(400).send({ error: "Unable to resolve branch name" });
+    }
+
+    const branchExists = await queryOne<{ id: string }>(
+      `SELECT id FROM branches WHERE repo_id = $1 AND name = $2`,
+      [job.repo_id, branchName],
+    );
+    if (!branchExists) {
+      const requestedBase = job.base_branch || "main";
+      const baseBranch =
+        (await queryOne<{ id: string }>(
+          `SELECT id FROM branches WHERE repo_id = $1 AND name = $2`,
+          [job.repo_id, requestedBase],
+        )) != null
+          ? requestedBase
+          : "main";
+
+      await sdk.createBranch(job.repo_id, branchName, baseBranch, agent.ens_name);
+    }
+
+    const options: sdk.CommitOptions = {
+      skipSemantics: body.skip_semantics ?? true,
+      reasoningType: body.reasoning_type,
+    };
+
+    if (isRecord(body.trace)) {
+      options.trace = {
+        prompt: typeof body.trace.prompt === "string" ? body.trace.prompt : "",
+        context: isRecord(body.trace.context) ? body.trace.context : {},
+        tools: Array.isArray(body.trace.tools) ? body.trace.tools as Array<{ name: string; input: any; output: any }> : [],
+        result: typeof body.trace.result === "string" ? body.trace.result : "",
+      };
+    }
+
+    if (isRecord(body.knowledge_context)) {
+      options.knowledgeContext = body.knowledge_context as sdk.KnowledgeContext;
+    }
+    if (isRecord(body.failure_context)) {
+      const rawFailure = body.failure_context;
+      if (typeof rawFailure.failed === "boolean") {
+        const severity =
+          rawFailure.severity === "low" ||
+          rawFailure.severity === "medium" ||
+          rawFailure.severity === "high"
+            ? rawFailure.severity
+            : undefined;
+
+        options.failureContext = {
+          failed: rawFailure.failed,
+          error_type: typeof rawFailure.error_type === "string" ? rawFailure.error_type : undefined,
+          error_detail: typeof rawFailure.error_detail === "string" ? rawFailure.error_detail : undefined,
+          failed_approach:
+            typeof rawFailure.failed_approach === "string" ? rawFailure.failed_approach : undefined,
+          root_cause: typeof rawFailure.root_cause === "string" ? rawFailure.root_cause : undefined,
+          severity,
+          corrective_actions: Array.isArray(rawFailure.corrective_actions)
+            ? rawFailure.corrective_actions.filter((v): v is string => typeof v === "string")
+            : undefined,
+          next_attempt_constraints: Array.isArray(rawFailure.next_attempt_constraints)
+            ? rawFailure.next_attempt_constraints.filter((v): v is string => typeof v === "string")
+            : undefined,
+          related_examples: Array.isArray(rawFailure.related_examples)
+            ? rawFailure.related_examples.filter((v): v is string => typeof v === "string")
+            : undefined,
+        };
+      }
+    }
+
+    const commit = await sdk.commitMemory(
+      job.repo_id,
+      branchName,
+      body.content,
+      body.message,
+      agent.ens_name,
+      options,
+    );
+
+    await query(
+      `UPDATE git_jobs
+       SET payload = COALESCE(payload, '{}'::jsonb) || $1::jsonb,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [
+        JSON.stringify({
+          memory_commit_id: commit.id,
+          memory_commit_branch: branchName,
+          memory_commit_created_at: new Date().toISOString(),
+        }),
+        id,
+      ],
+    );
+
+    return {
+      commit_id: commit.id,
+      branch_name: branchName,
+      author_ens: agent.ens_name,
+    };
   });
 }

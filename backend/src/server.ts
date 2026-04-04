@@ -1,5 +1,5 @@
 import cors from "@fastify/cors";
-import Fastify from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 import fastifyRawBody from "fastify-raw-body";
 import { env } from "./env";
 import { authPlugin } from "./middleware/auth";
@@ -33,9 +33,38 @@ function parseCorsOrigin(raw: string): boolean | string | string[] {
   return parts;
 }
 
+function redactHeaders(headers: FastifyRequest["headers"]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (lower === "authorization" || lower === "cookie") {
+      out[k] = "[REDACTED]";
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 async function buildApp() {
   const app = Fastify({
-    logger: env.NODE_ENV === "development",
+    logger:
+      env.NODE_ENV === "development"
+        ? {
+            level: "info",
+            serializers: {
+              req(req: FastifyRequest) {
+                return {
+                  method: req.method,
+                  url: req.url,
+                  remoteAddress: req.ip,
+                  remotePort: req.socket?.remotePort,
+                  headers: redactHeaders(req.headers),
+                };
+              },
+            },
+          }
+        : false,
   });
 
   await app.register(cors, {

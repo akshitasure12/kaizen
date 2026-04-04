@@ -8,13 +8,14 @@
 import { FastifyInstance } from 'fastify';
 import { query, queryOne } from '../db/client';
 import { requireAuth } from '../middleware/auth';
-import { judgeSubmission, storeJudgement, judgeAllSubmissions, Scorecard } from '../services/judge';
+import { judgeSubmission, storeJudgement, judgeAllSubmissions, Scorecard, isRealJudge } from '../services/judge';
 import * as sdk from '../sdk';
 import * as bountyService from '../services/bounty';
 import { rankAgentsForIssue } from '../services/agent-assignment';
 import { enqueueGitJob } from '../services/git-job-enqueue';
 import { getGitHubLinkForRepo } from '../services/github-integration';
 import { buildResolvePlan, PlannedChildWork } from '../services/resolve-orchestration';
+import { rollupParentIssueStatus } from '../services/issue-lifecycle';
 
 interface Issue {
   id: string;
@@ -1106,18 +1107,23 @@ export async function issueRoutes(app: FastifyInstance) {
       // Auto-trigger judging if max submissions reached
       const newCount = currentCount + 1;
       let judgingTriggered = false;
+      let judgingBlockedReason: string | null = null;
       if (newCount >= bounty.max_submissions) {
-        judgingTriggered = true;
-        // Trigger judging asynchronously (don't block response)
-        const issue = await queryOne<Issue>(
-          'SELECT * FROM issues WHERE id = $1',
-          [issueId]
-        );
-        if (issue) {
-          const scorecard = issue.scorecard as Scorecard;
-          triggerBountyJudging(bounty.id, issueId, scorecard).catch(err => {
-            console.error('Auto-judging failed:', err.message);
-          });
+        if (!isRealJudge()) {
+          judgingBlockedReason = 'live_gemini_required';
+        } else {
+          judgingTriggered = true;
+          // Trigger judging asynchronously (don't block response)
+          const issue = await queryOne<Issue>(
+            'SELECT * FROM issues WHERE id = $1',
+            [issueId]
+          );
+          if (issue) {
+            const scorecard = issue.scorecard as Scorecard;
+            triggerBountyJudging(bounty.id, issueId, scorecard).catch(err => {
+              console.error('Auto-judging failed:', err.message);
+            });
+          }
         }
       }
 
@@ -1126,6 +1132,7 @@ export async function issueRoutes(app: FastifyInstance) {
         submission_count: newCount,
         max_submissions: bounty.max_submissions,
         judging_triggered: judgingTriggered,
+        judging_blocked_reason: judgingBlockedReason,
       });
     } catch (err: any) {
       if (err.message?.includes('unique') || err.message?.includes('duplicate')) {
@@ -1151,6 +1158,10 @@ export async function issueRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: `Cannot judge bounty with status: ${bounty.status}` });
     }
 
+    if (!isRealJudge()) {
+      return reply.status(503).send({ error: 'Live Gemini judge is required for bounty settlement' });
+    }
+
     const submissionCount = await bountyService.getBountySubmissionCount(bounty.id);
     if (submissionCount === 0) {
       // No submissions — refund
@@ -1168,6 +1179,10 @@ export async function issueRoutes(app: FastifyInstance) {
 
     const scorecard = issue.scorecard as Scorecard;
     const result = await triggerBountyJudging(bounty.id, issueId, scorecard);
+
+    if (result.status === 'blocked_mock_judge') {
+      return reply.status(503).send({ error: 'Live Gemini judge is required for bounty settlement', result });
+    }
 
     return result;
   });
@@ -1226,6 +1241,18 @@ async function triggerBountyJudging(
   winner: { agent_id: string; points_awarded: number } | null;
 }> {
   const judgeResult = await judgeAllSubmissions(bountyId, scorecard);
+
+  if (judgeResult.has_mock_judging) {
+    return {
+      status: 'blocked_mock_judge',
+      results: judgeResult.results.map(r => ({
+        agent_id: r.agent_id,
+        points_awarded: r.points_awarded,
+        is_mock: r.is_mock,
+      })),
+      winner: null,
+    };
+  }
 
   if (judgeResult.winner) {
     // Get bounty to know the amount
@@ -1410,57 +1437,4 @@ async function assignIssueToAgent(issueId: string, agentId: string): Promise<voi
      WHERE id = $2`,
     [agentId, issueId],
   );
-}
-
-async function rollupParentIssueStatus(issueId: string): Promise<void> {
-  let cursorIssueId: string | null = issueId;
-
-  while (cursorIssueId) {
-    const relation: { parent_issue_id: string | null } | null = await queryOne<{ parent_issue_id: string | null }>(
-      'SELECT parent_issue_id FROM issues WHERE id = $1',
-      [cursorIssueId],
-    );
-    const parentId: string | null = relation?.parent_issue_id ?? null;
-    if (!parentId) return;
-
-    const parent = await queryOne<{ id: string; status: string }>(
-      'SELECT id, status FROM issues WHERE id = $1',
-      [parentId],
-    );
-    if (!parent) {
-      cursorIssueId = parentId;
-      continue;
-    }
-
-    const children = await query<{ status: string }>(
-      'SELECT status FROM issues WHERE parent_issue_id = $1',
-      [parentId],
-    );
-    if (children.length === 0) {
-      cursorIssueId = parentId;
-      continue;
-    }
-
-    const allTerminal = children.every((c) => c.status === 'closed' || c.status === 'cancelled');
-    const anyStarted = children.some(
-      (c) => c.status === 'in_progress' || c.status === 'closed' || c.status === 'cancelled',
-    );
-    const nextStatus: 'open' | 'in_progress' | 'closed' = allTerminal
-      ? 'closed'
-      : anyStarted
-        ? 'in_progress'
-        : 'open';
-
-    if (parent.status !== 'cancelled' && nextStatus !== parent.status) {
-      await query(
-        `UPDATE issues
-         SET status = $1,
-             closed_at = CASE WHEN $1 = 'closed' THEN NOW() ELSE NULL END
-         WHERE id = $2`,
-        [nextStatus, parentId],
-      );
-    }
-
-    cursorIssueId = parentId;
-  }
 }

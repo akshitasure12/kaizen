@@ -22,8 +22,9 @@ export default function LoginPage() {
     setIsLoading(true);
 
     try {
-      await login(username, password);
-      router.push("/github_api");
+      const gh = await login(username, password);
+      const hasPat = gh?.api_key_configured === true;
+      router.push(hasPat ? "/dashboard" : "/github_api");
     } catch (err: any) {
       setError(err.message || "Login failed");
     } finally {

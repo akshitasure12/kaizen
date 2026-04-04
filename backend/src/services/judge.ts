@@ -13,7 +13,7 @@ import {
   pickGeminiModel,
 } from './gemini-orchestration';
 
-const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+const geminiApiKey = process.env.GEMINI_API_KEY;
 const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
 
 export interface Scorecard {
@@ -40,6 +40,27 @@ export interface JudgeResult {
   verdict: Verdict;
   points_awarded: number;
   is_mock: boolean;
+}
+
+function uniqueStrings(values: unknown[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    ordered.push(normalized);
+  }
+  return ordered;
+}
+
+function deterministicRatio(seed: string): number {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) % 1000003;
+  }
+  return (hash % 1000) / 1000;
 }
 
 // ─── Main Judge Function ──────────────────────────────────────────────────────
@@ -149,13 +170,24 @@ async function judgeWithGemini(
   const verdict = JSON.parse(response.text || '{}') as Verdict;
   
   // Validate and sanitize verdict
-  verdict.passed_tests = Array.isArray(verdict.passed_tests) ? verdict.passed_tests : [];
-  verdict.failed_tests = Array.isArray(verdict.failed_tests) ? verdict.failed_tests : [];
-  verdict.bonus_achieved = Array.isArray(verdict.bonus_achieved) ? verdict.bonus_achieved : [];
-  verdict.bonus_missed = Array.isArray(verdict.bonus_missed) ? verdict.bonus_missed : [];
+  const allowedTests = new Set(scorecard.unit_tests.map((t) => t.name));
+  const allowedBonus = new Set(scorecard.bonus_criteria);
+  const passed = uniqueStrings(Array.isArray(verdict.passed_tests) ? verdict.passed_tests : [])
+    .filter((testName) => allowedTests.has(testName));
+  const failed = uniqueStrings(Array.isArray(verdict.failed_tests) ? verdict.failed_tests : [])
+    .filter((testName) => allowedTests.has(testName) && !passed.includes(testName));
+  const bonusAchieved = uniqueStrings(Array.isArray(verdict.bonus_achieved) ? verdict.bonus_achieved : [])
+    .filter((criterion) => allowedBonus.has(criterion));
+  const bonusMissed = uniqueStrings(Array.isArray(verdict.bonus_missed) ? verdict.bonus_missed : [])
+    .filter((criterion) => allowedBonus.has(criterion) && !bonusAchieved.includes(criterion));
+
+  verdict.passed_tests = passed;
+  verdict.failed_tests = failed;
+  verdict.bonus_achieved = bonusAchieved;
+  verdict.bonus_missed = bonusMissed;
   verdict.code_quality_score = Math.min(10, Math.max(1, verdict.code_quality_score || 5));
   verdict.reasoning = verdict.reasoning || 'Evaluation completed.';
-  verdict.suggestions = Array.isArray(verdict.suggestions) ? verdict.suggestions : [];
+  verdict.suggestions = uniqueStrings(Array.isArray(verdict.suggestions) ? verdict.suggestions : []);
 
   const points_awarded = calculatePoints(verdict, scorecard);
 
@@ -193,7 +225,7 @@ function mockJudge(submissionContent: string, scorecard: Scorecard): JudgeResult
     const keywords = testName.split(/[\s_-]+/);
     const hasKeywords = keywords.some((kw: string) => content.includes(kw) && kw.length > 2);
     
-    if (hasKeywords && Math.random() > 0.3) {
+    if (hasKeywords && deterministicRatio(`${test.name}:${submissionContent.length}`) > 0.3) {
       passed_tests.push(test.name);
     } else {
       failed_tests.push(test.name);
@@ -206,7 +238,10 @@ function mockJudge(submissionContent: string, scorecard: Scorecard): JudgeResult
 
   for (const criterion of bonusCriteria) {
     const criterionLower = criterion.toLowerCase();
-    if (content.includes(criterionLower.split(' ')[0]) && Math.random() > 0.5) {
+    if (
+      content.includes(criterionLower.split(' ')[0]) &&
+      deterministicRatio(`${criterion}:${submissionContent.length}`) > 0.5
+    ) {
       bonus_achieved.push(criterion);
     } else {
       bonus_missed.push(criterion);
@@ -251,12 +286,14 @@ function mockJudge(submissionContent: string, scorecard: Scorecard): JudgeResult
  */
 function calculatePoints(verdict: Verdict, scorecard: Scorecard): number {
   let points = 0;
+  const passedSet = new Set(verdict.passed_tests);
+  const bonusSet = new Set(verdict.bonus_achieved);
 
   // Base points for attempt
   points += Math.floor(scorecard.base_points * 0.2);
 
   // Points for passed tests
-  for (const testName of verdict.passed_tests) {
+  for (const testName of passedSet) {
     const test = scorecard.unit_tests.find(t => t.name === testName);
     if (test) {
       points += test.points;
@@ -264,7 +301,7 @@ function calculatePoints(verdict: Verdict, scorecard: Scorecard): number {
   }
 
   // Bonus points
-  points += verdict.bonus_achieved.length * scorecard.bonus_points_per_criterion;
+  points += bonusSet.size * scorecard.bonus_points_per_criterion;
 
   // Code quality bonus (up to 10% of base points)
   const qualityBonus = Math.floor((verdict.code_quality_score / 10) * scorecard.base_points * 0.1);
@@ -346,6 +383,7 @@ export async function judgeAllSubmissions(
 ): Promise<{
   results: Array<{ agent_id: string; points_awarded: number; verdict: Verdict; is_mock: boolean }>;
   winner: { agent_id: string; points_awarded: number } | null;
+  has_mock_judging: boolean;
 }> {
   // Get all submissions
   const submissions = await query<{
@@ -358,7 +396,7 @@ export async function judgeAllSubmissions(
   );
 
   if (submissions.length === 0) {
-    return { results: [], winner: null };
+    return { results: [], winner: null, has_mock_judging: false };
   }
 
   // Update bounty status to judging
@@ -387,8 +425,13 @@ export async function judgeAllSubmissions(
   }
 
   // Find winner (highest points)
+  const hasMockJudging = results.some((r) => r.is_mock);
   const sorted = [...results].sort((a, b) => b.points_awarded - a.points_awarded);
-  const winner = sorted[0].points_awarded > 0 ? { agent_id: sorted[0].agent_id, points_awarded: sorted[0].points_awarded } : null;
+  const winner = hasMockJudging
+    ? null
+    : sorted[0].points_awarded > 0
+      ? { agent_id: sorted[0].agent_id, points_awarded: sorted[0].points_awarded }
+      : null;
 
   return {
     results: results.map(r => ({
@@ -398,5 +441,6 @@ export async function judgeAllSubmissions(
       is_mock: r.is_mock,
     })),
     winner,
+    has_mock_judging: hasMockJudging,
   };
 }

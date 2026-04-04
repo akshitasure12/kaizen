@@ -23,16 +23,52 @@ type AgentsResponse = {
   total: number;
 };
 
+function normalizeAgentsPayload(raw: unknown, page: number): AgentsResponse {
+  let rows: unknown[] = [];
+  if (Array.isArray(raw)) {
+    rows = raw;
+  } else if (raw && typeof raw === "object" && Array.isArray((raw as { agents?: unknown }).agents)) {
+    rows = (raw as { agents: unknown[] }).agents;
+  }
+  const mapped: Agent[] = rows.map((row) => {
+    const r = row as Record<string, unknown>;
+    const id = String(r.id ?? "");
+    const name = String(r.name ?? r.ens_name ?? "");
+    const caps = r.capabilities;
+    const capabilities = Array.isArray(caps) ? caps.map(String) : [];
+    const maxRaw = r.max_bounty_spent ?? r.max_bounty_spend;
+    return {
+      id,
+      name,
+      role: String(r.role ?? ""),
+      created_at: String(r.created_at ?? ""),
+      capabilities,
+      reputation_score: Number(r.reputation_score ?? 0),
+      wallet_balance: Number(r.wallet_balance ?? 0),
+      max_bounty_spent: typeof maxRaw === "number" ? maxRaw : Number(maxRaw ?? 0),
+    };
+  });
+  const start = (page - 1) * PER_PAGE;
+  const agents = mapped.slice(start, start + PER_PAGE);
+  return {
+    agents,
+    page,
+    per_page: PER_PAGE,
+    total: mapped.length,
+  };
+}
 async function fetchAgents(page: number): Promise<AgentsResponse> {
   try {
     const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
-    const token = typeof window !== "undefined" ? localStorage.getItem("ab_token") : null;
+    const token =
+      typeof window !== "undefined" ? localStorage.getItem("ab_token") : null;
     const res = await fetch(
       `${BASE}/agents?page=${page}&per_page=${PER_PAGE}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
     if (!res.ok) throw new Error(`${res.status}`);
-    return res.json();
+    const raw: unknown = await res.json();
+    return normalizeAgentsPayload(raw, page);
   } catch {
     // Fall back to local fake data
     const start = (page - 1) * PER_PAGE;
@@ -76,9 +112,18 @@ function EditableText({
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
-        onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") { setDraft(value); setEditing(false); } }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+          if (e.key === "Escape") {
+            setDraft(value);
+            setEditing(false);
+          }
+        }}
         className="w-full bg-transparent border-b outline-none text-sm"
-        style={{ color: "var(--fg-default)", borderColor: "var(--border-default)" }}
+        style={{
+          color: "var(--fg-default)",
+          borderColor: "var(--border-default)",
+        }}
       />
     );
   }
@@ -108,7 +153,10 @@ function EditableCapabilities({
 
   const commit = () => {
     setEditing(false);
-    const next = draft.split(",").map((s) => s.trim()).filter(Boolean);
+    const next = draft
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     onSave(next);
   };
 
@@ -119,9 +167,18 @@ function EditableCapabilities({
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commit}
-        onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") { setDraft(value.join(", ")); setEditing(false); } }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+          if (e.key === "Escape") {
+            setDraft(value.join(", "));
+            setEditing(false);
+          }
+        }}
         className="w-full bg-transparent border-b outline-none text-xs"
-        style={{ color: "var(--fg-default)", borderColor: "var(--border-default)" }}
+        style={{
+          color: "var(--fg-default)",
+          borderColor: "var(--border-default)",
+        }}
         placeholder="comma-separated"
       />
     );
@@ -219,7 +276,9 @@ function TagInput({
         value={input}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
-        placeholder={tags.length === 0 ? "type a capability, add comma to tag…" : ""}
+        placeholder={
+          tags.length === 0 ? "type a capability, add comma to tag…" : ""
+        }
         className="flex-1 bg-transparent outline-none min-w-32"
         style={{ color: "var(--fg-default)", fontSize: "14px" }}
       />
@@ -271,12 +330,20 @@ function AddAgentModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center"
-      style={{ backgroundColor: "rgba(0,0,0,0.65)", backdropFilter: "blur(6px)" }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      style={{
+        backgroundColor: "rgba(0,0,0,0.65)",
+        backdropFilter: "blur(6px)",
+      }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
       <div
         className="relative w-full max-w-md mx-4 rounded-2xl p-7"
-        style={{ backgroundColor: "var(--bg-subtle)", border: "1px solid var(--border-default)" }}
+        style={{
+          backgroundColor: "var(--bg-subtle)",
+          border: "1px solid var(--border-default)",
+        }}
       >
         <button
           onClick={onClose}
@@ -286,41 +353,60 @@ function AddAgentModal({
           ×
         </button>
 
-        <h2 className="text-xl font-semibold mb-7" style={{ color: "var(--fg-default)" }}>
+        <h2
+          className="text-xl font-semibold mb-7"
+          style={{ color: "var(--fg-default)" }}
+        >
           Add new agent
         </h2>
 
         <div className="space-y-5">
           <div>
-            <label className="block mb-1.5 text-sm font-medium" style={{ color: "var(--fg-muted)" }}>
+            <label
+              className="block mb-1.5 text-sm font-medium"
+              style={{ color: "var(--fg-muted)" }}
+            >
               Name
             </label>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleAdd();
+              }}
               placeholder="agent-name"
               style={inputStyle}
             />
           </div>
 
           <div>
-            <label className="block mb-1.5 text-sm font-medium" style={{ color: "var(--fg-muted)" }}>
+            <label
+              className="block mb-1.5 text-sm font-medium"
+              style={{ color: "var(--fg-muted)" }}
+            >
               Role
             </label>
             <input
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") handleAdd(); }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleAdd();
+              }}
               placeholder="e.g. Solidity Developer"
               style={inputStyle}
             />
           </div>
 
           <div>
-            <label className="block mb-1.5 text-sm font-medium" style={{ color: "var(--fg-muted)" }}>
+            <label
+              className="block mb-1.5 text-sm font-medium"
+              style={{ color: "var(--fg-muted)" }}
+            >
               Capabilities
-              <span className="ml-1.5 font-normal" style={{ color: "var(--fg-subtle)", fontSize: "12px" }}>
+              <span
+                className="ml-1.5 font-normal"
+                style={{ color: "var(--fg-subtle)", fontSize: "12px" }}
+              >
                 (add comma to tag)
               </span>
             </label>
@@ -328,9 +414,15 @@ function AddAgentModal({
           </div>
 
           <div>
-            <label className="block mb-1.5 text-sm font-medium" style={{ color: "var(--fg-muted)" }}>
+            <label
+              className="block mb-1.5 text-sm font-medium"
+              style={{ color: "var(--fg-muted)" }}
+            >
               Knowledge document
-              <span className="ml-1.5 font-normal" style={{ color: "var(--fg-subtle)", fontSize: "12px" }}>
+              <span
+                className="ml-1.5 font-normal"
+                style={{ color: "var(--fg-subtle)", fontSize: "12px" }}
+              >
                 (optional)
               </span>
             </label>
@@ -351,7 +443,9 @@ function AddAgentModal({
                 color: docFile ? "var(--fg-default)" : "var(--fg-subtle)",
               }}
             >
-              {docFile ? docFile.name : "Click to upload (.pdf, .md, .txt, .json)"}
+              {docFile
+                ? docFile.name
+                : "Click to upload (.pdf, .md, .txt, .json)"}
             </button>
           </div>
         </div>
@@ -398,8 +492,12 @@ function AgentRow({
     <tr
       className="transition-colors"
       style={{ borderBottom: "1px solid var(--border-muted)" }}
-      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = "rgba(255,255,255,0.03)")}
-      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = "transparent")}
+      onMouseEnter={(e) =>
+        (e.currentTarget.style.backgroundColor = "rgba(255,255,255,0.03)")
+      }
+      onMouseLeave={(e) =>
+        (e.currentTarget.style.backgroundColor = "transparent")
+      }
     >
       {/* Name */}
       <td className="px-4 py-4 align-top w-36">
@@ -413,7 +511,10 @@ function AgentRow({
       </td>
 
       {/* Created */}
-      <td className="px-4 py-4 align-top text-sm whitespace-nowrap" style={{ color: "var(--fg-muted)" }}>
+      <td
+        className="px-4 py-4 align-top text-sm whitespace-nowrap"
+        style={{ color: "var(--fg-muted)" }}
+      >
         {formatDate(agent.created_at)}
       </td>
 
@@ -426,12 +527,18 @@ function AgentRow({
       </td>
 
       {/* Reputation */}
-      <td className="px-4 py-4 align-top text-sm text-right tabular-nums" style={{ color: "var(--fg-default)" }}>
+      <td
+        className="px-4 py-4 align-top text-sm text-right tabular-nums"
+        style={{ color: "var(--fg-default)" }}
+      >
         {agent.reputation_score.toLocaleString()}
       </td>
 
       {/* Wallet */}
-      <td className="px-4 py-4 align-top text-sm text-right tabular-nums" style={{ color: "var(--fg-muted)" }}>
+      <td
+        className="px-4 py-4 align-top text-sm text-right tabular-nums"
+        style={{ color: "var(--fg-muted)" }}
+      >
         {agent.wallet_balance.toFixed(4)} ETH
       </td>
 
@@ -444,7 +551,9 @@ function AgentRow({
             if (!isNaN(n)) onUpdate(agent.id, { max_bounty_spent: n });
           }}
         />
-        <span className="text-xs ml-1" style={{ color: "var(--fg-subtle)" }}>ETH</span>
+        <span className="text-xs ml-1" style={{ color: "var(--fg-subtle)" }}>
+          ETH
+        </span>
       </td>
 
       {/* Delete */}
@@ -496,10 +605,14 @@ export default function AgentsPage() {
     }
   };
 
-  useEffect(() => { load(page); }, [page]);
+  useEffect(() => {
+    load(page);
+  }, [page]);
 
   const handleUpdate = (id: string, patch: Partial<Agent>) => {
-    setAgents((prev) => prev.map((a) => (a.id === id ? { ...a, ...patch } : a)));
+    setAgents((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+    );
     // TODO: PATCH /agents/:id
   };
 
@@ -515,16 +628,24 @@ export default function AgentsPage() {
   };
 
   return (
-    <div className="min-h-screen" style={{ backgroundColor: "var(--bg-canvas)" }}>
-
+    <div
+      className="min-h-screen"
+      style={{ backgroundColor: "var(--bg-canvas)" }}
+    >
       <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-10">
         {/* ── Heading row ── */}
         <div className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="text-3xl font-bold" style={{ color: "var(--fg-default)" }}>
+            <h1
+              className="text-3xl font-bold"
+              style={{ color: "var(--fg-default)" }}
+            >
               Agents
             </h1>
-            <p className="mt-1" style={{ color: "var(--fg-muted)", fontSize: "18px" }}>
+            <p
+              className="mt-1"
+              style={{ color: "var(--fg-muted)", fontSize: "18px" }}
+            >
               Manage autonomous agents and their configuration.
             </p>
           </div>
@@ -559,15 +680,24 @@ export default function AgentsPage() {
           style={{ border: "1px solid var(--border-default)" }}
         >
           {loading ? (
-            <div className="flex items-center justify-center py-24" style={{ color: "var(--fg-subtle)", fontSize: "18px" }}>
+            <div
+              className="flex items-center justify-center py-24"
+              style={{ color: "var(--fg-subtle)", fontSize: "18px" }}
+            >
               Loading agents…
             </div>
           ) : error ? (
-            <div className="flex items-center justify-center py-24" style={{ color: "#ef4444", fontSize: "18px" }}>
+            <div
+              className="flex items-center justify-center py-24"
+              style={{ color: "#ef4444", fontSize: "18px" }}
+            >
               {error}
             </div>
           ) : agents.length === 0 ? (
-            <div className="flex items-center justify-center py-24" style={{ color: "var(--fg-subtle)", fontSize: "18px" }}>
+            <div
+              className="flex items-center justify-center py-24"
+              style={{ color: "var(--fg-subtle)", fontSize: "18px" }}
+            >
               No agents found.
             </div>
           ) : (
@@ -583,10 +713,16 @@ export default function AgentsPage() {
                 >
                   <th className="px-4 py-3 text-left font-medium">Name</th>
                   <th className="px-4 py-3 text-left font-medium">Created</th>
-                  <th className="px-4 py-3 text-left font-medium">Capabilities</th>
-                  <th className="px-4 py-3 text-right font-medium">Reputation</th>
+                  <th className="px-4 py-3 text-left font-medium">
+                    Capabilities
+                  </th>
+                  <th className="px-4 py-3 text-right font-medium">
+                    Reputation
+                  </th>
                   <th className="px-4 py-3 text-right font-medium">Balance</th>
-                  <th className="px-4 py-3 text-right font-medium">Max Bounty</th>
+                  <th className="px-4 py-3 text-right font-medium">
+                    Max Bounty
+                  </th>
                   <th className="px-4 py-3 text-center font-medium"></th>
                 </tr>
               </thead>

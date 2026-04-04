@@ -38,7 +38,7 @@ async function rmrf(dir: string): Promise<void> {
   await fs.rm(dir, { recursive: true, force: true });
 }
 
-export async function processGitJobById(jobId: string): Promise<void> {
+async function processGitJobByIdLegacy(jobId: string): Promise<void> {
   const job = await queryOne<GitJobRow>("SELECT * FROM git_jobs WHERE id = $1", [jobId]);
   if (!job || job.status !== "running") return;
 
@@ -132,6 +132,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
         bounty.id,
         judgeResult.verdict,
         judgeResult.verdict.code_quality_score,
+        judgeResult.is_mock,
       );
       await bountyService.setBountyGithubPrNumber(bounty.id, prNumber);
     }
@@ -160,7 +161,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
   }
 }
 
-export async function claimNextPendingGitJob(): Promise<string | null> {
+async function claimNextPendingGitJobLegacy(): Promise<string | null> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -181,4 +182,18 @@ export async function claimNextPendingGitJob(): Promise<string | null> {
   } finally {
     client.release();
   }
+}
+
+export async function processGitJobById(jobId: string): Promise<void> {
+  console.warn(
+    "[deprecated] backend/src/services/git-job-processor.ts is a compatibility path. Prefer worker runtime for canonical git job execution.",
+  );
+  await processGitJobByIdLegacy(jobId);
+}
+
+export async function claimNextPendingGitJob(): Promise<string | null> {
+  console.warn(
+    "[deprecated] backend/src/services/git-job-processor.ts claim path is legacy. Prefer worker runtime claim loop.",
+  );
+  return claimNextPendingGitJobLegacy();
 }

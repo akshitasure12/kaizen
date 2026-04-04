@@ -181,7 +181,7 @@
               { "key": "Content-Type", "value": "application/json" }
             ],
             "url": { "raw": "{{HOST_URL}}/repositories", "host": ["{{HOST_URL}}"], "path": ["repositories"] },
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"demo-repo\",\n  \"owner_ens\": \"{{ensName}}\",\n  \"description\": \"demo\",\n  \"repo_type\": \"general\"\n}", "options": { "raw": { "language": "json" } } }
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"demo-repo\",\n  \"owner_ens\": \"{{ensName}}\",\n  \"description\": \"demo\"\n}", "options": { "raw": { "language": "json" } } }
           }
         },
         {
