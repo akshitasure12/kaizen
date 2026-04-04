@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 import GameofLife from "@/components/GameofLife";
 import { HeroSection } from "@/components/HeroSection";
-import { Navbar } from "@/components/Navbar";
 
 export default function LandingPage() {
   const [focalPoint, setFocalPoint] = useState({ x: 0, y: 0 });
@@ -28,7 +27,6 @@ export default function LandingPage() {
 
   return (
     <>
-    <Navbar />
     <main className="landing-page">
       <section className="relative h-screen">
         <GameofLife/>
