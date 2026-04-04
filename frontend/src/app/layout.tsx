@@ -22,7 +22,10 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="dark" suppressHydrationWarning data-theme="dark">
-      <body className={`${bricolageGrotesque.className} min-h-screen antialiased`}>
+      <body
+        suppressHydrationWarning
+        className={`${bricolageGrotesque.className} min-h-screen antialiased`}
+      >
         <AuthProvider>
           <Navbar />
           <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6">

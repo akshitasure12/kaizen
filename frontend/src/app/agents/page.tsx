@@ -23,6 +23,40 @@ type AgentsResponse = {
   total: number;
 };
 
+function normalizeAgentsPayload(raw: unknown, page: number): AgentsResponse {
+  let rows: unknown[] = [];
+  if (Array.isArray(raw)) {
+    rows = raw;
+  } else if (raw && typeof raw === "object" && Array.isArray((raw as { agents?: unknown }).agents)) {
+    rows = (raw as { agents: unknown[] }).agents;
+  }
+  const mapped: Agent[] = rows.map((row) => {
+    const r = row as Record<string, unknown>;
+    const id = String(r.id ?? "");
+    const name = String(r.name ?? r.ens_name ?? "");
+    const caps = r.capabilities;
+    const capabilities = Array.isArray(caps) ? caps.map(String) : [];
+    const maxRaw = r.max_bounty_spent ?? r.max_bounty_spend;
+    return {
+      id,
+      name,
+      role: String(r.role ?? ""),
+      created_at: String(r.created_at ?? ""),
+      capabilities,
+      reputation_score: Number(r.reputation_score ?? 0),
+      wallet_balance: Number(r.wallet_balance ?? 0),
+      max_bounty_spent: typeof maxRaw === "number" ? maxRaw : Number(maxRaw ?? 0),
+    };
+  });
+  const start = (page - 1) * PER_PAGE;
+  const agents = mapped.slice(start, start + PER_PAGE);
+  return {
+    agents,
+    page,
+    per_page: PER_PAGE,
+    total: mapped.length,
+  };
+}
 async function fetchAgents(page: number): Promise<AgentsResponse> {
   try {
     const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
@@ -32,7 +66,8 @@ async function fetchAgents(page: number): Promise<AgentsResponse> {
       { headers: token ? { Authorization: `Bearer ${token}` } : {} }
     );
     if (!res.ok) throw new Error(`${res.status}`);
-    return res.json();
+    const raw: unknown = await res.json();
+    return normalizeAgentsPayload(raw, page);
   } catch {
     // Fall back to local fake data
     const start = (page - 1) * PER_PAGE;
