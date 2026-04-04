@@ -92,11 +92,9 @@
 
 html {
   color-scheme: dark;
-  overflow: hidden;
 }
 
 body {
-  overflow: hidden;
   background-color: var(--bg-canvas);
   color: var(--fg-default);
   font-family: inherit;
