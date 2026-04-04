@@ -100,7 +100,9 @@ export default function DashboardPage() {
     setGhError(null);
     try {
       const data = await integrationsApi.listGithubRepos(p, 30);
-      setGhList((prev) => append ? [...prev, ...(data.items ?? [])] : data.items ?? []);
+      setGhList((prev) =>
+        append ? [...prev, ...(data.items ?? [])] : (data.items ?? []),
+      );
       setGhHasNext(data.has_next);
       setGhPage(p);
     } catch (e) {
