@@ -191,9 +191,10 @@ export function Navbar() {
                 onMouseLeave={(e) => {
                   e.currentTarget.style.backgroundColor = "#ffffff";
                 }}
-              >
+                >
                 Sign out
               </button>
+              </>
             ) : (
               <Link
                 href="/login"
