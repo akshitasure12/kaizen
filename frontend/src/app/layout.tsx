@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { AuthProvider } from "@/contexts/AuthContext";
 import { Navbar } from "@/components/Navbar";
+import { AuthRouteGuard } from "@/components/AuthRouteGuard";
 import { Bricolage_Grotesque } from "next/font/google";
 
 const bricolageGrotesque = Bricolage_Grotesque({
@@ -28,9 +29,11 @@ export default function RootLayout({
       >
         <AuthProvider>
           <Navbar />
-          <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6">
-            {children}
-          </main>
+          <AuthRouteGuard>
+            <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6">
+              {children}
+            </main>
+          </AuthRouteGuard>
         </AuthProvider>
       </body>
     </html>
