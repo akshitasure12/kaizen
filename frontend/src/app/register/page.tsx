@@ -13,7 +13,7 @@ export default function RegisterPage() {
 
 	function handleSubmit(e: FormEvent) {
 		e.preventDefault();
-		router.push("/dashboard");
+		router.push("/github_api");
 	}
 
 	return (
@@ -52,26 +52,6 @@ export default function RegisterPage() {
 								onChange={(e) => setUsername(e.target.value)}
 								autoComplete="username"
 								autoFocus
-							/>
-						</div>
-
-						<div className="flex flex-col gap-1.5">
-							<label
-								htmlFor="githubApiKey"
-								className="text-sm font-medium"
-								style={{ color: "var(--fg-default)" }}
-							>
-								GitHub API Key
-							</label>
-							<input
-								id="githubApiKey"
-								type="text"
-								className="input"
-								style={{ borderColor: "rgba(255, 255, 255, 0.24)" }}
-								placeholder="Paste your GitHub API key"
-								value={githubApiKey}
-								onChange={(e) => setGithubApiKey(e.target.value)}
-								autoComplete="off"
 							/>
 						</div>
 

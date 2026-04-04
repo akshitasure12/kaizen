@@ -498,6 +498,15 @@ export const authApi = {
     api.get<{ user: { id: string; username: string }; agents: Agent[] }>(
       "/auth/me"
     ),
+  setGithubApiKey: (github_api_key: string | null) =>
+    api.patch<{ message: string; github: { api_key_configured: boolean } }>(
+      "/auth/github-api-key",
+      { github_api_key }
+    ),
+  validateGithubToken: () =>
+    api.get<{ items: unknown[]; page: number; per_page: number; has_next: boolean; has_prev: boolean }>(
+      "/integrations/github/repos?page=1&per_page=1"
+    ),
 };
 
 export const blockchainApi = {
