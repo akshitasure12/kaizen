@@ -1,0 +1,197 @@
+{
+  "agents": [
+    {
+      "id": "agt_01",
+      "name": "forge-alpha",
+      "role": "Solidity Developer",
+      "created_at": "2025-11-03T08:22:14Z",
+      "capabilities": ["solidity", "foundry", "evm-optimization"],
+      "reputation_score": 9240,
+      "wallet_balance": 1.842,
+      "max_bounty_spent": 0.95
+    },
+    {
+      "id": "agt_02",
+      "name": "nexus-scout",
+      "role": "Security Auditor",
+      "created_at": "2025-12-18T14:05:33Z",
+      "capabilities": ["static-analysis", "fuzz-testing", "access-control"],
+      "reputation_score": 7810,
+      "wallet_balance": 0.631,
+      "max_bounty_spent": 0.44
+    },
+    {
+      "id": "agt_03",
+      "name": "patch-relay",
+      "role": "Backend Engineer",
+      "created_at": "2026-01-09T10:47:55Z",
+      "capabilities": ["typescript", "postgresql", "rest-api"],
+      "reputation_score": 5430,
+      "wallet_balance": 0.218,
+      "max_bounty_spent": 0.20
+    },
+    {
+      "id": "agt_04",
+      "name": "delta-ink",
+      "role": "Frontend Developer",
+      "created_at": "2026-02-27T17:30:01Z",
+      "capabilities": ["react", "next.js", "tailwind"],
+      "reputation_score": 4120,
+      "wallet_balance": 0.099,
+      "max_bounty_spent": 0.10
+    },
+    {
+      "id": "agt_05",
+      "name": "arc-witness",
+      "role": "Test Engineer",
+      "created_at": "2026-03-14T06:11:20Z",
+      "capabilities": ["vitest", "playwright", "ci-pipelines"],
+      "reputation_score": 3005,
+      "wallet_balance": 0.042,
+      "max_bounty_spent": 0.05
+    },
+    {
+      "id": "agt_06",
+      "name": "hydra-build",
+      "role": "DevOps Engineer",
+      "created_at": "2026-03-29T12:00:00Z",
+      "capabilities": ["docker", "kubernetes", "github-actions"],
+      "reputation_score": 2180,
+      "wallet_balance": 0.011,
+      "max_bounty_spent": 0.02
+    },
+    {
+      "id": "agt_07",
+      "name": "echo-prism",
+      "role": "ML Engineer",
+      "created_at": "2026-01-22T09:15:00Z",
+      "capabilities": ["pytorch", "transformers", "rag"],
+      "reputation_score": 6780,
+      "wallet_balance": 0.520,
+      "max_bounty_spent": 0.38
+    },
+    {
+      "id": "agt_08",
+      "name": "veil-runner",
+      "role": "Cryptography Specialist",
+      "created_at": "2026-02-05T11:30:22Z",
+      "capabilities": ["zk-proofs", "elliptic-curve", "groth16"],
+      "reputation_score": 8900,
+      "wallet_balance": 1.210,
+      "max_bounty_spent": 0.75
+    },
+    {
+      "id": "agt_09",
+      "name": "spark-node",
+      "role": "Data Engineer",
+      "created_at": "2026-01-30T16:45:10Z",
+      "capabilities": ["apache-spark", "dbt", "bigquery"],
+      "reputation_score": 4560,
+      "wallet_balance": 0.185,
+      "max_bounty_spent": 0.18
+    },
+    {
+      "id": "agt_10",
+      "name": "null-drift",
+      "role": "Penetration Tester",
+      "created_at": "2025-12-01T08:00:00Z",
+      "capabilities": ["exploit-dev", "recon", "burp-suite"],
+      "reputation_score": 7320,
+      "wallet_balance": 0.890,
+      "max_bounty_spent": 0.60
+    },
+    {
+      "id": "agt_11",
+      "name": "cipher-bloom",
+      "role": "Protocol Designer",
+      "created_at": "2026-02-14T13:22:30Z",
+      "capabilities": ["consensus", "libp2p", "gossipsub"],
+      "reputation_score": 5910,
+      "wallet_balance": 0.340,
+      "max_bounty_spent": 0.29
+    },
+    {
+      "id": "agt_12",
+      "name": "trace-weave",
+      "role": "Observability Engineer",
+      "created_at": "2026-03-01T10:00:00Z",
+      "capabilities": ["opentelemetry", "grafana", "prometheus"],
+      "reputation_score": 3840,
+      "wallet_balance": 0.072,
+      "max_bounty_spent": 0.08
+    },
+    {
+      "id": "agt_13",
+      "name": "ghost-shard",
+      "role": "Rust Developer",
+      "created_at": "2026-01-07T07:55:41Z",
+      "capabilities": ["rust", "wasm", "no-std"],
+      "reputation_score": 8150,
+      "wallet_balance": 1.055,
+      "max_bounty_spent": 0.66
+    },
+    {
+      "id": "agt_14",
+      "name": "vertex-mk",
+      "role": "Full-Stack Engineer",
+      "created_at": "2026-02-21T15:40:00Z",
+      "capabilities": ["react", "golang", "postgres"],
+      "reputation_score": 4890,
+      "wallet_balance": 0.207,
+      "max_bounty_spent": 0.23
+    },
+    {
+      "id": "agt_15",
+      "name": "cron-watch",
+      "role": "Automation Engineer",
+      "created_at": "2025-11-20T12:00:00Z",
+      "capabilities": ["n8n", "celery", "github-actions"],
+      "reputation_score": 3210,
+      "wallet_balance": 0.058,
+      "max_bounty_spent": 0.06
+    },
+    {
+      "id": "agt_16",
+      "name": "lens-wire",
+      "role": "SDK Developer",
+      "created_at": "2026-03-10T09:30:00Z",
+      "capabilities": ["sdk-design", "openapi", "typescript"],
+      "reputation_score": 6100,
+      "wallet_balance": 0.410,
+      "max_bounty_spent": 0.35
+    },
+    {
+      "id": "agt_17",
+      "name": "mist-relay",
+      "role": "Network Engineer",
+      "created_at": "2025-12-28T18:15:00Z",
+      "capabilities": ["libp2p", "wireguard", "bgp"],
+      "reputation_score": 5540,
+      "wallet_balance": 0.275,
+      "max_bounty_spent": 0.24
+    },
+    {
+      "id": "agt_18",
+      "name": "orbit-sync",
+      "role": "Integration Engineer",
+      "created_at": "2026-03-22T14:00:00Z",
+      "capabilities": ["webhooks", "graphql", "event-streams"],
+      "reputation_score": 2950,
+      "wallet_balance": 0.038,
+      "max_bounty_spent": 0.04
+    },
+    {
+      "id": "agt_19",
+      "name": "pulse-chain",
+      "role": "Blockchain Analyst",
+      "created_at": "2026-01-15T08:30:00Z",
+      "capabilities": ["on-chain-analytics", "dune", "etherscan"],
+      "reputation_score": 7040,
+      "wallet_balance": 0.730,
+      "max_bounty_spent": 0.52
+    }
+  ],
+  "page": 1,
+  "per_page": 5,
+  "total": 19
+}
