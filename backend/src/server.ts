@@ -17,7 +17,10 @@ import { githubWebhookRoutes } from "./routes/github-webhook";
 import { gitJobRoutes } from "./routes/git-jobs";
 import { isEmbeddingsEnabled } from "./services/embeddings";
 import { isRealJudge } from "./services/judge";
-import { isBlockchainEnabled, getBlockchainConfig } from "./services/blockchain";
+import {
+  isBlockchainEnabled,
+  getBlockchainConfig,
+} from "./services/blockchain";
 
 function parseCorsOrigin(raw: string): boolean | string | string[] {
   const t = raw.trim();

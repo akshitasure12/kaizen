@@ -28,7 +28,7 @@ services:
       PORT: "3001"
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
       JWT_SECRET: docker-compose-dev-only-use-a-long-random-secret-32chars-min
-      CORS_ORIGIN: "*"
+      CORS_ORIGIN: http://localhost:3000
       # Required for POST /integrations/github/webhook (merge/refund). Set in root .env.
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       # Full public URL for POST /repositories/:id/github/webhook (register hook via GitHub API).
@@ -46,10 +46,36 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
       WORKER_POLL_MS: "10000"
+      WORKER_CONCURRENCY: "2"
+      LEASE_TTL_MS: "120000"
+      RETRY_MAX: "3"
+      GIT_TMP_ROOT: /tmp/kaizen-git-jobs
+      GITHUB_APP_ID: "0"
+      GITHUB_APP_PRIVATE_KEY: ""
     depends_on:
       postgres:
         condition: service_healthy
     profiles: ["stack"]
+
+  worker-dry-run:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      WORKER_POLL_MS: "10000"
+      WORKER_CONCURRENCY: "1"
+      LEASE_TTL_MS: "120000"
+      RETRY_MAX: "3"
+      WORKER_DRY_RUN: "true"
+      GIT_TMP_ROOT: /tmp/kaizen-git-jobs
+      GITHUB_APP_ID: "0"
+      GITHUB_APP_PRIVATE_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["dry-run"]
 
   web:
     build:

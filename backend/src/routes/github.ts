@@ -1,11 +1,55 @@
-/**
- * GitHub API helpers (repos list). Auth: users.github_api_key via PATCH /auth/github-api-key.
- */
-
 import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
-import { fetchGitHubUserReposPage, getGitHubTokenForUser } from "../services/github-integration";
+import {
+  getGitHubTokenForUser,
+  upsertGithubInstallation,
+} from "../services/github-integration";
+
+type FetchGitHubUserReposPageResult =
+  | { ok: true; status: number; data: unknown }
+  | { ok: false; status: number; githubMessage?: string };
+
+async function fetchGitHubUserReposPage(
+  accessToken: string,
+  params: { page: number; per_page: number },
+): Promise<FetchGitHubUserReposPageResult> {
+  const query = new URLSearchParams({
+    page: String(params.page),
+    per_page: String(params.per_page),
+  });
+
+  const response = await fetch(`https://api.github.com/user/repos?${query.toString()}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+
+  if (!response.ok) {
+    let githubMessage: string | undefined;
+    try {
+      const err = (await response.json()) as { message?: string };
+      githubMessage = err.message;
+    } catch {
+      githubMessage = undefined;
+    }
+
+    return {
+      ok: false,
+      status: response.status,
+      githubMessage,
+    };
+  }
+
+  const data = (await response.json()) as unknown;
+  return {
+    ok: true,
+    status: response.status,
+    data,
+  };
+}
 
 const reposQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -13,6 +57,49 @@ const reposQuerySchema = z.object({
 });
 
 export async function githubIntegrationRoutes(app: FastifyInstance) {
+  app.post(
+    "/github/app/callback",
+    { preHandler: requireAuth },
+    async (req, reply) => {
+      const body = req.body as {
+        installation_id?: number;
+        account_login?: string;
+        app_id?: number;
+        pem_encrypted?: string;
+        webhook_secret?: string;
+      };
+
+      const installationId = Number(body.installation_id);
+      const accountLogin = body.account_login?.trim();
+      const appId = Number(body.app_id || process.env.GITHUB_APP_ID || 0);
+      const pemEncrypted = body.pem_encrypted?.trim() || "configured-via-env";
+      const webhookSecret = body.webhook_secret?.trim() || process.env.GITHUB_WEBHOOK_SECRET || "";
+
+      if (!Number.isFinite(installationId) || installationId <= 0) {
+        return reply.status(400).send({ error: "installation_id is required" });
+      }
+      if (!accountLogin) {
+        return reply.status(400).send({ error: "account_login is required" });
+      }
+      if (!Number.isFinite(appId) || appId <= 0) {
+        return reply.status(400).send({ error: "app_id is required" });
+      }
+      if (!webhookSecret) {
+        return reply.status(400).send({ error: "webhook_secret is required" });
+      }
+
+      await upsertGithubInstallation({
+        installationId,
+        accountLogin,
+        appId,
+        pemEncrypted,
+        webhookSecret,
+      });
+
+      return { ok: true, installation_id: installationId, account_login: accountLogin };
+    },
+  );
+
   app.get(
     "/github/repos",
     { preHandler: requireAuth },

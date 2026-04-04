@@ -10,7 +10,7 @@ import { FastifyInstance } from 'fastify';
 import bcrypt from 'bcryptjs';
 import { query, queryOne } from '../db/client';
 import { generateToken, requireAuth } from '../middleware/auth';
-import { getUserGitHubAuthFlags, setUserGithubApiKey } from '../services/github-integration';
+import { getUserGitHubAuthFlags, setUserGithubApiKey, validateGitHubToken } from '../services/github-integration';
 
 const SALT_ROUNDS = 10;
 
@@ -203,6 +203,40 @@ export async function authRoutes(app: FastifyInstance) {
       }
       if (github_api_key.trim().length === 0) {
         return reply.status(400).send({ error: 'github_api_key cannot be only whitespace' });
+      }
+
+      // Validate GitHub token before storing
+      const tokenValue = github_api_key.trim();
+      const validation = await validateGitHubToken(tokenValue);
+      if (!validation.ok) {
+        if (validation.status === 401) {
+          return reply.status(401).send({
+            error: 'Token invalid',
+            code: 'GITHUB_TOKEN_INVALID',
+            message: validation.githubMessage ?? 'The GitHub token is invalid or expired. Please check your token and try again.',
+          });
+        }
+        if (validation.status === 403) {
+          // Check if it's specifically an insufficient permissions issue
+          if (validation.reason === 'insufficient_permissions') {
+            return reply.status(403).send({
+              error: 'Insufficient permissions',
+              code: 'GITHUB_TOKEN_INSUFFICIENT_PERMISSIONS',
+              message: validation.githubMessage ?? 'The token lacks required permissions. Please create a fine-grained token with: Repository (read & write), Issues (read & write), and Pull Requests (read & write) permissions.',
+            });
+          }
+          return reply.status(403).send({
+            error: 'Token forbidden',
+            code: 'GITHUB_TOKEN_FORBIDDEN',
+            message: validation.githubMessage ?? 'The token has insufficient permissions or is restricted.',
+          });
+        }
+        return reply.status(502).send({
+          error: 'GitHub API error',
+          code: 'GITHUB_VALIDATION_ERROR',
+          message: validation.githubMessage ?? 'Unable to validate GitHub token. Please try again later.',
+          status: validation.status,
+        });
       }
     }
 

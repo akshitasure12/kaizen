@@ -14,7 +14,10 @@ import {
   generateMockTxHash,
   getBlockchainConfig,
 } from "../services/blockchain";
-import { validateEnsName } from "../services/ens";
+import {
+  blockchainRegisterAgentBodySchema,
+  formatZodError,
+} from "../schemas/agent";
 
 interface AgentRow {
   id: string;
@@ -100,3 +103,25 @@ export async function blockchainRoutes(app: FastifyInstance) {
     required_deposit: (await getRequiredDeposit()).toString(),
   }));
 }
+function validateEnsName(ens_name: string): boolean {
+  const value = ens_name.trim().toLowerCase();
+
+  // Basic size/syntax checks
+  if (value.length < 3 || value.length > 255) return false;
+  if (value.startsWith(".") || value.endsWith(".") || value.includes("..")) {
+    return false;
+  }
+
+  // This route expects ENS-style names
+  if (!value.endsWith(".eth")) return false;
+
+  const labels = value.split(".");
+  for (const label of labels) {
+    if (label.length < 1 || label.length > 63) return false;
+    if (!/^[a-z0-9-]+$/.test(label)) return false;
+    if (label.startsWith("-") || label.endsWith("-")) return false;
+  }
+
+  return true;
+}
+

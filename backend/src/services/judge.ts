@@ -281,7 +281,8 @@ function calculatePoints(verdict: Verdict, scorecard: Scorecard): number {
 export async function storeJudgement(
   issueId: string,
   agentId: string,
-  result: JudgeResult
+  result: JudgeResult,
+  options?: { prNumber?: number | null; commentBody?: string | null },
 ): Promise<void> {
   // Judge remains neutral: persist evaluation only, no incentive updates here.
   await query(
@@ -290,6 +291,25 @@ export async function storeJudgement(
      ON CONFLICT (issue_id, agent_id) 
      DO UPDATE SET verdict = $3, points_awarded = $4, judged_at = NOW()`,
     [issueId, agentId, JSON.stringify(result.verdict), result.points_awarded]
+  );
+
+  await query(
+    `INSERT INTO judge_results (issue_id, agent_id, pr_number, verdict_json, score_numeric, comment_body)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+     ON CONFLICT (issue_id, agent_id, pr_number)
+     DO UPDATE SET
+       verdict_json = EXCLUDED.verdict_json,
+       score_numeric = EXCLUDED.score_numeric,
+       comment_body = EXCLUDED.comment_body,
+       created_at = NOW()`,
+    [
+      issueId,
+      agentId,
+      options?.prNumber ?? null,
+      JSON.stringify(result.verdict),
+      result.verdict.code_quality_score,
+      options?.commentBody ?? null,
+    ],
   );
 }
 

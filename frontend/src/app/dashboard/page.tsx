@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
+import importableRepos from "@/data/importable-repos.json";
 import {
   authApi,
   integrationsApi,
@@ -12,7 +13,36 @@ import {
   type Repository,
 } from "@/lib/api";
 
-const PAGE_SIZE = 20;
+// API endpoints
+const DASHBOARD_REPOS_API_URL =
+  "http://localhost:3001/integrations/github/repos?page=1&per_page=10";
+const IMPORT_REPOS_API_URL =
+  "http://localhost:3001/integrations/github/repos?page=3&per_page=10";
+
+type LocalRepo = {
+  title: string;
+  owner: string;
+  issues: number;
+  description?: string;
+};
+
+type GithubRepoItem = {
+  id: number;
+  name: string;
+  full_name: string;
+  default_branch: string;
+  private: boolean;
+  html_url: string;
+  description?: string | null;
+};
+
+type GithubReposResponse = {
+  items: GithubRepoItem[];
+  page: number;
+  per_page: number;
+  has_next: boolean;
+  has_prev: boolean;
+};
 
 export default function DashboardPage() {
   const {
@@ -40,7 +70,9 @@ export default function DashboardPage() {
   const [ghHasNext, setGhHasNext] = useState(false);
   const [ghLoading, setGhLoading] = useState(false);
   const [ghError, setGhError] = useState<string | null>(null);
-  const [selectedGh, setSelectedGh] = useState<GitHubAccessibleRepo | null>(null);
+  const [selectedGh, setSelectedGh] = useState<GitHubAccessibleRepo | null>(
+    null,
+  );
 
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
@@ -52,7 +84,9 @@ export default function DashboardPage() {
       const list = await repoApi.list();
       setRepos(list);
     } catch (e) {
-      setReposError(e instanceof Error ? e.message : "Failed to load repositories");
+      setReposError(
+        e instanceof Error ? e.message : "Failed to load repositories",
+      );
     } finally {
       setReposLoading(false);
     }
@@ -173,7 +207,10 @@ export default function DashboardPage() {
   if (!isAuthenticated) {
     return (
       <div className="flex flex-col gap-4 animate-in">
-        <h1 className="text-2xl font-bold" style={{ color: "var(--fg-default)" }}>
+        <h1
+          className="text-2xl font-bold"
+          style={{ color: "var(--fg-default)" }}
+        >
           Dashboard
         </h1>
         <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
@@ -189,11 +226,15 @@ export default function DashboardPage() {
   return (
     <div className="flex flex-col gap-6 animate-in">
       <div>
-        <h1 className="text-2xl font-bold" style={{ color: "var(--fg-default)" }}>
+        <h1
+          className="text-2xl font-bold"
+          style={{ color: "var(--fg-default)" }}
+        >
           Dashboard
         </h1>
         <p className="text-sm mt-1" style={{ color: "var(--fg-muted)" }}>
-          Import a GitHub repo to create a Kaizen record and install the merge webhook in one step.
+          Import a GitHub repo to create a Kaizen record and install the merge
+          webhook in one step.
         </p>
       </div>
 
@@ -208,10 +249,16 @@ export default function DashboardPage() {
               boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.06)",
             }}
           >
-            <p className="text-xs uppercase tracking-wide" style={{ color: "var(--fg-subtle)" }}>
+            <p
+              className="text-xs uppercase tracking-wide"
+              style={{ color: "var(--fg-subtle)" }}
+            >
               {item.label}
             </p>
-            <p className="text-3xl font-bold mt-2" style={{ color: "var(--fg-default)" }}>
+            <p
+              className="text-3xl font-bold mt-2"
+              style={{ color: "var(--fg-default)" }}
+            >
               {item.value}
             </p>
             <p className="text-xs mt-2" style={{ color: "var(--fg-muted)" }}>
@@ -230,11 +277,18 @@ export default function DashboardPage() {
         }}
       >
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
-          <h2 className="text-lg font-semibold" style={{ color: "var(--fg-default)" }}>
+          <h2
+            className="text-lg font-semibold"
+            style={{ color: "var(--fg-default)" }}
+          >
             Repositories
           </h2>
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" onClick={() => loadRepos()} className="btn-secondary text-sm">
+            <button
+              type="button"
+              onClick={() => loadRepos()}
+              className="btn-secondary text-sm"
+            >
               Refresh
             </button>
             <button
@@ -267,7 +321,8 @@ export default function DashboardPage() {
           </p>
         ) : visibleRepos.length === 0 ? (
           <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
-            No repositories yet. Use <strong>Import from GitHub</strong> after connecting a PAT.
+            No repositories yet. Use <strong>Import from GitHub</strong> after
+            connecting a PAT.
           </p>
         ) : (
           <>
@@ -283,20 +338,32 @@ export default function DashboardPage() {
                   }}
                 >
                   <div className="min-w-0">
-                    <p className="text-sm font-medium truncate" style={{ color: "var(--fg-default)" }}>
+                    <p
+                      className="text-sm font-medium truncate"
+                      style={{ color: "var(--fg-default)" }}
+                    >
                       {repo.name}
                     </p>
-                    <p className="text-xs mt-0.5 truncate" style={{ color: "var(--fg-muted)" }}>
+                    <p
+                      className="text-xs mt-0.5 truncate"
+                      style={{ color: "var(--fg-muted)" }}
+                    >
                       {repo.github_owner && repo.github_repo
                         ? `${repo.github_owner}/${repo.github_repo}`
-                        : repo.owner_ens ?? "—"}
+                        : (repo.owner_ens ?? "—")}
                     </p>
                   </div>
                   <div className="shrink-0 text-right leading-tight">
-                    <p className="text-lg font-bold tabular-nums" style={{ color: "var(--fg-default)" }}>
+                    <p
+                      className="text-lg font-bold tabular-nums"
+                      style={{ color: "var(--fg-default)" }}
+                    >
                       {repo.open_issues ?? 0}
                     </p>
-                    <p className="text-sm" style={{ color: "var(--fg-subtle)" }}>
+                    <p
+                      className="text-sm"
+                      style={{ color: "var(--fg-subtle)" }}
+                    >
                       open issues
                     </p>
                   </div>
@@ -319,7 +386,9 @@ export default function DashboardPage() {
                 </span>
                 <button
                   type="button"
-                  onClick={() => setPage((p) => Math.min(p + 1, totalPages - 1))}
+                  onClick={() =>
+                    setPage((p) => Math.min(p + 1, totalPages - 1))
+                  }
                   disabled={page >= totalPages - 1}
                   className="btn-secondary text-sm disabled:opacity-40"
                 >
@@ -344,7 +413,11 @@ export default function DashboardPage() {
             style={{ borderColor: "var(--border-default)" }}
           >
             <div className="flex items-start justify-between gap-2">
-              <h3 id="import-title" className="text-lg font-semibold" style={{ color: "var(--fg-default)" }}>
+              <h3
+                id="import-title"
+                className="text-lg font-semibold"
+                style={{ color: "var(--fg-default)" }}
+              >
                 Import from GitHub
               </h3>
               <button
@@ -360,7 +433,8 @@ export default function DashboardPage() {
             {!github?.api_key_configured ? (
               <div className="flex flex-col gap-2">
                 <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
-                  Paste a GitHub personal access token with repo and webhook access. It is stored for your account only.
+                  Paste a GitHub personal access token with repo and webhook
+                  access. It is stored for your account only.
                 </p>
                 <input
                   type="password"
@@ -369,7 +443,10 @@ export default function DashboardPage() {
                   value={patInput}
                   onChange={(e) => setPatInput(e.target.value)}
                   className="rounded-md border px-3 py-2 text-sm bg-transparent"
-                  style={{ borderColor: "var(--border-default)", color: "var(--fg-default)" }}
+                  style={{
+                    borderColor: "var(--border-default)",
+                    color: "var(--fg-default)",
+                  }}
                 />
                 {patError && (
                   <p className="text-sm" style={{ color: "#f87171" }}>
@@ -388,22 +465,31 @@ export default function DashboardPage() {
             ) : (
               <>
                 <div className="flex flex-col gap-1">
-                  <label className="text-xs uppercase tracking-wide" style={{ color: "var(--fg-subtle)" }}>
+                  <label
+                    className="text-xs uppercase tracking-wide"
+                    style={{ color: "var(--fg-subtle)" }}
+                  >
                     Owner agent (Kaizen)
                   </label>
                   {agents.length === 0 ? (
                     <p className="text-sm" style={{ color: "#f87171" }}>
-                      Register an agent for your account before importing (POST /agents or your onboarding flow).
+                      Register an agent for your account before importing (POST
+                      /agents or your onboarding flow).
                     </p>
                   ) : (
                     <select
                       value={selectedAgent?.ens_name ?? ""}
                       onChange={(e) => {
-                        const a = agents.find((x) => x.ens_name === e.target.value);
+                        const a = agents.find(
+                          (x) => x.ens_name === e.target.value,
+                        );
                         if (a) selectAgent(a);
                       }}
                       className="rounded-md border px-3 py-2 text-sm bg-transparent"
-                      style={{ borderColor: "var(--border-default)", color: "var(--fg-default)" }}
+                      style={{
+                        borderColor: "var(--border-default)",
+                        color: "var(--fg-default)",
+                      }}
                     >
                       {agents.map((a) => (
                         <option key={a.id} value={a.ens_name}>
@@ -434,14 +520,21 @@ export default function DashboardPage() {
                         className="text-left rounded-lg border px-3 py-2 text-sm transition-colors"
                         style={{
                           borderColor:
-                            selectedGh?.id === r.id ? "var(--accent, #6366f1)" : "var(--border-default)",
+                            selectedGh?.id === r.id
+                              ? "var(--accent, #6366f1)"
+                              : "var(--border-default)",
                           backgroundColor:
-                            selectedGh?.id === r.id ? "rgba(99,102,241,0.12)" : "var(--bg-subtle)",
+                            selectedGh?.id === r.id
+                              ? "rgba(99,102,241,0.12)"
+                              : "var(--bg-subtle)",
                           color: "var(--fg-default)",
                         }}
                       >
                         <span className="font-medium">{r.full_name}</span>
-                        <span className="text-xs block mt-0.5" style={{ color: "var(--fg-muted)" }}>
+                        <span
+                          className="text-xs block mt-0.5"
+                          style={{ color: "var(--fg-muted)" }}
+                        >
                           default: {r.default_branch}
                           {r.private ? " · private" : ""}
                         </span>
@@ -468,17 +561,29 @@ export default function DashboardPage() {
                 )}
 
                 <p className="text-xs" style={{ color: "var(--fg-muted)" }}>
-                  The API creates the repo row, registers the pull_request webhook on GitHub, and stores the hook id.
-                  Requires server env <code className="text-[11px]">GITHUB_WEBHOOK_SECRET</code> and{" "}
-                  <code className="text-[11px]">GITHUB_WEBHOOK_CALLBACK_URL</code>.
+                  The API creates the repo row, registers the pull_request
+                  webhook on GitHub, and stores the hook id. Requires server env{" "}
+                  <code className="text-[11px]">GITHUB_WEBHOOK_SECRET</code> and{" "}
+                  <code className="text-[11px]">
+                    GITHUB_WEBHOOK_CALLBACK_URL
+                  </code>
+                  .
                 </p>
 
                 <button
                   type="button"
-                  disabled={!selectedGh || !selectedAgent || agents.length === 0 || importing}
+                  disabled={
+                    !selectedGh ||
+                    !selectedAgent ||
+                    agents.length === 0 ||
+                    importing
+                  }
                   onClick={() => void runImport()}
                   className="text-sm rounded-lg px-3 py-2 font-medium disabled:opacity-40"
-                  style={{ background: "var(--accent, #6366f1)", color: "#fff" }}
+                  style={{
+                    background: "var(--accent, #6366f1)",
+                    color: "#fff",
+                  }}
                 >
                   {importing ? "Importing…" : "Import & install webhook"}
                 </button>

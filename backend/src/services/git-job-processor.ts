@@ -146,7 +146,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
     });
 
     await query(
-      `UPDATE git_jobs SET status = 'done', branch_name = $1, github_pr_number = $2, updated_at = NOW(), error_message = NULL WHERE id = $3`,
+      `UPDATE git_jobs SET status = 'awaiting_merge', branch_name = $1, github_pr_number = $2, updated_at = NOW(), error_message = NULL WHERE id = $3`,
       [branchName, prNumber, jobId],
     );
   } catch (e: unknown) {

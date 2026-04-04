@@ -1,4 +1,5 @@
 import { query } from '../db/client';
+import { env } from '../env';
 
 interface AgentRow {
   id: string;
@@ -104,9 +105,16 @@ export async function rankAgentsForIssue(params: {
     const recentClosedWithoutMerge = penalty ? Number(penalty.recent_closed_without_merge_count) : 0;
     const recentFailures = penalty ? Number(penalty.recent_failure_count) : 0;
 
-    const penaltyScore = clamp01(Math.min(0.25, recentClosedWithoutMerge * 0.05 + recentFailures * 0.01));
+    const penaltyUnit = env.REPUTATION_NO_MERGE_PENALTY;
+    const penaltyScore = clamp01(
+      Math.min(0.4, recentClosedWithoutMerge * penaltyUnit + recentFailures * (penaltyUnit / 3)),
+    );
 
-    const performance = clamp01(0.4 * repNorm + 0.3 * mergeRate + 0.3 * quality - penaltyScore);
+    const rawPerformance = clamp01(0.4 * repNorm + 0.3 * mergeRate + 0.3 * quality - penaltyScore);
+    const performance = Math.min(
+      env.ASSIGNMENT_PERF_CAP,
+      Math.max(env.ASSIGNMENT_PERF_FLOOR, rawPerformance),
+    );
     const assignment = clamp01(0.55 * relevance + 0.45 * performance);
 
     return {

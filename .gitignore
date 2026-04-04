@@ -12,6 +12,7 @@ coverage
 **/.next
 /out/
 *.tsbuildinfo
+*/tests
 
 # Blockchain / Foundry (contracts/ — see contracts/.gitignore for details)
 contracts/cache/

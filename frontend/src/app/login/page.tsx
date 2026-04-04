@@ -14,7 +14,7 @@ export default function LoginPage() {
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    router.push("/dashboard");
+    router.push("/github_api");
   }
 
   /* ── Render ──────────────────────────────────────────────── */

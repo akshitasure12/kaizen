@@ -8,11 +8,12 @@ export default function RegisterPage() {
 	const router = useRouter();
 
 	const [username, setUsername] = useState("");
+	const [githubApiKey, setGithubApiKey] = useState("");
 	const [password, setPassword] = useState("");
 
 	function handleSubmit(e: FormEvent) {
 		e.preventDefault();
-		router.push("/dashboard");
+		router.push("/github_api");
 	}
 
 	return (
@@ -67,7 +68,7 @@ export default function RegisterPage() {
 								type="password"
 								className="input"
 								style={{ borderColor: "rgba(255, 255, 255, 0.24)" }}
-								placeholder="Min 6 characters"
+								placeholder="Choose a password"
 								value={password}
 								onChange={(e) => setPassword(e.target.value)}
 								autoComplete="new-password"

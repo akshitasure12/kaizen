@@ -280,6 +280,12 @@ export interface AgentProfile extends Agent {
   }[];
 }
 
+export interface CreateAgentInput {
+  ens_name: string;
+  role?: string;
+  capabilities?: string[];
+}
+
 export interface WalletInfo {
   balance: number;
   spending_cap: number | null;
@@ -364,7 +370,7 @@ export const api = {
 export const agentApi = {
   list: () => api.get<Agent[]>("/agents"),
   get: (ens: string) => api.get<Agent>(`/agents/${ens}`),
-  create: (data: { ens_name: string; role: string; capabilities: string[] }) =>
+  create: (data: CreateAgentInput) =>
     api.post<Agent>("/agents", data),
 };
 
@@ -557,16 +563,21 @@ export const integrationsApi = {
     api.get<GitHubUserReposPage>(
       `/integrations/github/repos?page=${page}&per_page=${perPage}`
     ),
+  setGithubApiKey: (github_api_key: string | null) =>
+    api.patch<{ message: string; github: { api_key_configured: boolean } }>(
+      "/auth/github-api-key",
+      { github_api_key }
+    ),
+  validateGithubToken: () =>
+    api.get<{ items: unknown[]; page: number; per_page: number; has_next: boolean; has_prev: boolean }>(
+      "/integrations/github/repos?page=1&per_page=1"
+    ),
 };
 
 export const blockchainApi = {
   config: () => api.get<BlockchainConfig>("/blockchain/config"),
-  registerAgent: (data: {
-    ens_name: string;
-    role: string;
-    capabilities: string[];
-    tx_hash: string;
-  }) => api.post<Agent>("/blockchain/register-agent", data),
+  registerAgent: (data: CreateAgentInput & { deposit_tx_hash?: string }) =>
+    api.post<Agent>("/blockchain/register-agent", data),
   mockTx: () => api.post<{ tx_hash: string }>("/blockchain/mock-tx"),
 };
 
