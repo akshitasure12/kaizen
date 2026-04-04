@@ -85,8 +85,10 @@ function humanizeJobToken(s: string) {
 function gitJobStateLines(j: GitJob): { title: string; subtitle?: string } {
   const st = (j.status || "").trim() || "unknown";
   const sg = (j.stage || "").trim();
-  if (st === sg) {
-    if (st === "pending") {
+  const stL = st.toLowerCase();
+  const sgL = sg.toLowerCase();
+  if (!sg || stL === sgL) {
+    if (stL === "pending") {
       return {
         title: "Pending",
         subtitle: "Queued — a worker will claim this job when available",
@@ -192,6 +194,18 @@ export default function RepositoryDetailPage() {
     void loadJobs();
   }, [repo, isAuthenticated, loadJobs]);
 
+  const hasActiveQueuedJob = jobs.some(
+    (j) => (j.status || "").toLowerCase().trim() === "pending",
+  );
+
+  useEffect(() => {
+    if (!repo || !isAuthenticated || !hasActiveQueuedJob) return;
+    const t = window.setInterval(() => {
+      void loadJobs();
+    }, 8000);
+    return () => window.clearInterval(t);
+  }, [repo, isAuthenticated, hasActiveQueuedJob, loadJobs]);
+
   const selectedIssue =
     issues.find((i) => i.id === selectedIssueId) ?? null;
 
@@ -288,8 +302,32 @@ export default function RepositoryDetailPage() {
 
   return (
     <div className="flex flex-col gap-6 animate-in">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
+      <div className="flex items-start gap-3">
+        <Link
+          href="/dashboard"
+          className="inline-flex shrink-0 items-center justify-center rounded-lg border p-2.5 transition-colors hover:opacity-90"
+          style={{
+            borderColor: "rgba(255, 255, 255, 0.14)",
+            backgroundColor: "rgba(255, 255, 255, 0.06)",
+            color: "var(--fg-default)",
+          }}
+          aria-label="Back to dashboard"
+        >
+          <svg
+            width="22"
+            height="22"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </Link>
+        <div className="min-w-0 flex-1">
           <h1
             className="text-2xl font-bold"
             style={{ color: "var(--fg-default)" }}
@@ -311,9 +349,6 @@ export default function RepositoryDetailPage() {
             {repo.description?.trim() || "No description."}
           </p>
         </div>
-        <Link href="/dashboard" className="btn-secondary text-sm">
-          Dashboard
-        </Link>
       </div>
 
       <section>
@@ -490,21 +525,23 @@ export default function RepositoryDetailPage() {
                         backgroundColor: "rgba(255, 255, 255, 0.06)",
                       }}
                     >
-                      <p
-                        className="text-sm font-medium"
-                        style={{ color: "var(--fg-default)" }}
-                      >
-                        {issue.title}
-                      </p>
-                      <p
-                        className="text-xs mt-1"
-                        style={{ color: "var(--fg-muted)" }}
-                      >
-                        {issue.status}
-                        {issue.assigned_agent_ens
-                          ? ` · ${issue.assigned_agent_ens}`
-                          : ""}
-                      </p>
+                      <div className="flex items-start justify-between gap-2">
+                        <p
+                          className="text-sm font-medium min-w-0 flex-1"
+                          style={{ color: "var(--fg-default)" }}
+                        >
+                          {issue.title}
+                        </p>
+                        <IssueStatusChip status={issue.status} />
+                      </div>
+                      {issue.assigned_agent_ens ? (
+                        <p
+                          className="text-xs mt-1.5"
+                          style={{ color: "var(--fg-muted)" }}
+                        >
+                          {issue.assigned_agent_ens}
+                        </p>
+                      ) : null}
                     </button>
                   </li>
                 );
@@ -567,7 +604,9 @@ export default function RepositoryDetailPage() {
             </p>
           ) : (
             <ul className="space-y-2 text-sm">
-              {jobs.map((j) => (
+              {jobs.map((j) => {
+                const jobLines = gitJobStateLines(j);
+                return (
                 <li
                   key={j.id}
                   className="rounded-lg px-3 py-2"
@@ -582,9 +621,20 @@ export default function RepositoryDetailPage() {
                   >
                     {j.id.slice(0, 8)}…
                   </div>
-                  <div style={{ color: "var(--fg-default)" }}>
-                    {j.status} · {j.stage}
+                  <div
+                    className="font-medium mt-0.5"
+                    style={{ color: "var(--fg-default)" }}
+                  >
+                    {jobLines.title}
                   </div>
+                  {jobLines.subtitle ? (
+                    <div
+                      className="text-xs mt-1 leading-snug"
+                      style={{ color: "var(--fg-muted)" }}
+                    >
+                      {jobLines.subtitle}
+                    </div>
+                  ) : null}
                   <div
                     className="text-xs mt-1"
                     style={{ color: "var(--fg-muted)" }}
@@ -604,7 +654,8 @@ export default function RepositoryDetailPage() {
                     </div>
                   )}
                 </li>
-              ))}
+              );
+              })}
             </ul>
           )}
           {jobTotal > JOB_PAGE && (
@@ -646,13 +697,16 @@ export default function RepositoryDetailPage() {
             }}
           >
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <p
-                  className="text-xs uppercase tracking-wide"
-                  style={{ color: "var(--fg-subtle)" }}
-                >
-                  Issue
-                </p>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p
+                    className="text-xs uppercase tracking-wide"
+                    style={{ color: "var(--fg-subtle)" }}
+                  >
+                    Issue
+                  </p>
+                  <IssueStatusChip status={selectedIssue.status} />
+                </div>
                 <h3
                   className="text-lg font-semibold mt-1"
                   style={{ color: "var(--fg-default)" }}
@@ -685,10 +739,9 @@ export default function RepositoryDetailPage() {
             )}
 
             <p className="text-xs mt-4" style={{ color: "var(--fg-subtle)" }}>
-              Status: {selectedIssue.status}
               {selectedAgent
-                ? ` · Resolve as ${selectedAgent.ens_name}`
-                : " · Pick an agent in the navbar to pass agent_ens"}
+                ? `Resolve as ${selectedAgent.ens_name}`
+                : "Pick an agent in the navbar to pass agent_ens"}
             </p>
 
             {resolveErr && (

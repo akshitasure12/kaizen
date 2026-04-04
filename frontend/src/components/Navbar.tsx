@@ -101,7 +101,7 @@ export function Navbar() {
               <div className="flex items-center gap-3">
                 <span
                   className="text-sm font-medium truncate max-w-[140px]"
-                  style={{ color: "var(--fg-muted)" }}
+                  style={{ color: "var(--fg-default)" }}
                   title={user?.username}
                 >
                   {user?.username}
@@ -177,23 +177,23 @@ export function Navbar() {
                   {user?.username}
                 </span>
                 <button
-                onClick={handleLogout}
-                className="btn-primary text-sm px-4 py-2 rounded-md transition-colors inline-flex items-center"
-                style={{
-                  color: "#000000",
-                  backgroundColor: "#ffffff",
-                  border: "1px solid rgba(255, 255, 255, 0.2)",
-                  boxShadow: "none",
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.backgroundColor = "#f0f0f0";
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.backgroundColor = "#ffffff";
-                }}
+                  onClick={handleLogout}
+                  className="btn-primary text-sm px-4 py-2 rounded-md transition-colors inline-flex items-center"
+                  style={{
+                    color: "#000000",
+                    backgroundColor: "#ffffff",
+                    border: "1px solid rgba(255, 255, 255, 0.2)",
+                    boxShadow: "none",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = "#f0f0f0";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = "#ffffff";
+                  }}
                 >
-                Sign out
-              </button>
+                  Sign out
+                </button>
               </>
             ) : (
               <Link
