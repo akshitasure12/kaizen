@@ -8,6 +8,7 @@ export default function RegisterPage() {
 	const router = useRouter();
 
 	const [username, setUsername] = useState("");
+	const [githubApiKey, setGithubApiKey] = useState("");
 	const [password, setPassword] = useState("");
 
 	function handleSubmit(e: FormEvent) {
@@ -56,6 +57,26 @@ export default function RegisterPage() {
 
 						<div className="flex flex-col gap-1.5">
 							<label
+								htmlFor="githubApiKey"
+								className="text-sm font-medium"
+								style={{ color: "var(--fg-default)" }}
+							>
+								GitHub API Key
+							</label>
+							<input
+								id="githubApiKey"
+								type="text"
+								className="input"
+								style={{ borderColor: "rgba(255, 255, 255, 0.24)" }}
+								placeholder="Paste your GitHub API key"
+								value={githubApiKey}
+								onChange={(e) => setGithubApiKey(e.target.value)}
+								autoComplete="off"
+							/>
+						</div>
+
+						<div className="flex flex-col gap-1.5">
+							<label
 								htmlFor="password"
 								className="text-sm font-medium"
 								style={{ color: "var(--fg-default)" }}
@@ -67,7 +88,7 @@ export default function RegisterPage() {
 								type="password"
 								className="input"
 								style={{ borderColor: "rgba(255, 255, 255, 0.24)" }}
-								placeholder="Min 6 characters"
+								placeholder="Choose a password"
 								value={password}
 								onChange={(e) => setPassword(e.target.value)}
 								autoComplete="new-password"

@@ -92,11 +92,9 @@
 
 html {
   color-scheme: dark;
-  overflow: hidden;
 }
 
 body {
-  overflow: hidden;
   background-color: var(--bg-canvas);
   color: var(--fg-default);
   font-family: inherit;
@@ -405,6 +403,21 @@ h2 { font-weight: 650; }
 
 .animate-in {
   animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes panelIn {
+  from {
+    opacity: 0;
+    transform: translateX(22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-panel-in {
+  animation: panelIn 0.22s ease-out;
 }
 
 /* ── Markdown Prose Container (v6) ──────────────────────────── */

@@ -37,16 +37,27 @@ export async function blockchainRoutes(app: FastifyInstance) {
     "/register-agent",
     { preHandler: requireAuth },
     async (req, reply) => {
-      const parsed = blockchainRegisterAgentBodySchema.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send({ error: formatZodError(parsed.error) });
+      const body = req.body as {
+        ens_name?: string;
+        role?: string;
+        capabilities?: string[];
+        deposit_tx_hash?: string;
+      };
+      const {
+        ens_name,
+        role = "contributor",
+        capabilities = [],
+        deposit_tx_hash,
+      } = body;
+
+      if (!ens_name || !validateEnsName(ens_name)) {
+        return reply.status(400).send({ error: "Invalid ens_name" });
       }
 
-      const { ens_name, role, capabilities, deposit_tx_hash } = parsed.data;
-
-      const existing = await queryOne<AgentRow>("SELECT * FROM agents WHERE ens_name = $1", [
-        ens_name.toLowerCase(),
-      ]);
+      const existing = await queryOne<AgentRow>(
+        "SELECT * FROM agents WHERE ens_name = $1",
+        [ens_name.toLowerCase()],
+      );
       if (existing) {
         return reply.status(409).send({ error: "Agent already registered" });
       }
@@ -56,19 +67,31 @@ export async function blockchainRoutes(app: FastifyInstance) {
         txHash = generateMockTxHash();
       }
       if (!txHash) {
-        return reply.status(400).send({ error: "deposit_tx_hash required when chain enabled" });
+        return reply
+          .status(400)
+          .send({ error: "deposit_tx_hash required when chain enabled" });
       }
 
-      const required = await getRequiredDeposit();
-      const verification = await verifyDepositTransaction(txHash, required);
+      const verification = await verifyDepositTransaction(txHash, {
+        ensName: ens_name.toLowerCase(),
+      });
       if (!verification.valid) {
-        return reply.status(400).send({ error: verification.reason ?? "verify_failed" });
+        return reply
+          .status(400)
+          .send({ error: verification.reason ?? "verify_failed" });
       }
 
       const [agent] = await query<AgentRow>(
         `INSERT INTO agents (ens_name, role, capabilities, user_id, deposit_tx_hash, deposit_verified)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [ens_name, role ?? "contributor", capabilities, req.user!.userId, txHash, true],
+        [
+          ens_name.toLowerCase(),
+          role,
+          capabilities,
+          req.user!.userId,
+          txHash,
+          true,
+        ],
       );
 
       return reply.status(201).send({ agent });
@@ -76,7 +99,7 @@ export async function blockchainRoutes(app: FastifyInstance) {
   );
 
   app.get("/treasury", async () => ({
-    address: getTreasuryAddress(),
+    address: await getTreasuryAddress(),
     required_deposit: (await getRequiredDeposit()).toString(),
   }));
 }

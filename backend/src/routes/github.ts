@@ -1,23 +1,12 @@
 import { FastifyInstance } from "fastify";
-import { Octokit } from "@octokit/rest";
+import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
-import {
-  getGitHubAppInstallationToken,
-  getGitHubTokenForUser,
-  setUserGithubApiKey,
-  upsertGithubInstallation,
-  upsertGithubRepoLink,
-} from "../services/github-integration";
-import { env } from "../env";
-import { queryOne } from "../db/client";
+import { fetchGitHubUserReposPage, getGitHubTokenForUser } from "../services/github-integration";
 
-function sanitizeRepoName(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function sanitizeOwner(value: string): string {
-  return value.trim().toLowerCase();
-}
+const reposQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  per_page: z.coerce.number().int().min(1).max(100).default(30),
+});
 
 export async function githubIntegrationRoutes(app: FastifyInstance) {
   app.post(
@@ -67,160 +56,52 @@ export async function githubIntegrationRoutes(app: FastifyInstance) {
     "/github/repos",
     { preHandler: requireAuth },
     async (req, reply) => {
-      const installationIdRaw = (req.query as { installation_id?: string }).installation_id;
-
-      if (installationIdRaw) {
-        const installationId = Number(installationIdRaw);
-        if (!Number.isFinite(installationId) || installationId <= 0) {
-          return reply.status(400).send({ error: "installation_id must be a positive integer" });
-        }
-
-        const token = await getGitHubAppInstallationToken(installationId);
-        const octokit = new Octokit({ auth: token });
-        const { data } = await octokit.request("GET /installation/repositories", {
-          per_page: 100,
-          headers: {
-            "x-github-api-version": "2022-11-28",
-          },
+      const parsed = reposQuerySchema.safeParse(req.query);
+      if (!parsed.success) {
+        return reply.status(400).send({
+          error: "Invalid query",
+          code: "INVALID_QUERY",
+          details: parsed.error.flatten(),
         });
-
-        const repos = data.repositories || [];
-
-        return repos.map((r) => ({
-          id: r.id,
-          owner: r.owner.login,
-          name: r.name,
-          full_name: r.full_name,
-          default_branch: r.default_branch,
-          private: r.private,
-          installation_id: installationId,
-        }));
       }
+      const { page, per_page } = parsed.data;
 
       const accessToken = await getGitHubTokenForUser(req.user!.userId);
       if (!accessToken) {
-        return reply.status(400).send({
-          error: "Provide installation_id for App auth, or set a GitHub API key with PATCH /auth/github-api-key",
+        return reply.status(403).send({
+          error: "GitHub token not configured",
+          code: "GITHUB_TOKEN_NOT_CONFIGURED",
+          message:
+            "No personal access token on file for this user. Set one with PATCH /auth/github-api-key (body: { \"github_api_key\": \"...\" }) before listing GitHub repositories.",
         });
       }
 
-      const res = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated", {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-        },
-      });
-      if (!res.ok) {
-        return reply.status(502).send({ error: "GitHub API error", status: res.status });
-      }
-
-      const data = (await res.json()) as Array<{
-        id: number;
-        name: string;
-        full_name: string;
-        default_branch: string;
-        private: boolean;
-        owner: { login: string };
-      }>;
-
-      return data.map((r) => ({
-        id: r.id,
-        owner: r.owner.login,
-        name: r.name,
-        full_name: r.full_name,
-        default_branch: r.default_branch,
-        private: r.private,
-      }));
-    },
-  );
-
-  app.post(
-    "/github/link",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      const body = req.body as {
-        repository_id?: string;
-        installation_id?: number;
-        owner?: string;
-        name?: string;
-        default_branch?: string;
-      };
-
-      const repositoryId = body.repository_id?.trim();
-      const owner = body.owner ? sanitizeOwner(body.owner) : "";
-      const repoName = body.name ? sanitizeRepoName(body.name) : "";
-      const installationId = Number(body.installation_id);
-      const defaultBranch = body.default_branch?.trim() || "main";
-
-      if (!repositoryId) {
-        return reply.status(400).send({ error: "repository_id is required" });
-      }
-      if (!owner || !repoName) {
-        return reply.status(400).send({ error: "owner and name are required" });
-      }
-      if (!Number.isFinite(installationId) || installationId <= 0) {
-        return reply.status(400).send({ error: "installation_id is required" });
-      }
-
-      const exists = await queryOne<{ id: string }>("SELECT id FROM repositories WHERE id = $1", [repositoryId]);
-      if (!exists) {
-        return reply.status(404).send({ error: "Repository not found" });
-      }
-
-      const installation = await queryOne<{ id: string }>(
-        "SELECT id::text AS id FROM github_installations WHERE id = $1",
-        [installationId],
-      );
-      if (!installation) {
-        return reply.status(400).send({
-          error: "Unknown installation_id. Call POST /integrations/github/app/callback first.",
+      const gh = await fetchGitHubUserReposPage(accessToken, { page, per_page });
+      if (!gh.ok) {
+        if (gh.status === 401) {
+          return reply.status(401).send({
+            error: "GitHub rejected the token",
+            code: "GITHUB_TOKEN_INVALID",
+            message: gh.githubMessage ?? "The stored token is invalid or expired. Update it with PATCH /auth/github-api-key.",
+          });
+        }
+        if (gh.status === 403) {
+          return reply.status(502).send({
+            error: "GitHub API forbidden",
+            code: "GITHUB_API_FORBIDDEN",
+            message: gh.githubMessage ?? "Insufficient scopes or rate limit; check the token and GitHub status.",
+            github_status: gh.status,
+          });
+        }
+        return reply.status(502).send({
+          error: "GitHub API error",
+          code: "GITHUB_UPSTREAM_ERROR",
+          message: gh.githubMessage,
+          github_status: gh.status,
         });
       }
 
-      const installToken = await getGitHubAppInstallationToken(installationId);
-      const octokit = new Octokit({ auth: installToken });
-      let remoteDefaultBranch = defaultBranch;
-      try {
-        const { data: remoteRepo } = await octokit.rest.repos.get({
-          owner,
-          repo: repoName,
-        });
-        remoteDefaultBranch = remoteRepo.default_branch || defaultBranch;
-      } catch {
-        // Keep caller-provided default branch when repo lookup cannot be verified.
-      }
-
-      await upsertGithubRepoLink({
-        repositoryId,
-        installationId,
-        owner,
-        name: repoName,
-        defaultBranch: remoteDefaultBranch,
-      });
-
-      return {
-        ok: true,
-        repository_id: repositoryId,
-        installation_id: installationId,
-        owner,
-        name: repoName,
-        default_branch: remoteDefaultBranch,
-      };
-    },
-  );
-
-  app.patch(
-    "/github/pat",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      const { github_api_key } = req.body as { github_api_key?: string | null };
-      if (github_api_key === undefined) {
-        return reply.status(400).send({ error: "github_api_key is required (use null to clear)" });
-      }
-      const value = github_api_key === null || github_api_key === "" ? null : github_api_key.trim();
-      await setUserGithubApiKey(req.user!.userId, value);
-      return { ok: true, api_key_configured: Boolean(value) };
+      return gh.data;
     },
   );
 }

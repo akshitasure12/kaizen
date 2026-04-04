@@ -443,7 +443,15 @@
           "request": {
             "method": "GET",
             "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
-            "url": { "raw": "{{HOST_URL}}/integrations/github/repos", "host": ["{{HOST_URL}}"], "path": ["integrations", "github", "repos"] }
+            "url": {
+              "raw": "{{HOST_URL}}/integrations/github/repos?page=1&per_page=30",
+              "host": ["{{HOST_URL}}"],
+              "path": ["integrations", "github", "repos"],
+              "query": [
+                { "key": "page", "value": "1" },
+                { "key": "per_page", "value": "30" }
+              ]
+            }
           }
         }
       ]
