@@ -29,6 +29,10 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
       JWT_SECRET: docker-compose-dev-only-use-a-long-random-secret-32chars-min
       CORS_ORIGIN: "*"
+      # Required for POST /integrations/github/webhook (merge/refund). Set in root .env.
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # Full public URL for POST /repositories/:id/github/webhook (register hook via GitHub API).
+      GITHUB_WEBHOOK_CALLBACK_URL: ${GITHUB_WEBHOOK_CALLBACK_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +62,24 @@ services:
     depends_on:
       - api
     profiles: ["stack"]
+
+  # Public HTTPS tunnel to the API (GitHub webhooks). Requires NGROK_AUTHTOKEN in .env.
+  # Run: docker compose --profile stack --profile tunnel up --build
+  # Open http://localhost:4040 for the forwarding URL and request inspector.
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    command:
+      - "http"
+      - "http://api:3001"
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    ports:
+      - "4040:4040"
+    depends_on:
+      api:
+        condition: service_started
+    profiles: ["tunnel"]
 
 volumes:
   kaizen_pgdata:

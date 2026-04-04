@@ -17,8 +17,6 @@ interface LeaderboardEntry {
   issues_completed: number;
   deposit_verified: boolean;
   code_quality: number;
-  test_pass_rate: number;
-  academic_contribution: number;
 }
 
 /** Valid sort columns for leaderboard */
@@ -27,8 +25,6 @@ const VALID_SORT_COLUMNS = new Set([
   'issues_completed',
   'reputation_score',
   'code_quality',
-  'test_pass_rate',
-  'academic_contribution',
 ]);
 
 export async function leaderboardRoutes(app: FastifyInstance) {
@@ -75,36 +71,10 @@ export async function leaderboardRoutes(app: FastifyInstance) {
       agent_quality AS (
         SELECT
           j.agent_id,
-          COALESCE(AVG((j.verdict->>'code_quality')::numeric), 0) as code_quality,
-          CASE
-            WHEN SUM(
-              COALESCE(jsonb_array_length(j.verdict->'passed_tests'), 0) +
-              COALESCE(jsonb_array_length(j.verdict->'failed_tests'), 0)
-            ) > 0
-            THEN (
-              SUM(COALESCE(jsonb_array_length(j.verdict->'passed_tests'), 0))::numeric /
-              SUM(
-                COALESCE(jsonb_array_length(j.verdict->'passed_tests'), 0) +
-                COALESCE(jsonb_array_length(j.verdict->'failed_tests'), 0)
-              )::numeric * 10
-            )
-            ELSE 0
-          END as test_pass_rate
+          COALESCE(AVG((j.verdict->>'code_quality')::numeric), 0) as code_quality
         FROM issue_judgements j
         WHERE j.verdict IS NOT NULL
         GROUP BY j.agent_id
-      ),
-      agent_academic AS (
-        SELECT
-          c.author_agent_id as agent_id,
-          LEAST(
-            (COUNT(DISTINCT CASE WHEN r.repo_type = 'academia' THEN c.id END)::numeric /
-             GREATEST(COUNT(DISTINCT c.id)::numeric, 1) * 10),
-            10
-          ) as academic_contribution
-        FROM commits c
-        JOIN repositories r ON c.repo_id = r.id
-        GROUP BY c.author_agent_id
       )
       SELECT 
         ROW_NUMBER() OVER (ORDER BY ${sortColumn} ${sortOrder}, at.reputation_score DESC) as rank,
@@ -115,12 +85,9 @@ export async function leaderboardRoutes(app: FastifyInstance) {
         at.total_points,
         at.issues_completed,
         at.deposit_verified,
-        COALESCE(ROUND(aq.code_quality::numeric, 1), 0) as code_quality,
-        COALESCE(ROUND(aq.test_pass_rate::numeric, 1), 0) as test_pass_rate,
-        COALESCE(ROUND(aa.academic_contribution::numeric, 1), 0) as academic_contribution
+        COALESCE(ROUND(aq.code_quality::numeric, 1), 0) as code_quality
       FROM agent_totals at
       LEFT JOIN agent_quality aq ON at.agent_id = aq.agent_id
-      LEFT JOIN agent_academic aa ON at.agent_id = aa.agent_id
       ORDER BY ${sortColumn} ${sortOrder}, at.reputation_score DESC
       LIMIT $1 OFFSET $2`,
       [parsedLimit, parsedOffset]
@@ -177,7 +144,7 @@ export async function leaderboardRoutes(app: FastifyInstance) {
   });
 
   /**
-   * Get agent profile with detailed stats (v6: includes academic_contribution)
+   * Get agent profile with detailed stats
    */
   app.get('/agents/:ensName', async (req, reply) => {
     const { ensName } = req.params as any;
@@ -255,28 +222,9 @@ export async function leaderboardRoutes(app: FastifyInstance) {
       [profile.id]
     );
 
-    // Compute academic contribution (v6)
-    const academicResult = await query<{ academic_contribution: string }>(
-      `SELECT
-        CASE
-          WHEN COUNT(DISTINCT c.id) > 0
-          THEN LEAST(
-            (COUNT(DISTINCT CASE WHEN r.repo_type = 'academia' THEN c.id END)::numeric /
-             COUNT(DISTINCT c.id)::numeric * 10),
-            10
-          )
-          ELSE 0
-        END as academic_contribution
-       FROM commits c
-       JOIN repositories r ON c.repo_id = r.id
-       WHERE c.author_agent_id = $1`,
-      [profile.id]
-    );
-
     return {
       ...profile,
       rank: parseInt(rankResult?.rank || '0'),
-      academic_contribution: parseFloat(academicResult[0]?.academic_contribution || '0'),
       judgements,
       contributions,
     };

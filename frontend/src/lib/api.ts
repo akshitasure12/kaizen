@@ -24,11 +24,16 @@ async function request<T>(
   });
 
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    const err = new Error(
-      (body as Record<string, string>).error ?? `Request failed: ${res.status}`
-    );
-    (err as ApiError).status = res.status;
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const msg =
+      (typeof body.message === "string" && body.message) ||
+      (typeof body.error === "string" && body.error) ||
+      `Request failed: ${res.status}`;
+    const err = new Error(msg) as ApiError;
+    err.status = res.status;
+    if (typeof body.code === "string") err.code = body.code;
+    if (typeof body.github_message === "string") err.github_message = body.github_message;
+    if (typeof body.github_status === "number") err.github_status = body.github_status;
     throw err;
   }
 
@@ -37,6 +42,9 @@ async function request<T>(
 
 export interface ApiError extends Error {
   status: number;
+  code?: string;
+  github_message?: string;
+  github_status?: number;
 }
 
 // ── Types ──────────────────────────────────────────────────────
@@ -66,6 +74,35 @@ export interface Repository {
   repo_type?: "general" | "academia";
   academia_field?: string;
   created_at: string;
+  github_owner?: string | null;
+  github_repo?: string | null;
+  github_default_branch?: string | null;
+  github_hook_id?: number | null;
+}
+
+export interface GitHubAccessibleRepo {
+  id: number;
+  name: string;
+  full_name: string;
+  default_branch: string;
+  private: boolean;
+  html_url: string;
+}
+
+export interface GitHubUserReposPage {
+  items: GitHubAccessibleRepo[];
+  page: number;
+  per_page: number;
+  has_next: boolean;
+  has_prev: boolean;
+}
+
+export interface RepoImportResult extends Repository {
+  webhook: {
+    action: "created" | "updated";
+    hook_id: number;
+    callback_url: string;
+  };
 }
 
 export interface Branch {
@@ -207,8 +244,6 @@ export interface LeaderboardEntry {
   issues_completed: number;
   deposit_verified: boolean;
   code_quality: number;
-  test_pass_rate: number;
-  academic_contribution: number;
 }
 
 export interface LeaderboardResponse {
@@ -234,7 +269,6 @@ export interface AgentProfile extends Agent {
   rank: number;
   total_points: number;
   issues_completed: number;
-  academic_contribution: number;
   judgements: Judgement[];
   contributions: {
     id: string;
@@ -341,6 +375,16 @@ export const repoApi = {
     const qs = params.toString();
     return api.get<Repository[]>(`/repositories${qs ? `?${qs}` : ""}`);
   },
+  importFromGitHub: (body: {
+    owner_ens: string;
+    github_owner: string;
+    github_repo: string;
+    github_default_branch?: string;
+    name?: string;
+    description?: string;
+    repo_type?: "general" | "academia";
+    academia_field?: string;
+  }) => api.post<RepoImportResult>("/repositories/import-from-github", body),
   get: (id: string) => api.get<Repository>(`/repositories/${id}`),
   branches: (id: string) => api.get<Branch[]>(`/repositories/${id}/branches`),
   commits: (id: string, agentEns: string, branch?: string) => {
@@ -483,6 +527,12 @@ export const leaderboardApi = {
     api.get<AgentProfile>(`/leaderboard/agents/${ens}`),
 };
 
+export interface AuthMeResponse {
+  user: { id: string; username: string; created_at?: string };
+  agents: Agent[];
+  github: { api_key_configured: boolean };
+}
+
 export const authApi = {
   register: (username: string, password: string) =>
     api.post<{ token: string; user: { id: string; username: string } }>(
@@ -494,9 +544,18 @@ export const authApi = {
       "/auth/login",
       { username, password }
     ),
-  me: () =>
-    api.get<{ user: { id: string; username: string }; agents: Agent[] }>(
-      "/auth/me"
+  me: () => api.get<AuthMeResponse>("/auth/me"),
+  setGithubApiKey: (github_api_key: string | null) =>
+    api.patch<{ message: string; github: { api_key_configured: boolean } }>(
+      "/auth/github-api-key",
+      { github_api_key }
+    ),
+};
+
+export const integrationsApi = {
+  listGithubRepos: (page = 1, perPage = 30) =>
+    api.get<GitHubUserReposPage>(
+      `/integrations/github/repos?page=${page}&per_page=${perPage}`
     ),
 };
 

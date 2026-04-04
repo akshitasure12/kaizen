@@ -57,7 +57,7 @@ export async function gitJobRoutes(app: FastifyInstance) {
           .status(400)
           .send({
             error:
-              "Set repository GitHub remote (PATCH /repositories/:id/github) and user PAT (PATCH /auth/github-api-key)",
+              "Import the GitHub repo (POST /repositories/import-from-github) and ensure PAT (PATCH /auth/github-api-key)",
           });
       }
 

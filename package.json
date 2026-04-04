@@ -21,7 +21,8 @@
     "start:frontend": "bun run --cwd frontend start",
     "migrate": "bun run --cwd backend migrate",
     "compose:up": "docker compose up -d postgres",
-    "compose:down": "docker compose down"
+    "compose:down": "docker compose down",
+    "tunnel:ngrok": "ngrok http 3001"
   },
   "engines": {
     "node": ">=20"

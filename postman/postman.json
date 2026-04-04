@@ -168,6 +168,23 @@
             "body": { "mode": "raw", "raw": "{\n  \"name\": \"demo-repo\",\n  \"owner_ens\": \"{{ensName}}\",\n  \"description\": \"demo\",\n  \"repo_type\": \"general\"\n}", "options": { "raw": { "language": "json" } } }
           }
         },
+        {
+          "name": "POST /repositories/import-from-github",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{HOST_URL}}/repositories/import-from-github", "host": ["{{HOST_URL}}"], "path": ["repositories", "import-from-github"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"owner_ens\": \"{{ensName}}\",\n  \"github_owner\": \"{{githubOwner}}\",\n  \"github_repo\": \"{{githubRepo}}\",\n  \"github_default_branch\": \"main\",\n  \"name\": \"{{githubRepo}}\",\n  \"repo_type\": \"general\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Creates Kaizen repo, links GitHub, provisions PR webhook. Server needs GITHUB_WEBHOOK_SECRET + GITHUB_WEBHOOK_CALLBACK_URL. Only supported webhook path."
+          }
+        },
         { "name": "GET /repositories", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories", "host": ["{{HOST_URL}}"], "path": ["repositories"] } } },
         { "name": "GET /repositories/:id", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}"] } } },
         {
@@ -179,7 +196,8 @@
               { "key": "Content-Type", "value": "application/json" }
             ],
             "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/github", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "github"] },
-            "body": { "mode": "raw", "raw": "{\n  \"github_owner\": \"{{githubOwner}}\",\n  \"github_repo\": \"{{githubRepo}}\",\n  \"github_default_branch\": \"main\"\n}", "options": { "raw": { "language": "json" } } }
+            "body": { "mode": "raw", "raw": "{\n  \"github_default_branch\": \"main\"\n}", "options": { "raw": { "language": "json" } } },
+            "description": "Only after import-from-github: update default branch. Cannot set github_owner/github_repo here."
           }
         },
         {

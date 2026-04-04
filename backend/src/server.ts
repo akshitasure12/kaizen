@@ -72,6 +72,8 @@ async function buildApp() {
     hasGemini: Boolean(env.GEMINI_API_KEY),
     github: {
       webhook: Boolean(env.GITHUB_WEBHOOK_SECRET),
+      webhookCallbackUrlConfigured: Boolean(env.GITHUB_WEBHOOK_CALLBACK_URL),
+      importRepoAndWebhook: "POST /repositories/import-from-github",
       userApiKey: "PATCH /auth/github-api-key",
     },
     corsOrigin: env.CORS_ORIGIN === "*" ? "*" : "[set]",

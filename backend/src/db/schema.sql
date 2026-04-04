@@ -62,6 +62,8 @@ ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_owner VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_repo VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_default_branch VARCHAR(255) DEFAULT 'main';
 
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_hook_id BIGINT;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_github_remote
   ON repositories (lower(github_owner), lower(github_repo))
   WHERE github_owner IS NOT NULL AND github_repo IS NOT NULL;
