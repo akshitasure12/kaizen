@@ -61,6 +61,77 @@ export async function setUserGithubApiKey(userId: string, apiKey: string | null)
   await query("UPDATE users SET github_api_key = $1 WHERE id = $2", [v, userId]);
 }
 
+export async function validateGitHubToken(
+  token: string,
+): Promise<
+  | { ok: true }
+  | { ok: false; status: number; githubMessage?: string; reason?: string }
+> {
+  // Step 1: Validate token is not expired/revoked by checking /user endpoint
+  const userUrl = new URL("https://api.github.com/user");
+  const userRes = await fetch(userUrl.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+
+  if (!userRes.ok) {
+    let githubMessage: string | undefined;
+    try {
+      const j = (await userRes.json()) as { message?: string };
+      if (typeof j?.message === "string") githubMessage = j.message;
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, status: userRes.status, githubMessage };
+  }
+
+  // Step 2: Verify token has repository and issues access by testing a basic API call
+  // Try to fetch user repos - this tests repository access
+  const reposUrl = new URL("https://api.github.com/user/repos");
+  reposUrl.searchParams.set("per_page", "1");
+  const reposRes = await fetch(reposUrl.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+
+  if (reposRes.status === 403) {
+    let githubMessage: string | undefined;
+    try {
+      const j = (await reposRes.json()) as { message?: string };
+      if (typeof j?.message === "string") githubMessage = j.message;
+    } catch {
+      /* ignore */
+    }
+    return {
+      ok: false,
+      status: 403,
+      reason: "insufficient_permissions",
+      githubMessage:
+        githubMessage ??
+        "Token lacks required permissions. Ensure your fine-grained token has necessary permissions.",
+    };
+  }
+
+  if (!reposRes.ok) {
+    let githubMessage: string | undefined;
+    try {
+      const j = (await reposRes.json()) as { message?: string };
+      if (typeof j?.message === "string") githubMessage = j.message;
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, status: reposRes.status, githubMessage };
+  }
+
+  return { ok: true };
+}
+
 /** Parsed `Link` header from GitHub pagination (e.g. rel="next"). */
 export function parseGitHubLinkHeader(linkHeader: string | null): {
   next?: string;
