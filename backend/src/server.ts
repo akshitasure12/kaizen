@@ -17,7 +17,10 @@ import { githubWebhookRoutes } from "./routes/github-webhook";
 import { gitJobRoutes } from "./routes/git-jobs";
 import { isEmbeddingsEnabled } from "./services/embeddings";
 import { isRealJudge } from "./services/judge";
-import { isBlockchainEnabled, getBlockchainConfig } from "./services/blockchain";
+import {
+  isBlockchainEnabled,
+  getBlockchainConfig,
+} from "./services/blockchain";
 
 function parseCorsOrigin(raw: string): boolean | string | string[] {
   const t = raw.trim();
@@ -72,8 +75,9 @@ async function buildApp() {
     hasGemini: Boolean(env.GEMINI_API_KEY),
     github: {
       webhook: Boolean(env.GITHUB_WEBHOOK_SECRET),
-      appConfigured: Boolean(env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY),
-      legacyUserApiKey: "PATCH /auth/github-api-key",
+      webhookCallbackUrlConfigured: Boolean(env.GITHUB_WEBHOOK_CALLBACK_URL),
+      importRepoAndWebhook: "POST /repositories/import-from-github",
+      userApiKey: "PATCH /auth/github-api-key",
     },
     corsOrigin: env.CORS_ORIGIN === "*" ? "*" : "[set]",
     features: {
