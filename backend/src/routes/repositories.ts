@@ -96,7 +96,6 @@ export async function repositoryRoutes(app: FastifyInstance) {
         ownerEns,
         description,
         'public',
-        { repoType, academiaField: repoType === 'academia' ? academiaField : undefined },
       );
       createdId = repo.id;
 
