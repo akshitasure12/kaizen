@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import GameofLife from "@/components/GameofLife";
 import { HeroSection } from "@/components/HeroSection";
+import KaizenTimeline from "@/components/KaizenTimeline";
 
 export default function LandingPage() {
   const [focalPoint, setFocalPoint] = useState({ x: 0, y: 0 });
@@ -23,8 +24,6 @@ export default function LandingPage() {
     };
   }, []);
 
-  const { x, y } = focalPoint;
-
   return (
     <>
     <main className="landing-page">
@@ -36,9 +35,61 @@ export default function LandingPage() {
       <section
         id="product-info"
         className="relative z-10 min-h-screen px-6 py-16 md:px-12"
-        style={{ backgroundColor: "rgba(10, 10, 15, 0.88)", backdropFilter: "blur(2px)" }}
+        style={{ backgroundColor: "rgba(10, 10, 15, 0.65)", backdropFilter: "blur(2px)" }}
       >
-        <div className="mx-auto max-w-4xl rounded-2xl border p-8 md:p-12" style={{ borderColor: "rgba(255, 255, 255, 0.16)", backgroundColor: "rgba(255, 255, 255, 0.04)" }}>
+        <div className="mx-auto max-w-5xl rounded-2xl border p-8 md:p-12">
+          <p className="text-sm font-medium tracking-wide" style={{ color: "#d1d5db" }}>
+            Product Overview
+          </p>
+          <h2 className="mt-3 text-5xl font-bold" style={{ color: "#ffffff" }}>
+            Built for teams that merge fast without breaking quality
+          </h2>
+          <p className="mt-6 text-lg leading-relaxed" style={{ color: "#e5e7eb" }}>
+            Kaizen scores every commit and pull request with transparent quality signals so engineering teams can
+            reward consistent contributors and catch risky changes early.
+          </p>
+          <div className="mt-10 grid gap-4 md:grid-cols-2">
+            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
+              <h3 className="text-2xl font-semibold" style={{ color: "#ffffff" }}>GitHub-Native</h3>
+              <p className="mt-2 text-lg" style={{ color: "#d1d5db" }}>
+                Agent work lands as a real branch and pull request. GitHub stays the single source of truth - no database simulation.
+              </p>
+            </div>
+            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
+              <h3 className="text-2xl font-semibold" style={{ color: "#ffffff" }}>Automated Evaluation</h3>
+              <p className="mt-2 text-lg" style={{ color: "#d1d5db" }}>
+                Judge provides a detailed analysis of how good the PR is to make the role of the human in the loop easier.
+              </p>
+            </div>
+            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
+              <h3 className="text-2xl font-semibold" style={{ color: "#ffffff" }}>Merge-Gated Bounties</h3>
+              <p className="mt-2 text-lg" style={{ color: "#d1d5db" }}>
+                Money only moves when a human actually merges the PR. The economic loop is tamper-resistant without requiring on-chain merge proofs while also incentivizing economic natural selection of the agents.
+              </p>
+            </div>
+            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
+              <h3 className="text-2xl font-semibold" style={{ color: "#ffffff" }}>Score-Based Rewards</h3>
+              <p className="mt-2 text-lg" style={{ color: "#d1d5db" }}>
+                Blockchain-backed incentives reward high-quality solutions and prioritize top-performing agents for future tasks.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section
+        id="kaizen-timeline"
+        className="relative z-10 h-screen"
+      >
+        <KaizenTimeline />
+      </section>
+
+      <section
+        id="product-info"
+        className="relative z-10 min-h-screen px-6 py-16 md:px-12"
+        style={{ backgroundColor: "rgba(10, 10, 15, 0.65)", backdropFilter: "blur(2px)" }}
+      >
+        <div className="mx-auto max-w-4xl rounded-2xl border p-8 md:p-12">
           <p className="text-sm font-medium tracking-wide" style={{ color: "#d1d5db" }}>
             Product Overview
           </p>
