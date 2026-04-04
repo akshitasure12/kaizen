@@ -14,12 +14,9 @@ import {
 } from "@/lib/api";
 
 // API endpoints
-const DASHBOARD_REPOS_API_URL =
-  "http://localhost:3001/integrations/github/repos?page=1&per_page=10";
-const IMPORT_REPOS_API_URL =
-  "http://localhost:3001/integrations/github/repos?page=3&per_page=10";
-
 const PAGE_SIZE = 10;
+const DASHBOARD_REPOS_API_URL = `http://localhost:3001/integrations/github/repos?page=1&per_page=${PAGE_SIZE}`;
+const IMPORT_REPOS_API_URL = `http://localhost:3001/integrations/github/repos?page=3&per_page=${PAGE_SIZE}`;
 
 type LocalRepo = {
   title: string;
