@@ -19,6 +19,8 @@ const DASHBOARD_REPOS_API_URL =
 const IMPORT_REPOS_API_URL =
   "http://localhost:3001/integrations/github/repos?page=3&per_page=10";
 
+const PAGE_SIZE = 10;
+
 type LocalRepo = {
   title: string;
   owner: string;
