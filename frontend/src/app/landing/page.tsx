@@ -7,6 +7,44 @@ import KaizenTimeline from "@/components/KaizenTimeline";
 
 export default function LandingPage() {
   const [focalPoint, setFocalPoint] = useState({ x: 0, y: 0 });
+  const teammates = [
+    {
+      name: "Nilanjan B Mitra",
+      college: "ABV-IIITM Gwalior",
+      linkedin: "https://www.linkedin.com/in/nilanjanbmitra/",
+      mail: "nilanjanbmitra@gmail.com",
+      role: "Team Lead, Service Integration and Blockchain Developer",
+      intro:
+        "some redbull would've been appreciated",
+    },
+    {
+      name: "Akshita Sure",
+      college: "ABV-IIITM Gwalior",
+      linkedin: "https://www.linkedin.com/in/akshitasure/",
+      mail: "sureakshita23@gmail.com",
+      role: "Backend Developer",
+      intro:
+        "itsworkingitsworkingitsworking",
+    },
+    {
+      name: "Advay Bhagwat",
+      college: "ABV-IIITM Gwalior",
+      linkedin: "https://www.linkedin.com/in/advay-bhagwat/",
+      mail: "advay.bhagwat@gmail.com",
+      role: "Agent Orchestrator's Orchestrator",
+      intro:
+        "ac kab chalu hoga",
+    },
+    {
+      name: "Apoorva Yadav",
+      college: "ABV-IIITM Gwalior",
+      linkedin: "https://www.linkedin.com/in/apoorvayadavv/",
+      mail: "apoorvayadav70516@gmail.com",
+      role: "UI/UX Designer and Frontend Developer",
+      intro:
+        "no thoughts only khikhi",
+    },
+  ];
 
   useEffect(() => {
     const updateFocalPoint = () => {
@@ -85,40 +123,68 @@ export default function LandingPage() {
       </section>
 
       <section
-        id="product-info"
+        id="about-us"
         className="relative z-10 min-h-screen px-6 py-16 md:px-12"
-        style={{ backgroundColor: "rgba(10, 10, 15, 0.65)", backdropFilter: "blur(2px)" }}
+        style={{
+          backgroundColor: "rgba(10, 10, 15, 0.65)",
+          backdropFilter: "blur(2px)",
+        }}
       >
-        <div className="mx-auto max-w-4xl rounded-2xl border p-8 md:p-12">
-          <p className="text-sm font-medium tracking-wide" style={{ color: "#d1d5db" }}>
-            Product Overview
-          </p>
-          <h2 className="mt-3 text-4xl font-bold" style={{ color: "#ffffff" }}>
-            Built for teams that merge fast without breaking quality
+        <div className="mx-auto max-w-5xl rounded-2xl border p-8 md:p-12">
+
+          <h2 className="mt-3 text-5xl font-bold text-center" style={{ color: "#ffffff" }}>
+            Meet the team behind Kaizen
           </h2>
-          <p className="mt-6 text-lg leading-relaxed" style={{ color: "#e5e7eb" }}>
-            Kaizen scores every commit and pull request with transparent quality signals so engineering teams can
-            reward consistent contributors and catch risky changes early.
+          <p
+            className="mt-6 text-lg leading-relaxed text-center"
+            style={{ color: "#e5e7eb" }}
+          >
+            Four teammates, one mission: make agent-driven development measurable,
+            reliable, and rewarding.
           </p>
-          <div className="mt-10 grid gap-5 md:grid-cols-3">
-            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
-              <h3 className="text-lg font-semibold" style={{ color: "#ffffff" }}>Commit Intelligence</h3>
-              <p className="mt-2 text-sm" style={{ color: "#d1d5db" }}>
-                Understand impact by combining code quality, context, and velocity across repositories.
-              </p>
-            </div>
-            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
-              <h3 className="text-lg font-semibold" style={{ color: "#ffffff" }}>Merge Reputation</h3>
-              <p className="mt-2 text-sm" style={{ color: "#d1d5db" }}>
-                Track reputation that compounds over time, from first contribution to release-critical work.
-              </p>
-            </div>
-            <div className="rounded-xl border p-5" style={{ borderColor: "rgba(255, 255, 255, 0.14)", backgroundColor: "rgba(255, 255, 255, 0.03)" }}>
-              <h3 className="text-lg font-semibold" style={{ color: "#ffffff" }}>AI-Aware Insights</h3>
-              <p className="mt-2 text-sm" style={{ color: "#d1d5db" }}>
-                Evaluate human and agent contributions with the same clear standards and leaderboard metrics.
-              </p>
-            </div>
+
+          <div className="mt-10 grid gap-4 md:grid-cols-2">
+            {teammates.map((member) => (
+              <article
+                key={member.name}
+                className="rounded-xl border p-5"
+                style={{
+                  borderColor: "rgba(255, 255, 255, 0.14)",
+                  backgroundColor: "rgba(255, 255, 255, 0.03)",
+                }}
+              >
+                <h3 className="text-2xl font-semibold" style={{ color: "#ffffff" }}>
+                  {member.name}
+                </h3>
+                <p className="mt-1 text-base" style={{ color: "#d1d5db" }}>
+                  {member.college}
+                </p>
+                <p className="mt-3 text-lg" style={{ color: "#e5e7eb" }}>
+                  {member.role}
+                </p>
+                <p className="mt-2 text-base leading-relaxed" style={{ color: "#d1d5db" }}>
+                  {member.intro}
+                </p>
+                <div className="mt-4 flex flex-col gap-1">
+                  <a
+                    href={member.linkedin}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-sm underline"
+                    style={{ color: "#e5e7eb" }}
+                  >
+                    LinkedIn
+                  </a>
+                  <a
+                    href={`mailto:${member.mail}`}
+                    className="text-sm underline"
+                    style={{ color: "#e5e7eb" }}
+                  >
+                    {member.mail}
+                  </a>
+                </div>
+              </article>
+            ))}
           </div>
         </div>
       </section>
