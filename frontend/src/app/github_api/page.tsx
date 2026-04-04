@@ -2,8 +2,11 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { authApi } from "@/lib/api";
+import { useAuth } from "@/contexts/AuthContext";
+
+const GITHUB_PAT_ERROR_STORAGE_KEY = "kaizen_github_pat_error";
 
 const REQUIRED_PERMISSIONS = [
 	{
@@ -37,12 +40,34 @@ function getErrorMessage(error: unknown): string {
 
 export default function GitHubApiPage() {
 	const router = useRouter();
+	const { isAuthenticated, isLoading, refreshSession } = useAuth();
 	const [token, setToken] = useState("");
 	const [isSubmitting, setIsSubmitting] = useState(false);
 	const [status, setStatus] = useState<{ kind: "idle" | "success" | "error"; text: string }>({
 		kind: "idle",
 		text: "",
 	});
+
+	useEffect(() => {
+		if (isLoading) return;
+		if (!isAuthenticated) {
+			router.replace("/login");
+		}
+	}, [isLoading, isAuthenticated, router]);
+
+	if (isLoading) {
+		return (
+			<div className="flex items-center justify-center min-h-[calc(100vh-10rem)]">
+				<p className="text-sm" style={{ color: "#d1d5db" }}>
+					Loading…
+				</p>
+			</div>
+		);
+	}
+
+	if (!isAuthenticated) {
+		return null;
+	}
 
 	const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
@@ -57,27 +82,23 @@ export default function GitHubApiPage() {
 		setStatus({ kind: "idle", text: "" });
 
 		try {
-			// TODO: Backend integration - uncomment when API is ready
-			// await authApi.setGithubApiKey(cleanedToken);
-			// await authApi.validateGithubToken();
-			
-			// Temporary: Skip backend validation for frontend testing
-			setStatus({ kind: "success", text: "Token accepted. Redirecting to dashboard..." });
+			await authApi.setGithubApiKey(cleanedToken);
+			setToken("");
+			await refreshSession();
+			setStatus({ kind: "success", text: "Token saved. Redirecting to dashboard…" });
 			setTimeout(() => {
 				router.push("/dashboard");
-			}, 700);
+			}, 500);
 		} catch (error) {
-			// This will be used when backend is integrated
 			const reason = getErrorMessage(error);
 
-			try {
-				await authApi.setGithubApiKey(null);
-			} catch {
-				// Best-effort cleanup; redirect still happens.
-			}
-
 			setStatus({ kind: "error", text: reason });
-			router.push(`/github_api/error?reason=${encodeURIComponent(reason)}`);
+			try {
+				sessionStorage.setItem(GITHUB_PAT_ERROR_STORAGE_KEY, reason);
+			} catch {
+				/* private mode / quota */
+			}
+			router.push("/github_api/error");
 		} finally {
 			setIsSubmitting(false);
 		}

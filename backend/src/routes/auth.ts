@@ -208,6 +208,7 @@ export async function authRoutes(app: FastifyInstance) {
       // Validate GitHub token before storing
       const tokenValue = github_api_key.trim();
       const validation = await validateGitHubToken(tokenValue);
+
       if (!validation.ok) {
         if (validation.status === 401) {
           return reply.status(401).send({
@@ -217,7 +218,6 @@ export async function authRoutes(app: FastifyInstance) {
           });
         }
         if (validation.status === 403) {
-          // Check if it's specifically an insufficient permissions issue
           if (validation.reason === 'insufficient_permissions') {
             return reply.status(403).send({
               error: 'Insufficient permissions',
@@ -231,11 +231,24 @@ export async function authRoutes(app: FastifyInstance) {
             message: validation.githubMessage ?? 'The token has insufficient permissions or is restricted.',
           });
         }
+        if (validation.status === 504) {
+          return reply.status(504).send({
+            error: 'GitHub timeout',
+            code: 'GITHUB_VALIDATION_TIMEOUT',
+            message: validation.githubMessage ?? 'GitHub did not respond in time. Try again.',
+          });
+        }
+        if (validation.status === 503 || validation.reason === 'network') {
+          return reply.status(503).send({
+            error: 'GitHub unreachable',
+            code: 'GITHUB_VALIDATION_UNAVAILABLE',
+            message: validation.githubMessage ?? 'Could not reach GitHub. Check your network and try again.',
+          });
+        }
         return reply.status(502).send({
           error: 'GitHub API error',
           code: 'GITHUB_VALIDATION_ERROR',
           message: validation.githubMessage ?? 'Unable to validate GitHub token. Please try again later.',
-          status: validation.status,
         });
       }
     }

@@ -2,10 +2,25 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 
-export default function GithubTokenErrorPage() {
+const GITHUB_PAT_ERROR_STORAGE_KEY = "kaizen_github_pat_error";
+
+function GithubTokenErrorContent() {
   const searchParams = useSearchParams();
-  const reason = searchParams.get("reason")?.trim();
+  const [reason, setReason] = useState<string | null>(null);
+
+  useEffect(() => {
+    let fromStore: string | null = null;
+    try {
+      fromStore = sessionStorage.getItem(GITHUB_PAT_ERROR_STORAGE_KEY);
+      if (fromStore) sessionStorage.removeItem(GITHUB_PAT_ERROR_STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
+    const fromQuery = searchParams.get("reason")?.trim() || null;
+    setReason(fromStore?.trim() || fromQuery);
+  }, [searchParams]);
 
   return (
     <div className="flex items-center justify-center min-h-[calc(100vh-10rem)]">
@@ -50,5 +65,21 @@ export default function GithubTokenErrorPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function GithubTokenErrorPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center min-h-[calc(100vh-10rem)]">
+          <p className="text-sm" style={{ color: "#d1d5db" }}>
+            Loading…
+          </p>
+        </div>
+      }
+    >
+      <GithubTokenErrorContent />
+    </Suspense>
   );
 }

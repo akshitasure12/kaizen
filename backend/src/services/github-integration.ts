@@ -223,75 +223,97 @@ export async function upsertGithubRepoLink(input: {
   );
 }
 
+const GITHUB_PAT_VALIDATE_TIMEOUT_MS = 15_000;
+
+async function githubPatFetch(url: string, token: string): Promise<Response> {
+  const signal = AbortSignal.timeout(GITHUB_PAT_VALIDATE_TIMEOUT_MS);
+  return fetch(url, {
+    signal,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+}
+
+function mapPatFetchFailure(err: unknown): {
+  status: number;
+  githubMessage: string;
+  reason: "timeout" | "network";
+} {
+  if (err instanceof Error && err.name === "AbortError") {
+    return {
+      status: 504,
+      reason: "timeout",
+      githubMessage: "GitHub did not respond in time. Try again.",
+    };
+  }
+  return {
+    status: 503,
+    reason: "network",
+    githubMessage: "Could not reach GitHub. Check your network and try again.",
+  };
+}
+
+async function readGitHubErrorMessage(res: Response): Promise<string | undefined> {
+  try {
+    const j = (await res.json()) as { message?: string };
+    if (typeof j?.message === "string") return j.message;
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
 export async function validateGitHubToken(
   token: string,
 ): Promise<
   | { ok: true }
   | { ok: false; status: number; githubMessage?: string; reason?: string }
 > {
-  // Step 1: Validate token is not expired/revoked by checking /user endpoint
-  const userUrl = new URL("https://api.github.com/user");
-  const userRes = await fetch(userUrl.toString(), {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
+  try {
+    // Step 1: Validate token is not expired/revoked by checking /user endpoint
+    const userUrl = new URL("https://api.github.com/user");
+    const userRes = await githubPatFetch(userUrl.toString(), token);
 
-  if (!userRes.ok) {
-    let githubMessage: string | undefined;
-    try {
-      const j = (await userRes.json()) as { message?: string };
-      if (typeof j?.message === "string") githubMessage = j.message;
-    } catch {
-      /* ignore */
+    if (!userRes.ok) {
+      const githubMessage = await readGitHubErrorMessage(userRes);
+      return { ok: false, status: userRes.status, githubMessage };
     }
-    return { ok: false, status: userRes.status, githubMessage };
-  }
 
-  // Step 2: Verify token has repository and issues access by testing a basic API call
-  // Try to fetch user repos - this tests repository access
-  const reposUrl = new URL("https://api.github.com/user/repos");
-  reposUrl.searchParams.set("per_page", "1");
-  const reposRes = await fetch(reposUrl.toString(), {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-  });
+    // Step 2: Verify repository access (fine-grained tokens without repo scope fail here)
+    const reposUrl = new URL("https://api.github.com/user/repos");
+    reposUrl.searchParams.set("per_page", "1");
+    const reposRes = await githubPatFetch(reposUrl.toString(), token);
 
-  if (reposRes.status === 403) {
-    let githubMessage: string | undefined;
-    try {
-      const j = (await reposRes.json()) as { message?: string };
-      if (typeof j?.message === "string") githubMessage = j.message;
-    } catch {
-      /* ignore */
+    if (reposRes.status === 403) {
+      const githubMessage = await readGitHubErrorMessage(reposRes);
+      return {
+        ok: false,
+        status: 403,
+        reason: "insufficient_permissions",
+        githubMessage:
+          githubMessage ??
+          "Token lacks required permissions. Ensure your fine-grained token has necessary permissions.",
+      };
     }
+
+    if (!reposRes.ok) {
+      const githubMessage = await readGitHubErrorMessage(reposRes);
+      return { ok: false, status: reposRes.status, githubMessage };
+    }
+
+    return { ok: true };
+  } catch (err) {
+    const mapped = mapPatFetchFailure(err);
     return {
       ok: false,
-      status: 403,
-      reason: "insufficient_permissions",
-      githubMessage:
-        githubMessage ??
-        "Token lacks required permissions. Ensure your fine-grained token has necessary permissions.",
+      status: mapped.status,
+      reason: mapped.reason,
+      githubMessage: mapped.githubMessage,
     };
   }
-
-  if (!reposRes.ok) {
-    let githubMessage: string | undefined;
-    try {
-      const j = (await reposRes.json()) as { message?: string };
-      if (typeof j?.message === "string") githubMessage = j.message;
-    } catch {
-      /* ignore */
-    }
-    return { ok: false, status: reposRes.status, githubMessage };
-  }
-
-  return { ok: true };
 }
 
 /** Parsed `Link` header from GitHub pagination (e.g. rel="next"). */

@@ -10,6 +10,9 @@ import {
 } from "react";
 import { authApi, type Agent } from "@/lib/api";
 
+/** Resolved after login via GET /auth/me; null if /me failed (caller may fall back to PAT onboarding). */
+export type PostAuthGithubFlags = { api_key_configured: boolean } | null;
+
 interface AuthState {
   isAuthenticated: boolean;
   isLoading: boolean;
@@ -18,7 +21,7 @@ interface AuthState {
   selectedAgent: Agent | null;
   token: string | null;
   github: { api_key_configured: boolean } | null;
-  login: (username: string, password: string) => Promise<void>;
+  login: (username: string, password: string) => Promise<PostAuthGithubFlags>;
   register: (username: string, password: string) => Promise<void>;
   logout: () => void;
   selectAgent: (agent: Agent) => void;
@@ -86,14 +89,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("ab_token", data.token);
     setToken(data.token);
     setUser(data.user);
-    // Fetch agents after login
     try {
       const me = await authApi.me();
       setAgents(me.agents ?? []);
       setGithub(me.github ?? null);
-      if (me.agents?.length) setSelectedAgent(me.agents[0]);
+      if (me.agents?.length) {
+        const savedEns = localStorage.getItem("ab_selected_agent");
+        const found = me.agents.find((a) => a.ens_name === savedEns);
+        setSelectedAgent(found ?? me.agents[0]);
+      } else {
+        setSelectedAgent(null);
+      }
+      return me.github ?? { api_key_configured: false };
     } catch {
-      /* ignore */
+      return null;
     }
   }, []);
 
@@ -106,8 +115,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const me = await authApi.me();
       setAgents(me.agents ?? []);
       setGithub(me.github ?? null);
+      if (me.agents?.length) {
+        const savedEns = localStorage.getItem("ab_selected_agent");
+        const found = me.agents.find((a) => a.ens_name === savedEns);
+        setSelectedAgent(found ?? me.agents[0]);
+      } else {
+        setSelectedAgent(null);
+      }
     } catch {
-      /* ignore */
+      /* session hydrated on next /me */
     }
   }, []);
 
