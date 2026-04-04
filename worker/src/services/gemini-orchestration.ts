@@ -4,7 +4,8 @@ import { env } from "../env";
 export type ReasoningLevel = "low" | "medium" | "high";
 
 function isGemini3Model(model: string): boolean {
-  return model.startsWith("gemini-3");
+  const normalized = model.trim().toLowerCase();
+  return normalized.startsWith("gemini-3") || normalized.includes("/gemini-3");
 }
 
 export function getReasoningLevel(params: {

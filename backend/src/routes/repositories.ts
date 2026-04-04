@@ -2,8 +2,6 @@ import { FastifyInstance } from 'fastify';
 import * as sdk from '../sdk';
 import { query, queryOne } from '../db/client';
 import { env } from '../env';
-import { getLedger } from '../services/bounty';
-import { deposit } from '../services/bounty';
 import { requireAuth } from '../middleware/auth';
 import { getGitHubTokenForUser } from '../services/github-integration';
 import { ensureKaizenPullRequestWebhook } from '../services/github-webhook-provision';
@@ -98,7 +96,6 @@ export async function repositoryRoutes(app: FastifyInstance) {
         ownerEns,
         description,
         'public',
-        { repoType, academiaField: repoType === 'academia' ? academiaField : undefined },
       );
       createdId = repo.id;
 
@@ -163,15 +160,13 @@ export async function repositoryRoutes(app: FastifyInstance) {
 
   // Create repository (internal-only; no GitHub link — use import-from-github for GitHub + webhook)
   app.post('/', { preHandler: requireAuth }, async (req, reply) => {
-    const { name, owner_ens, description, repo_type, academia_field } = req.body as Record<string, unknown>;
+    const { name, owner_ens, description } = req.body as Record<string, unknown>;
     if (!name || !owner_ens) return reply.status(400).send({ error: 'name and owner_ens are required' });
     try {
       const repo = await sdk.createRepository(
         String(name),
         String(owner_ens),
-        description != null ? String(description) : '',
-        'public',
-        { repoType: repo_type as 'general' | 'academia' | undefined, academiaField: academia_field as string | undefined }
+        description != null ? String(description) : ''
       );
       return reply.status(201).send(repo);
     } catch (e: unknown) {
@@ -182,14 +177,8 @@ export async function repositoryRoutes(app: FastifyInstance) {
 
   // List all repositories (with owner ens + branch count + type filtering)
   app.get('/', async (req, reply) => {
-    const { type } = req.query as any;
-
-    let typeFilter = '';
     const params: any[] = [];
-    if (type && (type === 'general' || type === 'academia')) {
-      params.push(type);
-      typeFilter = `WHERE r.repo_type = $1`;
-    }
+    const typeFilter = '';
 
     const repos = await query(
       `SELECT r.*, a.ens_name as owner_ens,
@@ -263,25 +252,4 @@ export async function repositoryRoutes(app: FastifyInstance) {
     return repo;
   });
 
-  // Deposit bounty into repo
-  app.post('/:id/deposit', { preHandler: requireAuth }, async (req, reply) => {
-    const { id } = req.params as any;
-    const { agent_ens, amount, note } = req.body as any;
-    if (!agent_ens || !amount) return reply.status(400).send({ error: 'agent_ens and amount are required' });
-    try {
-      const agent = await sdk.getAgent(agent_ens);
-      if (!agent) return reply.status(404).send({ error: 'Agent not found' });
-      const entry = await deposit(id, agent.id, amount, note);
-      return reply.status(201).send(entry);
-    } catch (e: any) {
-      return reply.status(400).send({ error: e.message });
-    }
-  });
-
-  // Get bounty ledger for repo
-  app.get('/:id/bounty', async (req, reply) => {
-    const { id } = req.params as any;
-    const ledger = await getLedger(id);
-    return ledger;
-  });
 }

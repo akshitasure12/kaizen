@@ -10,9 +10,15 @@ export async function pullRequestRoutes(app: FastifyInstance) {
     const { source_branch, target_branch, description, author_ens, bounty_amount } = req.body as any;
     if (!source_branch || !target_branch || !author_ens)
       return reply.status(400).send({ error: 'source_branch, target_branch, and author_ens are required' });
+    if (Number(bounty_amount ?? 0) > 0) {
+      return reply.status(400).send({
+        error: 'Repository-level PR bounty_amount is no longer supported. Use issue bounty endpoints instead.',
+      });
+    }
+
     try {
       const pr = await sdk.openPullRequest(
-        repoId, source_branch, target_branch, description ?? '', author_ens, bounty_amount ?? 0
+        repoId, source_branch, target_branch, description ?? '', author_ens
       );
       return reply.status(201).send(pr);
     } catch (e: any) {

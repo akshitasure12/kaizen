@@ -3,10 +3,7 @@
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 
-async function request<T>(
-  path: string,
-  options: RequestInit = {}
-): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token =
     typeof window !== "undefined" ? localStorage.getItem("ab_token") : null;
 
@@ -24,7 +21,10 @@ async function request<T>(
   });
 
   if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (await res.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
     const msg =
       (typeof body.message === "string" && body.message) ||
       (typeof body.error === "string" && body.error) ||
@@ -32,8 +32,10 @@ async function request<T>(
     const err = new Error(msg) as ApiError;
     err.status = res.status;
     if (typeof body.code === "string") err.code = body.code;
-    if (typeof body.github_message === "string") err.github_message = body.github_message;
-    if (typeof body.github_status === "number") err.github_status = body.github_status;
+    if (typeof body.github_message === "string")
+      err.github_message = body.github_message;
+    if (typeof body.github_status === "number")
+      err.github_status = body.github_status;
     throw err;
   }
 
@@ -71,8 +73,6 @@ export interface Repository {
   branch_count?: number;
   commit_count?: number;
   open_issues?: number;
-  repo_type?: "general" | "academia";
-  academia_field?: string;
   created_at: string;
   github_owner?: string | null;
   github_repo?: string | null;
@@ -164,7 +164,12 @@ export interface Commit {
   branch_name?: string;
   semantic_summary?: string;
   tags?: string[];
-  reasoning_type?: "knowledge" | "hypothesis" | "experiment" | "conclusion" | "trace";
+  reasoning_type?:
+    | "knowledge"
+    | "hypothesis"
+    | "experiment"
+    | "conclusion"
+    | "trace";
   trace_prompt?: string;
   trace_context?: Record<string, unknown>;
   trace_tools?: string[];
@@ -227,6 +232,7 @@ export interface JudgeVerdict {
   failed_tests?: string[];
   bonus_achieved?: string[];
   bonus_missed?: string[];
+  code_quality_score?: number;
   code_quality?: number;
   reasoning?: string;
   suggestions?: string[];
@@ -243,7 +249,10 @@ export interface LeaderboardEntry {
   total_points: number;
   issues_completed: number;
   deposit_verified: boolean;
-  code_quality: number;
+  code_quality_score: number;
+  test_quality_score: number;
+  code_quality?: number;
+  test_pass_rate?: number;
 }
 
 export interface LeaderboardResponse {
@@ -262,7 +271,6 @@ export interface LeaderboardStats {
   total_points: number;
   total_issues: number;
   total_repositories?: number;
-  academia_repositories?: number;
 }
 
 export interface AgentProfile extends Agent {
@@ -275,8 +283,6 @@ export interface AgentProfile extends Agent {
     name: string;
     commit_count: number;
     pr_count: number;
-    repo_type?: "general" | "academia";
-    academia_field?: string;
   }[];
 }
 
@@ -370,17 +376,11 @@ export const api = {
 export const agentApi = {
   list: () => api.get<Agent[]>("/agents"),
   get: (ens: string) => api.get<Agent>(`/agents/${ens}`),
-  create: (data: CreateAgentInput) =>
-    api.post<Agent>("/agents", data),
+  create: (data: CreateAgentInput) => api.post<Agent>("/agents", data),
 };
 
 export const repoApi = {
-  list: (type?: "general" | "academia") => {
-    const params = new URLSearchParams();
-    if (type) params.set("type", type);
-    const qs = params.toString();
-    return api.get<Repository[]>(`/repositories${qs ? `?${qs}` : ""}`);
-  },
+  list: () => api.get<Repository[]>(`/repositories`),
   importFromGitHub: (body: {
     owner_ens: string;
     github_owner: string;
@@ -400,7 +400,7 @@ export const repoApi = {
   },
   searchCommits: (id: string, query: string) =>
     api.get<(Commit & { similarity?: number })[]>(
-      `/repositories/${id}/commits/search?q=${encodeURIComponent(query)}`
+      `/repositories/${id}/commits/search?q=${encodeURIComponent(query)}`,
     ),
   commitGraph: (id: string) =>
     api.get<unknown[]>(`/repositories/${id}/commits/graph`),
@@ -409,22 +409,31 @@ export const repoApi = {
     if (branch) path += `?branch=${encodeURIComponent(branch)}`;
     return api.get<ContextChain>(path);
   },
-  searchFailures: (id: string, options?: { error_type?: string; severity?: string; limit?: number }) => {
+  searchFailures: (
+    id: string,
+    options?: { error_type?: string; severity?: string; limit?: number },
+  ) => {
     const params = new URLSearchParams();
     if (options?.error_type) params.set("error_type", options.error_type);
     if (options?.severity) params.set("severity", options.severity);
     if (options?.limit) params.set("limit", String(options.limit));
     const qs = params.toString();
-    return api.get<Commit[]>(`/repositories/${id}/commits/failures${qs ? `?${qs}` : ""}`);
+    return api.get<Commit[]>(
+      `/repositories/${id}/commits/failures${qs ? `?${qs}` : ""}`,
+    );
   },
   workflowRuns: (id: string, limit?: number) => {
     const params = new URLSearchParams();
     if (limit) params.set("limit", String(limit));
     const qs = params.toString();
-    return api.get<WorkflowRun[]>(`/repositories/${id}/workflow-runs${qs ? `?${qs}` : ""}`);
+    return api.get<WorkflowRun[]>(
+      `/repositories/${id}/workflow-runs${qs ? `?${qs}` : ""}`,
+    );
   },
   commitWorkflow: (repoId: string, commitId: string) =>
-    api.get<WorkflowRun>(`/repositories/${repoId}/commits/${commitId}/workflow`),
+    api.get<WorkflowRun>(
+      `/repositories/${repoId}/commits/${commitId}/workflow`,
+    ),
 };
 
 export const issueApi = {
@@ -435,11 +444,11 @@ export const issueApi = {
   },
   get: (repoId: string, issueId: string) =>
     api.get<Issue & { judgements?: Judgement[] }>(
-      `/repositories/${repoId}/issues/${issueId}`
+      `/repositories/${repoId}/issues/${issueId}`,
     ),
   create: (
     repoId: string,
-    data: { title: string; body?: string; scorecard?: Scorecard }
+    data: { title: string; body?: string; scorecard?: Scorecard },
   ) => api.post<Issue>(`/repositories/${repoId}/issues`, data),
   update: (repoId: string, issueId: string, data: Partial<Issue>) =>
     api.patch<Issue>(`/repositories/${repoId}/issues/${issueId}`, data),
@@ -447,12 +456,15 @@ export const issueApi = {
     api.post(`/repositories/${repoId}/issues/${issueId}/assign`, {
       agent_ens: agentEns,
     }),
-  submit: (repoId: string, issueId: string, data: { agent_ens: string; content: string }) =>
-    api.post(`/repositories/${repoId}/issues/${issueId}/submit`, data),
+  submit: (
+    repoId: string,
+    issueId: string,
+    data: { agent_ens: string; content: string },
+  ) => api.post(`/repositories/${repoId}/issues/${issueId}/submit`, data),
   close: (
     repoId: string,
     issueId: string,
-    data: { agent_ens: string; submission_content?: string }
+    data: { agent_ens: string; submission_content?: string },
   ) => api.post(`/repositories/${repoId}/issues/${issueId}/close`, data),
 };
 
@@ -467,12 +479,16 @@ export const bountyApi = {
       amount: number;
       deadline_hours: number;
       max_submissions?: number;
-    }
-  ) => api.post<IssueBounty>(`/repositories/${repoId}/issues/${issueId}/bounty`, data),
+    },
+  ) =>
+    api.post<IssueBounty>(
+      `/repositories/${repoId}/issues/${issueId}/bounty`,
+      data,
+    ),
   submit: (
     repoId: string,
     issueId: string,
-    data: { agent_ens: string; content: string }
+    data: { agent_ens: string; content: string },
   ) =>
     api.post(`/repositories/${repoId}/issues/${issueId}/bounty-submit`, data),
   judge: (repoId: string, issueId: string) =>
@@ -510,7 +526,13 @@ export const prApi = {
 };
 
 export const leaderboardApi = {
-  get: async (limit?: number, offset?: number, timeframe?: string, sort_by?: string, order?: "asc" | "desc") => {
+  get: async (
+    limit?: number,
+    offset?: number,
+    timeframe?: string,
+    sort_by?: string,
+    order?: "asc" | "desc",
+  ) => {
     const params = new URLSearchParams();
     if (limit) params.set("limit", String(limit));
     if (offset) params.set("offset", String(offset));
@@ -519,7 +541,7 @@ export const leaderboardApi = {
     if (order) params.set("order", order);
     const qs = params.toString();
     const response = await api.get<LeaderboardResponse | LeaderboardEntry[]>(
-      `/leaderboard${qs ? `?${qs}` : ""}`
+      `/leaderboard${qs ? `?${qs}` : ""}`,
     );
 
     if (Array.isArray(response)) {
@@ -543,25 +565,25 @@ export const authApi = {
   register: (username: string, password: string) =>
     api.post<{ token: string; user: { id: string; username: string } }>(
       "/auth/register",
-      { username, password }
+      { username, password },
     ),
   login: (username: string, password: string) =>
     api.post<{ token: string; user: { id: string; username: string } }>(
       "/auth/login",
-      { username, password }
+      { username, password },
     ),
   me: () => api.get<AuthMeResponse>("/auth/me"),
   setGithubApiKey: (github_api_key: string | null) =>
     api.patch<{ message: string; github: { api_key_configured: boolean } }>(
       "/auth/github-api-key",
-      { github_api_key }
+      { github_api_key },
     ),
 };
 
 export const integrationsApi = {
   listGithubRepos: (page = 1, perPage = 30) =>
     api.get<GitHubUserReposPage>(
-      `/integrations/github/repos?page=${page}&per_page=${perPage}`
+      `/integrations/github/repos?page=${page}&per_page=${perPage}`,
     ),
 };
 
@@ -685,7 +707,7 @@ export const bitgoWalletApi = {
   create: (agentId: string, label: string) =>
     api.post<{ message: string; wallet: BitGoWallet }>(
       "/blockchain/wallets/create",
-      { agent_id: agentId, label }
+      { agent_id: agentId, label },
     ),
   /** Get wallet info for an agent */
   get: (agentId: string) =>
@@ -694,15 +716,20 @@ export const bitgoWalletApi = {
   balance: (agentId: string) =>
     api.get<BitGoBalance>(`/blockchain/wallets/${agentId}/balance`),
   /** Send a transaction from an agent's wallet */
-  send: (agentId: string, toAddress: string, amountWei: string, note?: string) =>
+  send: (
+    agentId: string,
+    toAddress: string,
+    amountWei: string,
+    note?: string,
+  ) =>
     api.post<{ message: string; transaction: BitGoSendResult }>(
       `/blockchain/wallets/${agentId}/send`,
-      { to_address: toAddress, amount_wei: amountWei, note }
+      { to_address: toAddress, amount_wei: amountWei, note },
     ),
   /** List all agent wallets */
   list: () =>
     api.get<{ bitgo_enabled: boolean; wallets: BitGoWalletListItem[] }>(
-      "/blockchain/wallets"
+      "/blockchain/wallets",
     ),
 };
 

@@ -6,12 +6,13 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import { env } from '../env';
 import { buildGeminiThinkingConfig } from './gemini-orchestration';
 
-const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+const apiKey = process.env.GEMINI_API_KEY;
 const gemini = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
-const EMBEDDING_MODEL = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
+const EMBEDDING_MODEL = env.GEMINI_EMBEDDING_MODEL;
 const EMBEDDING_DIMENSIONS = 1536;
 
 export interface EmbeddingResult {
@@ -72,13 +73,13 @@ export async function generateSemanticMetadata(
 
   try {
     const response = await gemini.models.generateContent({
-      model: process.env.GEMINI_MODEL_FAST || 'gemini-2.5-flash-lite',
+      model: env.GEMINI_MODEL_FAST,
       contents: `Commit message: ${message}\n\nContent:\n${content.slice(0, 4000)}`,
       config: {
         systemInstruction:
           'You summarize code commits. Return strict JSON only. Keep summary concise and tags lowercase-hyphenated.',
         thinkingConfig: buildGeminiThinkingConfig(
-          process.env.GEMINI_MODEL_FAST || 'gemini-2.5-flash-lite',
+          env.GEMINI_MODEL_FAST,
           'low',
         ),
         responseMimeType: 'application/json',
