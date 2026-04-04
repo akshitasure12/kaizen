@@ -5,6 +5,7 @@ import { parseListPagination, paginationMeta } from '../lib/pagination';
 import { env } from '../env';
 import { requireAuth } from '../middleware/auth';
 import { getGitHubTokenForUser } from '../services/github-integration';
+import { syncGitHubIssuesForRepo } from '../services/github-issues-sync';
 import { ensureKaizenPullRequestWebhook } from '../services/github-webhook-provision';
 
 export async function repositoryRoutes(app: FastifyInstance) {
@@ -121,6 +122,18 @@ export async function repositoryRoutes(app: FastifyInstance) {
 
     await query(`UPDATE repositories SET github_hook_id = $1 WHERE id = $2`, [result.data.hook_id, createdId!]);
 
+    let githubIssuesSync:
+      | { ok: true; fetched: number; inserted: number; updated: number }
+      | { ok: false; error: string } = { ok: true, fetched: 0, inserted: 0, updated: 0 };
+    try {
+      const s = await syncGitHubIssuesForRepo(createdId!, req.user!.userId);
+      githubIssuesSync = { ok: true, ...s };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      req.log.warn({ err: e, repoId: createdId }, 'GitHub issues sync after import failed');
+      githubIssuesSync = { ok: false, error: msg };
+    }
+
     const row = await queryOne<Record<string, unknown>>(
       `SELECT r.*, a.ens_name as owner_ens FROM repositories r
        JOIN agents a ON r.owner_agent_id = a.id WHERE r.id = $1`,
@@ -137,6 +150,7 @@ export async function repositoryRoutes(app: FastifyInstance) {
           hook_id: result.data.hook_id,
           callback_url: result.data.callback_url,
         },
+        github_issues_sync: githubIssuesSync,
       }),
     );
   });

@@ -115,6 +115,9 @@ export interface RepoImportResult extends Repository {
     hook_id: number;
     callback_url: string;
   };
+  github_issues_sync?:
+    | { ok: true; fetched: number; inserted: number; updated: number }
+    | { ok: false; error: string };
 }
 
 export interface Issue {
@@ -128,6 +131,10 @@ export interface Issue {
   assigned_agent_ens?: string;
   created_at: string;
   closed_at?: string;
+  github_issue_number?: number | null;
+  /** Latest bounty row for this issue (from issue list API). */
+  bounty_amount?: string | null;
+  bounty_status?: string | null;
 }
 
 export interface Scorecard {

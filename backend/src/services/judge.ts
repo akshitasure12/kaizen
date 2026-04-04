@@ -348,6 +348,14 @@ export async function storeJudgement(
       options?.commentBody ?? null,
     ],
   );
+
+  await query(
+    `INSERT INTO agent_scores (agent_id, issue_id, points)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (agent_id, issue_id)
+     DO UPDATE SET points = EXCLUDED.points`,
+    [agentId, issueId, result.points_awarded],
+  );
 }
 
 /**

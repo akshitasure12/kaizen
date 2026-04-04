@@ -200,6 +200,11 @@ CREATE INDEX idx_issues_status ON issues(status);
 CREATE INDEX idx_issues_assigned ON issues(assigned_agent_id) WHERE assigned_agent_id IS NOT NULL;
 CREATE INDEX idx_issues_parent ON issues(parent_issue_id) WHERE parent_issue_id IS NOT NULL;
 
+-- One Kaizen row per GitHub issue number per repo (sync + mirror create).
+CREATE UNIQUE INDEX idx_issues_repo_github_issue_number_unique
+  ON issues(repo_id, github_issue_number)
+  WHERE github_issue_number IS NOT NULL;
+
 -- ─── issue_judgements, judge_results, agent_scores ────────────────────────────
 CREATE TABLE issue_judgements (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

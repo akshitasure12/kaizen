@@ -26,7 +26,7 @@ function requireInternal(req: { headers: Record<string, unknown> }): boolean {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function requireRepoImportedByUser(
@@ -63,6 +63,8 @@ export async function gitJobRoutes(app: FastifyInstance) {
         idempotency_key?: string;
         max_attempts?: number;
         fanout_children?: boolean;
+        /** Merged into git_jobs.payload (e.g. edit_commands, verify_commands). */
+        job_payload?: Record<string, unknown>;
       };
       const {
         issue_id,
@@ -71,7 +73,12 @@ export async function gitJobRoutes(app: FastifyInstance) {
         idempotency_key,
         max_attempts,
         fanout_children,
+        job_payload: jobPayloadFromBody,
       } = body;
+      const jobPayloadExtra =
+        jobPayloadFromBody && isRecord(jobPayloadFromBody)
+          ? jobPayloadFromBody
+          : {};
       if (!issue_id) {
         return reply.status(400).send({ error: "issue_id required" });
       }
@@ -154,7 +161,7 @@ export async function gitJobRoutes(app: FastifyInstance) {
               ? Math.floor(max_attempts)
               : env.WORKER_MAX_ATTEMPTS,
           idempotency_key: dedupeKey,
-          payload: {},
+          payload: { ...jobPayloadExtra },
         });
       };
 

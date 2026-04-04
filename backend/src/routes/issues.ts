@@ -20,6 +20,7 @@ import {
   createGitHubIssueForImportedRepo,
   getGitHubLinkForRepo,
 } from "../services/github-integration";
+import { syncGitHubIssuesForRepo } from "../services/github-issues-sync";
 import {
   buildResolvePlan,
   PlannedChildWork,
@@ -486,6 +487,14 @@ export async function issueRoutes(app: FastifyInstance) {
     { preHandler: [...repoUserAuth] },
     async (req, reply) => {
       const { repoId } = req.params as any;
+      try {
+        await syncGitHubIssuesForRepo(repoId, req.user!.userId);
+      } catch (e) {
+        req.log.warn(
+          { err: e, repoId },
+          "GitHub issues sync on list failed (listing local issues only)",
+        );
+      }
       const { status } = req.query as any;
       const { limit, offset } = parseListPagination(
         req.query as Record<string, unknown>,
@@ -507,11 +516,20 @@ export async function issueRoutes(app: FastifyInstance) {
       params.push(limit, offset);
 
       const issues = await query(
-        `SELECT i.*, u.username as created_by_username, 
-              a.ens_name as assigned_agent_ens
+        `SELECT i.*, u.username as created_by_username,
+              a.ens_name as assigned_agent_ens,
+              latest_bounty.amount::text as bounty_amount,
+              latest_bounty.status as bounty_status
        FROM issues i
        JOIN users u ON i.created_by = u.id
        LEFT JOIN agents a ON i.assigned_agent_id = a.id
+       LEFT JOIN LATERAL (
+         SELECT ib.amount, ib.status
+         FROM issue_bounties ib
+         WHERE ib.issue_id = i.id
+         ORDER BY ib.created_at DESC
+         LIMIT 1
+       ) latest_bounty ON true
        ${whereClause}
        ORDER BY i.created_at DESC
        LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
@@ -541,10 +559,19 @@ export async function issueRoutes(app: FastifyInstance) {
 
       const issue = await queryOne<Issue>(
         `SELECT i.*, u.username as created_by_username,
-              a.ens_name as assigned_agent_ens
+              a.ens_name as assigned_agent_ens,
+              latest_bounty.amount::text as bounty_amount,
+              latest_bounty.status as bounty_status
        FROM issues i
        JOIN users u ON i.created_by = u.id
        LEFT JOIN agents a ON i.assigned_agent_id = a.id
+       LEFT JOIN LATERAL (
+         SELECT ib.amount, ib.status
+         FROM issue_bounties ib
+         WHERE ib.issue_id = i.id
+         ORDER BY ib.created_at DESC
+         LIMIT 1
+       ) latest_bounty ON true
        WHERE i.id = $1 AND i.repo_id = $2`,
         [issueId, repoId],
       );
@@ -735,6 +762,8 @@ export async function issueRoutes(app: FastifyInstance) {
         fanout_children?: boolean;
         idempotency_key?: string;
         max_attempts?: number;
+        /** Merged into each enqueued git_jobs.payload (e.g. edit_commands). */
+        job_payload?: Record<string, unknown>;
         decomposition?: {
           children?: Array<{
             title?: string;
@@ -747,6 +776,13 @@ export async function issueRoutes(app: FastifyInstance) {
       };
 
       const mode = body.mode === "plan_only" ? "plan_only" : "execute";
+      const jobPayloadExtra =
+        body.job_payload &&
+        typeof body.job_payload === "object" &&
+        body.job_payload !== null &&
+        !Array.isArray(body.job_payload)
+          ? (body.job_payload as Record<string, unknown>)
+          : {};
 
       const issue = await queryOne<IssueWithAssignedEns>(
         `SELECT i.*, a.ens_name as assigned_agent_ens
@@ -905,6 +941,7 @@ export async function issueRoutes(app: FastifyInstance) {
               mode: "single_agent",
               plan_complexity_score: resolvedPlan.complexity_score,
             },
+            ...jobPayloadExtra,
           },
         });
 
@@ -964,6 +1001,7 @@ export async function issueRoutes(app: FastifyInstance) {
                 parent_issue_id: issue.id,
                 plan_complexity_score: resolvedPlan.complexity_score,
               },
+              ...jobPayloadExtra,
             },
           });
 
@@ -1053,6 +1091,7 @@ export async function issueRoutes(app: FastifyInstance) {
                 child_index: i,
                 plan_complexity_score: resolvedPlan.complexity_score,
               },
+              ...jobPayloadExtra,
             },
           });
           jobId = job.id;
