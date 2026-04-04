@@ -1,17 +1,20 @@
 /**
  * AutoResearch Judge Service
  * 
- * Uses OpenAI GPT-4o with structured output to evaluate agent submissions.
- * Gracefully degrades to deterministic mock scoring if OPENAI_API_KEY is not set.
+ * Uses Gemini with structured output to evaluate agent submissions.
+ * Gracefully degrades to deterministic mock scoring if GEMINI_API_KEY is not set.
  */
 
-import OpenAI from 'openai';
+import { GoogleGenAI } from '@google/genai';
 import { query, queryOne } from '../db/client';
+import {
+  buildGeminiThinkingConfig,
+  getReasoningLevel,
+  pickGeminiModel,
+} from './gemini-orchestration';
 
-const apiKey = process.env.OPENAI_API_KEY;
-const openai = apiKey ? new OpenAI({ apiKey }) : null;
-
-const JUDGE_MODEL = process.env.OPENAI_JUDGE_MODEL || 'gpt-4o';
+const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
 
 export interface Scorecard {
   difficulty: 'easy' | 'medium' | 'hard' | 'expert';
@@ -63,12 +66,12 @@ export async function judgeSubmission(
   submissionContent: string,
   scorecard: Scorecard
 ): Promise<JudgeResult> {
-  // Try OpenAI judge first, fall back to mock
-  if (openai) {
+  // Try Gemini judge first, fall back to mock.
+  if (gemini) {
     try {
-      return await judgeWithOpenAI(submissionContent, scorecard);
+      return await judgeWithGemini(submissionContent, scorecard);
     } catch (error: any) {
-      console.error('OpenAI judge failed, falling back to mock:', error.message);
+      console.error('Gemini judge failed, falling back to mock:', error.message);
     }
   }
 
@@ -76,49 +79,74 @@ export async function judgeSubmission(
 }
 
 /**
- * Judge using OpenAI GPT-4o with structured output
+ * Judge using Gemini with structured output and configurable reasoning depth.
  */
-async function judgeWithOpenAI(
+async function judgeWithGemini(
   submissionContent: string,
   scorecard: Scorecard
 ): Promise<JudgeResult> {
-  const systemPrompt = `You are an expert code reviewer and judge for AI agent submissions. 
-Your task is to evaluate a submission against a scorecard and provide a detailed verdict.
+  const reasoningLevel = getReasoningLevel({
+    difficulty: scorecard.difficulty,
+    inputChars: submissionContent.length,
+  });
+  const model = pickGeminiModel(reasoningLevel);
+  const thinkingConfig = buildGeminiThinkingConfig(model, reasoningLevel);
 
-Scorecard:
-- Difficulty: ${scorecard.difficulty}
-- Base Points: ${scorecard.base_points}
-- Unit Tests: ${JSON.stringify(scorecard.unit_tests)}
-- Bonus Criteria: ${JSON.stringify(scorecard.bonus_criteria)}
-- Bonus Points per Criterion: ${scorecard.bonus_points_per_criterion}
-${scorecard.required_language ? `- Required Language: ${scorecard.required_language}` : ''}
+  const systemPrompt = [
+    'You are an expert code judge for agentic software tasks.',
+    'Follow these rules strictly:',
+    '1) Evaluate only using evidence in the provided submission content and scorecard.',
+    '2) Use conservative pass/fail decisions for listed tests.',
+    '3) Keep reasoning concrete and action-oriented.',
+    '4) Return valid JSON matching the schema; do not include markdown.'
+  ].join('\n');
 
-Evaluate the submission and respond with a JSON object containing:
-{
-  "passed_tests": ["list of test names that passed"],
-  "failed_tests": ["list of test names that failed"],
-  "bonus_achieved": ["list of bonus criteria achieved"],
-  "bonus_missed": ["list of bonus criteria not achieved"],
-  "code_quality_score": <1-10 integer>,
-  "reasoning": "detailed explanation of your evaluation",
-  "suggestions": ["list of improvement suggestions"]
-}
+  const evaluationPrompt = [
+    '<scorecard>',
+    `difficulty: ${scorecard.difficulty}`,
+    `base_points: ${scorecard.base_points}`,
+    `unit_tests: ${JSON.stringify(scorecard.unit_tests)}`,
+    `bonus_criteria: ${JSON.stringify(scorecard.bonus_criteria)}`,
+    `bonus_points_per_criterion: ${scorecard.bonus_points_per_criterion}`,
+    scorecard.required_language ? `required_language: ${scorecard.required_language}` : 'required_language: none',
+    '</scorecard>',
+    '<submission>',
+    submissionContent.slice(0, 12000),
+    '</submission>',
+  ].join('\n');
 
-Be fair but rigorous. Only mark tests as passed if the code clearly implements the required functionality.
-For bonus criteria, require clear evidence of implementation.`;
-
-  const response = await openai!.chat.completions.create({
-    model: JUDGE_MODEL,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: `Please evaluate this submission:\n\n${submissionContent.slice(0, 8000)}` }
-    ],
-    response_format: { type: 'json_object' },
-    max_tokens: 1000,
-    temperature: 0.2,
+  const response = await gemini!.models.generateContent({
+    model,
+    contents: evaluationPrompt,
+    config: {
+      systemInstruction: systemPrompt,
+      thinkingConfig,
+      responseMimeType: 'application/json',
+      responseJsonSchema: {
+        type: 'object',
+        properties: {
+          passed_tests: { type: 'array', items: { type: 'string' } },
+          failed_tests: { type: 'array', items: { type: 'string' } },
+          bonus_achieved: { type: 'array', items: { type: 'string' } },
+          bonus_missed: { type: 'array', items: { type: 'string' } },
+          code_quality_score: { type: 'integer', minimum: 1, maximum: 10 },
+          reasoning: { type: 'string' },
+          suggestions: { type: 'array', items: { type: 'string' } },
+        },
+        required: [
+          'passed_tests',
+          'failed_tests',
+          'bonus_achieved',
+          'bonus_missed',
+          'code_quality_score',
+          'reasoning',
+          'suggestions',
+        ],
+      },
+    },
   });
 
-  const verdict = JSON.parse(response.choices[0].message.content || '{}') as Verdict;
+  const verdict = JSON.parse(response.text || '{}') as Verdict;
   
   // Validate and sanitize verdict
   verdict.passed_tests = Array.isArray(verdict.passed_tests) ? verdict.passed_tests : [];
@@ -135,7 +163,7 @@ For bonus criteria, require clear evidence of implementation.`;
 }
 
 /**
- * Mock judge for when OpenAI is not available
+ * Mock judge for when Gemini is not available
  * Uses deterministic scoring based on content analysis
  */
 function mockJudge(submissionContent: string, scorecard: Scorecard): JudgeResult {
@@ -255,29 +283,13 @@ export async function storeJudgement(
   agentId: string,
   result: JudgeResult
 ): Promise<void> {
-  // Insert judgement
+  // Judge remains neutral: persist evaluation only, no incentive updates here.
   await query(
     `INSERT INTO issue_judgements (issue_id, agent_id, verdict, points_awarded)
      VALUES ($1, $2, $3, $4)
      ON CONFLICT (issue_id, agent_id) 
      DO UPDATE SET verdict = $3, points_awarded = $4, judged_at = NOW()`,
     [issueId, agentId, JSON.stringify(result.verdict), result.points_awarded]
-  );
-
-  // Upsert agent score
-  await query(
-    `INSERT INTO agent_scores (agent_id, issue_id, points)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (agent_id, issue_id)
-     DO UPDATE SET points = $3`,
-    [agentId, issueId, result.points_awarded]
-  );
-
-  // Update agent reputation
-  const reputationBoost = Math.floor(result.points_awarded / 10);
-  await query(
-    `UPDATE agents SET reputation_score = reputation_score + $1 WHERE id = $2`,
-    [reputationBoost, agentId]
   );
 }
 
@@ -295,10 +307,10 @@ export async function getJudgement(
 }
 
 /**
- * Check if judge is using real OpenAI
+ * Check if judge is using real Gemini
  */
 export function isRealJudge(): boolean {
-  return openai !== null;
+  return gemini !== null;
 }
 
 // ─── Competitive Bounty Judging (v3) ─────────────────────────────────────────

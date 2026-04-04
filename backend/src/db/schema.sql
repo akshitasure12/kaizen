@@ -260,6 +260,125 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_bounties_merge_delivery
 
 CREATE INDEX IF NOT EXISTS idx_issue_bounties_github_pr ON issue_bounties(github_pr_number) WHERE github_pr_number IS NOT NULL;
 
+ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS settlement_key VARCHAR(255);
+ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS settlement_status VARCHAR(32) DEFAULT 'pending';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_bounties_settlement_key
+  ON issue_bounties(settlement_key) WHERE settlement_key IS NOT NULL;
+
+-- ─── execution verification / evidence (ArmorIQ overlay) ────────────────────
+CREATE TABLE IF NOT EXISTS armoriq_intents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  git_job_id UUID NOT NULL,
+  plan_hash VARCHAR(255) NOT NULL,
+  merkle_root VARCHAR(255),
+  canonical_version VARCHAR(64),
+  token_jwt_hash VARCHAR(255),
+  token_issued_at TIMESTAMPTZ,
+  token_expires_at TIMESTAMPTZ,
+  token_policy_digest VARCHAR(255),
+  token_identity_json JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (git_job_id, plan_hash)
+);
+
+CREATE TABLE IF NOT EXISTS armoriq_invocation_receipts (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  git_job_id UUID NOT NULL,
+  stage_name VARCHAR(64) NOT NULL,
+  stage_seq INTEGER NOT NULL,
+  action_name VARCHAR(128) NOT NULL,
+  mcp_name VARCHAR(128),
+  plan_hash VARCHAR(255) NOT NULL,
+  proof_digest VARCHAR(255),
+  request_digest VARCHAR(255),
+  response_digest VARCHAR(255),
+  success BOOLEAN NOT NULL DEFAULT true,
+  execution_time_ms INTEGER,
+  occurred_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (git_job_id, stage_name, stage_seq)
+);
+
+CREATE TABLE IF NOT EXISTS stage_evidence_links (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  git_job_id UUID NOT NULL,
+  stage_name VARCHAR(64) NOT NULL,
+  evidence_type VARCHAR(64) NOT NULL,
+  evidence_url TEXT,
+  evidence_digest VARCHAR(255),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS merge_settlement_events (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  issue_id UUID REFERENCES issues(id) ON DELETE SET NULL,
+  bounty_id UUID REFERENCES issue_bounties(id) ON DELETE SET NULL,
+  pr_number INTEGER NOT NULL,
+  merge_commit_sha VARCHAR(255),
+  github_delivery_id VARCHAR(255) NOT NULL,
+  merge_event_key VARCHAR(255) NOT NULL,
+  merge_semantic_key VARCHAR(255) NOT NULL,
+  settlement_key VARCHAR(255) NOT NULL,
+  payout_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  outcome_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  payout_tx_ref VARCHAR(255),
+  error_message TEXT,
+  processed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (merge_event_key),
+  UNIQUE (merge_semantic_key),
+  UNIQUE (settlement_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_merge_settlement_events_repo_pr
+  ON merge_settlement_events(repository_id, pr_number);
+CREATE INDEX IF NOT EXISTS idx_merge_settlement_events_bounty
+  ON merge_settlement_events(bounty_id);
+
+-- ─── agent outcome + reputation snapshots (incentive contract) ───────────────
+CREATE TABLE IF NOT EXISTS agent_outcomes (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  issue_id UUID NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  bounty_id UUID NOT NULL REFERENCES issue_bounties(id) ON DELETE CASCADE,
+  merge_event_id VARCHAR(255) NOT NULL,
+  merged BOOLEAN NOT NULL,
+  payout_fraction NUMERIC(8, 7) NOT NULL DEFAULT 0,
+  payout_amount NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  judge_score NUMERIC(8, 7),
+  outcome_score NUMERIC(8, 7) NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER,
+  failure_category VARCHAR(64),
+  settlement_key VARCHAR(255),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (merge_event_id)
+);
+
+ALTER TABLE agent_outcomes ADD COLUMN IF NOT EXISTS failure_category VARCHAR(64);
+ALTER TABLE agent_outcomes ADD COLUMN IF NOT EXISTS settlement_key VARCHAR(255);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_outcomes_settlement_key
+  ON agent_outcomes(settlement_key) WHERE settlement_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_agent_outcomes_agent_created
+  ON agent_outcomes(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_outcomes_issue ON agent_outcomes(issue_id);
+
+CREATE TABLE IF NOT EXISTS agent_reputation_snapshots (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  outcome_id UUID NOT NULL REFERENCES agent_outcomes(id) ON DELETE CASCADE,
+  previous_score NUMERIC(12, 4) NOT NULL,
+  next_score NUMERIC(12, 4) NOT NULL,
+  ewma_alpha NUMERIC(8, 7) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_reputation_snapshots_agent_created
+  ON agent_reputation_snapshots(agent_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS bounty_submissions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   bounty_id UUID NOT NULL REFERENCES issue_bounties(id) ON DELETE CASCADE,
@@ -316,13 +435,89 @@ CREATE TABLE IF NOT EXISTS git_jobs (
   branch_name VARCHAR(512),
   github_pr_number INTEGER,
   error_message TEXT,
+  stage VARCHAR(64) NOT NULL DEFAULT 'pending',
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  lease_owner VARCHAR(255),
+  lease_expires_at TIMESTAMPTZ,
+  last_heartbeat_at TIMESTAMPTZ,
+  retry_after TIMESTAMPTZ,
+  last_error_classification VARCHAR(24),
+  idempotency_key VARCHAR(255),
   payload JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS stage VARCHAR(64) NOT NULL DEFAULT 'pending';
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS lease_owner VARCHAR(255);
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_error_classification VARCHAR(24);
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS plan_hash VARCHAR(255);
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS armoriq_intent_id UUID;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS verification_status VARCHAR(32);
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_verified_stage VARCHAR(64);
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'armoriq_intents_git_job_id_fkey'
+  ) THEN
+    ALTER TABLE armoriq_intents
+      ADD CONSTRAINT armoriq_intents_git_job_id_fkey
+      FOREIGN KEY (git_job_id) REFERENCES git_jobs(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'armoriq_invocation_receipts_git_job_id_fkey'
+  ) THEN
+    ALTER TABLE armoriq_invocation_receipts
+      ADD CONSTRAINT armoriq_invocation_receipts_git_job_id_fkey
+      FOREIGN KEY (git_job_id) REFERENCES git_jobs(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'stage_evidence_links_git_job_id_fkey'
+  ) THEN
+    ALTER TABLE stage_evidence_links
+      ADD CONSTRAINT stage_evidence_links_git_job_id_fkey
+      FOREIGN KEY (git_job_id) REFERENCES git_jobs(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'git_jobs_armoriq_intent_id_fkey'
+  ) THEN
+    ALTER TABLE git_jobs
+      ADD CONSTRAINT git_jobs_armoriq_intent_id_fkey
+      FOREIGN KEY (armoriq_intent_id) REFERENCES armoriq_intents(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_git_jobs_idempotency_key
+  ON git_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_git_jobs_status ON git_jobs(status) WHERE status IN ('pending', 'running');
 CREATE INDEX IF NOT EXISTS idx_git_jobs_issue ON git_jobs(issue_id);
+CREATE INDEX IF NOT EXISTS idx_git_jobs_lease_exp ON git_jobs(lease_expires_at) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_git_jobs_retry_after ON git_jobs(retry_after) WHERE status = 'pending';
 
 -- FK issues.git_job_id → git_jobs (after git_jobs exists)
 DO $$

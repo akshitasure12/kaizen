@@ -4,8 +4,19 @@
 
 import { FastifyInstance } from "fastify";
 import { query, queryOne } from "../db/client";
+import { env } from "../env";
 import { requireAuth } from "../middleware/auth";
 import { getGitHubLinkForRepo, getGitHubTokenForUser } from "../services/github-integration";
+
+function hasInternalAccess(headerValue: string | string[] | undefined): boolean {
+  if (!env.INTERNAL_SERVICE_SECRET) return false;
+  const value = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  return value === env.INTERNAL_SERVICE_SECRET;
+}
+
+function requireInternal(req: { headers: Record<string, unknown> }): boolean {
+  return hasInternalAccess(req.headers["x-internal-service-secret"] as string | string[] | undefined);
+}
 
 export async function gitJobRoutes(app: FastifyInstance) {
   app.post(
@@ -17,10 +28,26 @@ export async function gitJobRoutes(app: FastifyInstance) {
         issue_id?: string;
         agent_ens?: string;
         base_branch?: string;
+        idempotency_key?: string;
+        max_attempts?: number;
+        fanout_children?: boolean;
       };
-      const { issue_id, agent_ens, base_branch } = body;
-      if (!issue_id || !agent_ens) {
-        return reply.status(400).send({ error: "issue_id and agent_ens required" });
+      const { issue_id, agent_ens, base_branch, idempotency_key, max_attempts, fanout_children } = body;
+      if (!issue_id) {
+        return reply.status(400).send({ error: "issue_id required" });
+      }
+
+      if (idempotency_key) {
+        const existing = await queryOne<{ id: string; status: string }>(
+          `SELECT id, status
+           FROM git_jobs
+           WHERE idempotency_key = $1
+           LIMIT 1`,
+          [idempotency_key],
+        );
+        if (existing) {
+          return reply.status(200).send({ id: existing.id, status: existing.status, deduped: true });
+        }
       }
 
       const link = await getGitHubLinkForRepo(repoId);
@@ -34,14 +61,6 @@ export async function gitJobRoutes(app: FastifyInstance) {
           });
       }
 
-      const agent = await queryOne<{ id: string }>(
-        "SELECT id FROM agents WHERE lower(ens_name) = lower($1)",
-        [agent_ens],
-      );
-      if (!agent) {
-        return reply.status(404).send({ error: "Agent not found" });
-      }
-
       const issue = await queryOne<{ id: string; repo_id: string }>(
         "SELECT id, repo_id FROM issues WHERE id = $1",
         [issue_id],
@@ -50,22 +69,122 @@ export async function gitJobRoutes(app: FastifyInstance) {
         return reply.status(404).send({ error: "Issue not found in this repository" });
       }
 
-      const [job] = await query<{ id: string }>(
-        `INSERT INTO git_jobs (issue_id, repo_id, user_id, agent_id, base_branch, status, payload)
-         VALUES ($1, $2, $3, $4, $5, 'pending', $6::jsonb) RETURNING id`,
-        [
-          issue_id,
-          repoId,
-          req.user!.userId,
-          agent.id,
-          base_branch ?? link.default_branch ?? "main",
-          JSON.stringify({}),
-        ],
+      const children = await query<{ id: string; assigned_agent_id: string | null }>(
+        `SELECT id, assigned_agent_id
+         FROM issues
+         WHERE parent_issue_id = $1
+         ORDER BY created_at ASC`,
+        [issue_id],
       );
 
-      await query(`UPDATE issues SET git_job_id = $1 WHERE id = $2`, [job.id, issue_id]);
+      const shouldFanout = children.length > 0 && fanout_children !== false;
 
-      return reply.status(201).send({ id: job.id, status: "pending" });
+      const resolvedAgent = agent_ens
+        ? await queryOne<{ id: string; ens_name: string }>(
+            "SELECT id, ens_name FROM agents WHERE lower(ens_name) = lower($1)",
+            [agent_ens],
+          )
+        : null;
+
+      if (!shouldFanout && !resolvedAgent) {
+        return reply.status(400).send({ error: "agent_ens required for non-fanout job" });
+      }
+      if (agent_ens && !resolvedAgent) {
+        return reply.status(404).send({ error: "Agent not found" });
+      }
+
+      const createJob = async (targetIssueId: string, targetAgentId: string, dedupeKey: string | null) => {
+        if (dedupeKey) {
+          const existing = await queryOne<{ id: string; status: string }>(
+            `SELECT id, status
+             FROM git_jobs
+             WHERE idempotency_key = $1
+             LIMIT 1`,
+            [dedupeKey],
+          );
+          if (existing) {
+            return { id: existing.id, status: existing.status, deduped: true };
+          }
+        }
+
+        const [job] = await query<{ id: string }>(
+          `INSERT INTO git_jobs (
+             issue_id,
+             repo_id,
+             user_id,
+             agent_id,
+             base_branch,
+             status,
+             stage,
+             payload,
+             max_attempts,
+             idempotency_key
+           )
+           VALUES ($1, $2, $3, $4, $5, 'pending', 'pending', $6::jsonb, $7, $8)
+           RETURNING id`,
+          [
+            targetIssueId,
+            repoId,
+            req.user!.userId,
+            targetAgentId,
+            base_branch ?? link.default_branch ?? "main",
+            JSON.stringify({}),
+            max_attempts && max_attempts > 0 ? Math.floor(max_attempts) : env.WORKER_MAX_ATTEMPTS,
+            dedupeKey,
+          ],
+        );
+
+        await query(`UPDATE issues SET git_job_id = $1 WHERE id = $2`, [job.id, targetIssueId]);
+        return { id: job.id, status: "pending", deduped: false };
+      };
+
+      if (shouldFanout) {
+        const parentBounty = await queryOne<{ id: string }>(
+          `SELECT id
+           FROM issue_bounties
+           WHERE issue_id = $1 AND status IN ('funded', 'judging')
+           LIMIT 1`,
+          [issue_id],
+        );
+        if (parentBounty) {
+          return reply.status(400).send({
+            error: "Parent issue has direct active bounty; decomposition requires child-only bounty allocation",
+          });
+        }
+
+        if (!resolvedAgent && children.some((c) => !c.assigned_agent_id)) {
+          return reply.status(400).send({
+            error: "agent_ens required when one or more child issues are unassigned",
+          });
+        }
+
+        const jobs: Array<{ child_issue_id: string; id: string; status: string; deduped: boolean }> = [];
+        for (const child of children) {
+          const childAgentId = child.assigned_agent_id || resolvedAgent!.id;
+          const childKey = idempotency_key ? `${idempotency_key}:${child.id}` : null;
+          const job = await createJob(child.id, childAgentId, childKey);
+          jobs.push({
+            child_issue_id: child.id,
+            id: job.id,
+            status: job.status,
+            deduped: job.deduped,
+          });
+        }
+
+        return reply.status(201).send({
+          parent_issue_id: issue_id,
+          fanout: true,
+          jobs,
+        });
+      }
+
+      const single = await createJob(issue_id, resolvedAgent!.id, idempotency_key ?? null);
+      const code = single.deduped ? 200 : 201;
+      return reply.status(code).send({
+        id: single.id,
+        status: single.status,
+        deduped: single.deduped,
+      });
     },
   );
 
@@ -77,6 +196,122 @@ export async function gitJobRoutes(app: FastifyInstance) {
        JOIN issues i ON i.id = gj.issue_id
        WHERE gj.id = $1`,
       [id],
+    );
+    if (!row) return reply.status(404).send({ error: "Job not found" });
+    return row;
+  });
+
+  app.post("/internal/git-jobs/:id/heartbeat", async (req, reply) => {
+    if (!requireInternal(req as { headers: Record<string, unknown> })) {
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
+    const { id } = req.params as { id: string };
+    const body = (req.body as { lease_timeout_ms?: number } | undefined) ?? {};
+    const timeoutMs =
+      body.lease_timeout_ms && body.lease_timeout_ms > 0
+        ? Math.floor(body.lease_timeout_ms)
+        : env.WORKER_LEASE_TIMEOUT_MS;
+    const [row] = await query<{ id: string; lease_expires_at: string }>(
+      `UPDATE git_jobs
+       SET last_heartbeat_at = NOW(),
+           lease_expires_at = NOW() + (($1::bigint || ' milliseconds')::interval),
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, lease_expires_at`,
+      [timeoutMs, id],
+    );
+    if (!row) return reply.status(404).send({ error: "Job not found" });
+    return row;
+  });
+
+  app.post("/internal/git-jobs/:id/stage", async (req, reply) => {
+    if (!requireInternal(req as { headers: Record<string, unknown> })) {
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
+    const { id } = req.params as { id: string };
+    const body = req.body as { stage?: string; payload?: unknown };
+    if (!body.stage) return reply.status(400).send({ error: "stage is required" });
+    const [row] = await query<{ id: string; stage: string }>(
+      `UPDATE git_jobs
+       SET stage = $1,
+           payload = COALESCE(payload, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, stage`,
+      [body.stage, body.payload ? JSON.stringify(body.payload) : null, id],
+    );
+    if (!row) return reply.status(404).send({ error: "Job not found" });
+    return row;
+  });
+
+  app.post("/internal/git-jobs/:id/complete", async (req, reply) => {
+    if (!requireInternal(req as { headers: Record<string, unknown> })) {
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
+    const { id } = req.params as { id: string };
+    const body = (req.body as { branch_name?: string; github_pr_number?: number } | undefined) ?? {};
+    const [row] = await query<{ id: string; status: string; stage: string }>(
+      `UPDATE git_jobs
+       SET status = 'done',
+           stage = 'completed',
+           branch_name = COALESCE($1, branch_name),
+           github_pr_number = COALESCE($2, github_pr_number),
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           retry_after = NULL,
+           error_message = NULL,
+           updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, status, stage`,
+      [body.branch_name ?? null, body.github_pr_number ?? null, id],
+    );
+    if (!row) return reply.status(404).send({ error: "Job not found" });
+    return row;
+  });
+
+  app.post("/internal/git-jobs/:id/fail", async (req, reply) => {
+    if (!requireInternal(req as { headers: Record<string, unknown> })) {
+      return reply.status(401).send({ error: "Unauthorized" });
+    }
+    const { id } = req.params as { id: string };
+    const body =
+      (req.body as
+        | {
+            error_message?: string;
+            classification?: string;
+            retryable?: boolean;
+            retry_after_ms?: number;
+          }
+        | undefined) ?? {};
+
+    const retryAfterMs =
+      body.retry_after_ms && body.retry_after_ms > 0
+        ? Math.floor(body.retry_after_ms)
+        : env.WORKER_BASE_RETRY_MS;
+
+    const [row] = await query<{ id: string; status: string; stage: string; attempt_count: number; max_attempts: number }>(
+      `UPDATE git_jobs
+       SET status = CASE
+             WHEN COALESCE($1, false) = true AND attempt_count < max_attempts THEN 'pending'
+             ELSE 'failed'
+           END,
+           stage = CASE
+             WHEN COALESCE($1, false) = true AND attempt_count < max_attempts THEN 'pending_retry'
+             ELSE 'failed'
+           END,
+           last_error_classification = COALESCE($2, last_error_classification),
+           error_message = COALESCE($3, error_message),
+           retry_after = CASE
+             WHEN COALESCE($1, false) = true AND attempt_count < max_attempts
+             THEN NOW() + (($4::bigint || ' milliseconds')::interval)
+             ELSE NULL
+           END,
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           updated_at = NOW()
+       WHERE id = $5
+       RETURNING id, status, stage, attempt_count, max_attempts`,
+      [body.retryable ?? false, body.classification ?? null, body.error_message ?? null, retryAfterMs, id],
     );
     if (!row) return reply.status(404).send({ error: "Job not found" });
     return row;

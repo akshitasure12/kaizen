@@ -1,10 +1,11 @@
 # Kaizen
 
-Scaffold for the **Demo-ready GitHub Git** stack (Fastify API, git worker process, Next.js UI, Postgres). Implementation follows the internal plan: GitHub as code SoT, merge webhook for bounties, shared temp clone for agent + judge — **not built in this repo state yet**, only structure and tooling.
+Scaffold for the **Demo-ready GitHub Git** stack (Fastify API, git worker process, Next.js UI, Postgres). Implementation follows the internal plan: GitHub as code SoT, merge webhook for bounties, shared temp clone for agent + judge.
 
 ## Prereqs
 
-- Node 20+
+- Bun 1.3+
+- Node 20+ for the Docker/runtime build targets
 - Docker (optional, for Postgres / full stack images)
 
 ## Env
@@ -17,17 +18,17 @@ The API, worker, and Next config all try to load a root `.env` by walking up fro
 ## Local dev
 
 ```bash
-npm install
+bun install
 docker compose up -d postgres   # optional
-npm run dev:api                 # http://localhost:3001
-npm run dev:frontend            # http://localhost:3000
-npm run dev:worker              # logs scaffold tick
+bun run dev:api                 # http://localhost:3001
+bun run dev:frontend            # http://localhost:3000
+bun run dev:worker              # DB-backed worker loop
 ```
 
 Migrations entrypoint (connectivity check only until SQL is added):
 
 ```bash
-npm run migrate
+bun run migrate
 ```
 
 ## Docker
@@ -41,6 +42,6 @@ npm run migrate
 | Path | Role |
 |------|------|
 | `backend/` | Fastify API (`/health`, `/status`), env validation, `src/db/migrate.ts`, `migrations/` for future SQL |
-| `worker/` | Git worker process (idle scaffold; Phase 2 in the plan) |
+| `worker/` | Git worker process (queue lease, clone, PR, judge, comment, cleanup) |
 | `frontend/` | Next.js app (`NEXT_PUBLIC_API_URL`) |
 | `ref/` | Ignored reference snapshot only — not source of truth |

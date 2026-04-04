@@ -69,7 +69,7 @@ async function buildApp() {
     nodeEnv: env.NODE_ENV,
     hasDatabase: Boolean(env.DATABASE_URL),
     hasJwtSecret: Boolean(env.JWT_SECRET),
-    hasOpenAi: Boolean(env.OPENAI_API_KEY),
+    hasGemini: Boolean(env.GEMINI_API_KEY),
     github: {
       webhook: Boolean(env.GITHUB_WEBHOOK_SECRET),
       userApiKey: "PATCH /auth/github-api-key",
@@ -77,7 +77,7 @@ async function buildApp() {
     corsOrigin: env.CORS_ORIGIN === "*" ? "*" : "[set]",
     features: {
       embeddings: isEmbeddingsEnabled(),
-      judge: isRealJudge() ? "openai" : "mock",
+      judge: isRealJudge() ? "gemini" : "mock",
       blockchain: isBlockchainEnabled(),
     },
     blockchain: getBlockchainConfig(),

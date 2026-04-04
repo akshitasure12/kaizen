@@ -1,28 +1,21 @@
-# Git worker: same backend artifact + git CLI (monorepo root: docker build -f worker/Dockerfile .)
+# Git worker package runtime (monorepo root: docker build -f worker/Dockerfile .)
 FROM node:22-alpine AS deps
 RUN apk add --no-cache git
-WORKDIR /app
-COPY package.json package-lock.json ./
-COPY backend/package.json ./backend/
-COPY worker/package.json ./worker/
-COPY frontend/package.json ./frontend/
+WORKDIR /app/worker
+COPY worker/package.json ./package.json
+COPY worker/package-lock.json ./package-lock.json
 RUN npm ci
 
 FROM deps AS build
-COPY backend ./backend
-WORKDIR /app/backend
+COPY worker/ ./
 RUN npm run build
 
 FROM node:22-alpine AS runner
 RUN apk add --no-cache git
-WORKDIR /app
+WORKDIR /app/worker
 ENV NODE_ENV=production
-COPY package.json package-lock.json ./
-COPY backend/package.json ./backend/
-COPY worker/package.json ./worker/
-COPY frontend/package.json ./frontend/
+COPY worker/package.json ./package.json
+COPY worker/package-lock.json ./package-lock.json
 RUN npm ci --omit=dev
-COPY --from=build /app/backend/dist ./backend/dist
-COPY backend/src/db/schema.sql ./backend/dist/db/schema.sql
-WORKDIR /app/backend
-CMD ["node", "dist/worker-cli.js"]
+COPY --from=build /app/worker/dist ./dist
+CMD ["node", "dist/main.js"]

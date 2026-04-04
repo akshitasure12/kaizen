@@ -1,17 +1,17 @@
 /**
  * Embeddings Service
  * 
- * Uses OpenAI text-embedding-3-small for semantic commit search.
- * Gracefully degrades to no-op if OPENAI_API_KEY is not set.
+ * Uses Gemini embeddings and text generation for semantic commit search.
+ * Gracefully degrades to no-op if GEMINI_API_KEY is not set.
  */
 
-import OpenAI from 'openai';
+import { GoogleGenAI } from '@google/genai';
+import { buildGeminiThinkingConfig } from './gemini-orchestration';
 
-// Initialize OpenAI client if API key is available
-const apiKey = process.env.OPENAI_API_KEY;
-const openai = apiKey ? new OpenAI({ apiKey }) : null;
+const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+const gemini = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
-const EMBEDDING_MODEL = process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
+const EMBEDDING_MODEL = process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-001';
 const EMBEDDING_DIMENSIONS = 1536;
 
 export interface EmbeddingResult {
@@ -24,26 +24,32 @@ export interface EmbeddingResult {
  * Check if embeddings are available
  */
 export function isEmbeddingsEnabled(): boolean {
-  return openai !== null;
+  return gemini !== null;
 }
 
 /**
  * Generate embedding for commit content
- * Returns null embedding if OpenAI is not configured
+ * Returns null embedding if Gemini is not configured
  */
 export async function generateEmbedding(text: string): Promise<number[] | null> {
-  if (!openai) {
+  if (!gemini) {
     return null;
   }
 
   try {
-    const response = await openai.embeddings.create({
+    const response = await gemini.models.embedContent({
       model: EMBEDDING_MODEL,
-      input: text.slice(0, 8000), // Truncate to avoid token limits
-      dimensions: EMBEDDING_DIMENSIONS,
+      contents: text.slice(0, 8000),
+      config: {
+        outputDimensionality: EMBEDDING_DIMENSIONS,
+      },
     });
 
-    return response.data[0].embedding;
+    const values =
+      ((response as any).embeddings?.[0]?.values as number[] | undefined) ??
+      ((response as any).embedding?.values as number[] | undefined) ??
+      null;
+    return values;
   } catch (error: any) {
     console.error('Embedding generation failed:', error.message);
     return null;
@@ -52,41 +58,42 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
 
 /**
  * Generate semantic summary and tags for commit content
- * Uses GPT-4o for intelligent summarization
+ * Uses Gemini for intelligent summarization
  */
 export async function generateSemanticMetadata(
   content: string,
   message: string
 ): Promise<{ summary: string; tags: string[] }> {
-  if (!openai) {
+  if (!gemini) {
     // Fallback: use message as summary, extract simple tags
     const tags = extractSimpleTags(content, message);
     return { summary: message, tags };
   }
 
   try {
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_JUDGE_MODEL || 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: `You are a code analysis assistant. Given a commit message and content, generate:
-1. A concise 1-2 sentence semantic summary of what this commit accomplishes
-2. 3-7 relevant tags (lowercase, hyphenated)
-
-Respond in JSON format: {"summary": "...", "tags": ["tag1", "tag2", ...]}`
+    const response = await gemini.models.generateContent({
+      model: process.env.GEMINI_MODEL_FAST || 'gemini-2.5-flash-lite',
+      contents: `Commit message: ${message}\n\nContent:\n${content.slice(0, 4000)}`,
+      config: {
+        systemInstruction:
+          'You summarize code commits. Return strict JSON only. Keep summary concise and tags lowercase-hyphenated.',
+        thinkingConfig: buildGeminiThinkingConfig(
+          process.env.GEMINI_MODEL_FAST || 'gemini-2.5-flash-lite',
+          'low',
+        ),
+        responseMimeType: 'application/json',
+        responseJsonSchema: {
+          type: 'object',
+          properties: {
+            summary: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['summary', 'tags'],
         },
-        {
-          role: 'user',
-          content: `Commit message: ${message}\n\nContent:\n${content.slice(0, 4000)}`
-        }
-      ],
-      response_format: { type: 'json_object' },
-      max_tokens: 200,
-      temperature: 0.3,
+      },
     });
 
-    const result = JSON.parse(response.choices[0].message.content || '{}');
+    const result = JSON.parse((response.text || '{}') as string);
     return {
       summary: result.summary || message,
       tags: Array.isArray(result.tags) ? result.tags : [],

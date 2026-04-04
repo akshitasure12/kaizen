@@ -11,6 +11,7 @@ import { requireAuth } from '../middleware/auth';
 import { judgeSubmission, storeJudgement, judgeAllSubmissions, Scorecard } from '../services/judge';
 import * as sdk from '../sdk';
 import * as bountyService from '../services/bounty';
+import { rankAgentsForIssue } from '../services/agent-assignment';
 
 interface Issue {
   id: string;
@@ -20,6 +21,8 @@ interface Issue {
   status: 'open' | 'in_progress' | 'closed' | 'cancelled';
   scorecard: Scorecard;
   assigned_agent_id: string | null;
+  parent_issue_id?: string | null;
+  root_issue_id?: string | null;
   created_by: string;
   closed_at: string | null;
   created_at: string;
@@ -68,6 +71,256 @@ export async function issueRoutes(app: FastifyInstance) {
     );
 
     return reply.status(201).send(issue);
+  });
+
+  app.get('/:repoId/issues/:issueId/children', async (req, reply) => {
+    const { repoId, issueId } = req.params as any;
+
+    const parent = await queryOne<Issue>(
+      'SELECT * FROM issues WHERE id = $1 AND repo_id = $2',
+      [issueId, repoId],
+    );
+    if (!parent) {
+      return reply.status(404).send({ error: 'Issue not found' });
+    }
+
+    const children = await query<Issue>(
+      `SELECT * FROM issues
+       WHERE parent_issue_id = $1
+       ORDER BY created_at ASC`,
+      [issueId],
+    );
+
+    const counts = {
+      total: children.length,
+      open: children.filter((c) => c.status === 'open').length,
+      in_progress: children.filter((c) => c.status === 'in_progress').length,
+      closed: children.filter((c) => c.status === 'closed').length,
+      cancelled: children.filter((c) => c.status === 'cancelled').length,
+    };
+
+    return {
+      parent_issue_id: issueId,
+      parent_status: parent.status,
+      counts,
+      children,
+    };
+  });
+
+  app.post('/:repoId/issues/:issueId/decompose', { preHandler: requireAuth }, async (req, reply) => {
+    const { repoId, issueId } = req.params as any;
+    const body = (req.body || {}) as {
+      children?: Array<{
+        title: string;
+        body?: string;
+        scorecard?: unknown;
+        estimated_effort?: number;
+        agent_ens?: string;
+        bounty_amount?: number;
+      }>;
+      allocation_strategy?: 'effort' | 'equal';
+      total_bounty_amount?: number;
+      poster_agent_ens?: string;
+      deadline_hours?: number;
+      max_submissions?: number;
+    };
+
+    const parent = await queryOne<Issue>(
+      'SELECT * FROM issues WHERE id = $1 AND repo_id = $2',
+      [issueId, repoId],
+    );
+    if (!parent) {
+      return reply.status(404).send({ error: 'Issue not found' });
+    }
+    if (parent.status === 'closed' || parent.status === 'cancelled') {
+      return reply.status(400).send({ error: 'Cannot decompose a closed/cancelled issue' });
+    }
+    if (parent.parent_issue_id) {
+      return reply.status(400).send({ error: 'Only top-level parent issues can be decomposed' });
+    }
+
+    const existingChildren = await queryOne<{ cnt: string }>(
+      'SELECT COUNT(*)::text as cnt FROM issues WHERE parent_issue_id = $1',
+      [issueId],
+    );
+    if (Number(existingChildren?.cnt || '0') > 0) {
+      return reply.status(409).send({ error: 'Issue already has child issues' });
+    }
+
+    const parentBounty = await bountyService.getIssueBounty(issueId);
+    if (parentBounty && ['funded', 'judging'].includes(parentBounty.status)) {
+      return reply.status(400).send({ error: 'Parent issue cannot keep direct active bounty when decomposed' });
+    }
+
+    const childSpecs = Array.isArray(body.children) ? body.children : [];
+    if (childSpecs.length < 2) {
+      return reply.status(400).send({ error: 'Provide at least two child issues for decomposition' });
+    }
+    if (childSpecs.some((c) => !c.title || !c.title.trim())) {
+      return reply.status(400).send({ error: 'Each child issue requires a title' });
+    }
+
+    const totalBounty = Number(body.total_bounty_amount || 0);
+    const hasPerChildBounty = childSpecs.some((c) => Number(c.bounty_amount || 0) > 0);
+    if (totalBounty > 0 && hasPerChildBounty) {
+      return reply.status(400).send({
+        error: 'Use either total_bounty_amount or per-child bounty_amount values, not both',
+      });
+    }
+
+    const willCreateBounties = totalBounty > 0 || hasPerChildBounty;
+
+    let posterAgentId: string | null = null;
+    if (willCreateBounties) {
+      if (!body.poster_agent_ens) {
+        return reply.status(400).send({ error: 'poster_agent_ens is required when bounty allocation is requested' });
+      }
+      const poster = await sdk.getAgent(body.poster_agent_ens);
+      if (!poster) {
+        return reply.status(404).send({ error: 'Poster agent not found' });
+      }
+      posterAgentId = poster.id;
+    }
+
+    const strategy = body.allocation_strategy === 'equal' ? 'equal' : 'effort';
+    const bountyAllocations = totalBounty > 0
+      ? allocateChildBounties(totalBounty, childSpecs, strategy)
+      : childSpecs.map((c) => Math.max(0, Number(c.bounty_amount || 0)));
+
+    const requestedTotalBounty = bountyAllocations.reduce((acc, amount) => acc + amount, 0);
+    if (willCreateBounties && requestedTotalBounty <= 0) {
+      return reply.status(400).send({ error: 'Bounty allocation must be greater than zero' });
+    }
+
+    const childAgentByEns = new Map<string, { id: string; ens_name: string }>();
+    const requestedChildAgents = Array.from(
+      new Set(
+        childSpecs
+          .map((c) => (typeof c.agent_ens === 'string' ? c.agent_ens.trim() : ''))
+          .filter((ens) => ens.length > 0),
+      ),
+    );
+    for (const childEns of requestedChildAgents) {
+      const childAgent = await sdk.getAgent(childEns);
+      if (!childAgent) {
+        return reply.status(404).send({ error: `Child agent not found: ${childEns}` });
+      }
+      childAgentByEns.set(childAgent.ens_name.toLowerCase(), childAgent);
+    }
+
+    if (willCreateBounties && posterAgentId) {
+      const balance = await bountyService.getWalletBalance(posterAgentId);
+      if (balance < requestedTotalBounty) {
+        return reply.status(400).send({
+          error: `Insufficient wallet balance: have ${balance}, need ${requestedTotalBounty}`,
+        });
+      }
+
+      const cap = await bountyService.getSpendingCap(posterAgentId);
+      if (cap !== null) {
+        const spent = await bountyService.getTotalBountySpend(posterAgentId);
+        if (spent + requestedTotalBounty > cap) {
+          return reply.status(400).send({
+            error: `Bounty would exceed spending cap: spent ${spent}, cap ${cap}, requested ${requestedTotalBounty}`,
+          });
+        }
+      }
+    }
+
+    const deadlineHours = body.deadline_hours && body.deadline_hours > 0 ? body.deadline_hours : 24;
+    const maxSubmissions = body.max_submissions && body.max_submissions > 0 ? body.max_submissions : 5;
+    const deadline = new Date(Date.now() + deadlineHours * 60 * 60 * 1000);
+
+    const createdChildren: Array<{
+      issue: Issue;
+      assigned_agent_ens: string | null;
+      bounty_amount: number;
+    }> = [];
+    const createdChildIssueIds: string[] = [];
+    const createdBountyIds: string[] = [];
+    try {
+      for (let i = 0; i < childSpecs.length; i += 1) {
+        const spec = childSpecs[i]!;
+        const [child] = await query<Issue>(
+          `INSERT INTO issues (repo_id, title, body, scorecard, created_by, parent_issue_id, root_issue_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *`,
+          [
+            repoId,
+            spec.title.trim(),
+            spec.body || '',
+            validateScorecard(spec.scorecard),
+            req.user!.userId,
+            issueId,
+            parent.root_issue_id || parent.id,
+          ],
+        );
+        createdChildIssueIds.push(child.id);
+
+        let assignedEns: string | null = null;
+        const childAgentEns = typeof spec.agent_ens === 'string' ? spec.agent_ens.trim().toLowerCase() : '';
+        if (childAgentEns) {
+          const childAgent = childAgentByEns.get(childAgentEns)!;
+          await query(
+            `UPDATE issues
+             SET assigned_agent_id = $1, status = 'in_progress'
+             WHERE id = $2`,
+            [childAgent.id, child.id],
+          );
+          child.assigned_agent_id = childAgent.id;
+          child.status = 'in_progress';
+          assignedEns = childAgent.ens_name;
+        }
+
+        const allocation = Math.max(0, bountyAllocations[i] || 0);
+        if (allocation > 0 && posterAgentId) {
+          const bounty = await bountyService.postIssueBounty(
+            child.id,
+            posterAgentId,
+            allocation,
+            deadline,
+            maxSubmissions,
+          );
+          createdBountyIds.push(bounty.id);
+        }
+
+        createdChildren.push({
+          issue: child,
+          assigned_agent_ens: assignedEns,
+          bounty_amount: allocation,
+        });
+      }
+    } catch (err) {
+      for (const bountyId of createdBountyIds) {
+        try {
+          await bountyService.refundIssueBounty(bountyId);
+        } catch (refundErr) {
+          req.log.error({ err: refundErr, bountyId }, 'Failed to rollback child bounty during decomposition');
+        }
+      }
+
+      if (createdChildIssueIds.length > 0) {
+        await query(
+          'DELETE FROM issues WHERE id = ANY($1::uuid[])',
+          [createdChildIssueIds],
+        );
+      }
+      throw err;
+    }
+
+    await query(
+      `UPDATE issues
+       SET status = CASE WHEN status = 'open' THEN 'in_progress' ELSE status END
+       WHERE id = $1`,
+      [issueId],
+    );
+
+    return reply.status(201).send({
+      parent_issue_id: issueId,
+      strategy: totalBounty > 0 ? strategy : 'manual_or_zero',
+      total_bounty_amount: totalBounty > 0 ? totalBounty : bountyAllocations.reduce((a, b) => a + b, 0),
+      children: createdChildren,
+    });
   });
 
   /**
@@ -184,6 +437,10 @@ export async function issueRoutes(app: FastifyInstance) {
       values
     );
 
+    if (status !== undefined) {
+      await rollupParentIssueStatus(issueId);
+    }
+
     return updated;
   });
 
@@ -194,27 +451,75 @@ export async function issueRoutes(app: FastifyInstance) {
     const { repoId, issueId } = req.params as any;
     const { agent_ens } = req.body as any;
 
-    if (!agent_ens) {
-      return reply.status(400).send({ error: 'agent_ens is required' });
+    const issueForAssignment = await queryOne<Issue>(
+      'SELECT * FROM issues WHERE id = $1 AND repo_id = $2',
+      [issueId, repoId],
+    );
+    if (!issueForAssignment) {
+      return reply.status(404).send({ error: 'Issue not found' });
     }
 
-    const agent = await sdk.getAgent(agent_ens);
-    if (!agent) {
-      return reply.status(404).send({ error: 'Agent not found' });
+    let agentId: string | null = null;
+    let selectedEns: string | null = null;
+    let assignmentMeta: Record<string, unknown> | undefined;
+
+    if (agent_ens) {
+      const agent = await sdk.getAgent(agent_ens);
+      if (!agent) {
+        return reply.status(404).send({ error: 'Agent not found' });
+      }
+      agentId = agent.id;
+      selectedEns = agent.ens_name;
+    } else {
+      const ranked = await rankAgentsForIssue({
+        issueTitle: issueForAssignment.title,
+        issueBody: issueForAssignment.body || '',
+        limit: 3,
+      });
+      const winner = ranked[0];
+      if (!winner) {
+        return reply.status(400).send({ error: 'No agents available for assignment' });
+      }
+      agentId = winner.id;
+      selectedEns = winner.ens_name;
+      assignmentMeta = {
+        strategy: 'auto_ranked',
+        winner_score: winner.assignment_score,
+        top_candidates: ranked,
+      };
     }
 
     const [issue] = await query<Issue>(
       `UPDATE issues SET assigned_agent_id = $1, status = 'in_progress'
        WHERE id = $2 AND repo_id = $3
        RETURNING *`,
-      [agent.id, issueId, repoId]
+      [agentId, issueId, repoId]
     );
 
     if (!issue) {
       return reply.status(404).send({ error: 'Issue not found' });
     }
 
-    return issue;
+    return {
+      ...issue,
+      assigned_agent_ens: selectedEns,
+      assignment: assignmentMeta ?? { strategy: 'manual' },
+    };
+  });
+
+  app.get('/:repoId/issues/:issueId/assignment-suggestions', { preHandler: requireAuth }, async (req, reply) => {
+    const { repoId, issueId } = req.params as any;
+    const issue = await queryOne<Issue>('SELECT * FROM issues WHERE id = $1 AND repo_id = $2', [issueId, repoId]);
+    if (!issue) {
+      return reply.status(404).send({ error: 'Issue not found' });
+    }
+
+    const suggestions = await rankAgentsForIssue({
+      issueTitle: issue.title,
+      issueBody: issue.body || '',
+      limit: 5,
+    });
+    return { issue_id: issue.id, suggestions };
   });
 
   /**
@@ -284,6 +589,8 @@ export async function issueRoutes(app: FastifyInstance) {
       [issueId]
     );
 
+    await rollupParentIssueStatus(issueId);
+
     return {
       issue: closed,
       judgement: {
@@ -297,7 +604,7 @@ export async function issueRoutes(app: FastifyInstance) {
   /**
    * Submit solution for issue (by agent)
    */
-  app.post('/:repoId/issues/:issueId/submit', async (req, reply) => {
+  app.post('/:repoId/issues/:issueId/submit', { preHandler: requireAuth }, async (req, reply) => {
     const { repoId, issueId } = req.params as any;
     const { agent_ens, content } = req.body as any;
 
@@ -370,6 +677,17 @@ export async function issueRoutes(app: FastifyInstance) {
     if (!issue) {
       return reply.status(404).send({ error: 'Issue not found' });
     }
+    if (!issue.parent_issue_id) {
+      const childCount = await queryOne<{ count: string }>(
+        'SELECT COUNT(*)::text as count FROM issues WHERE parent_issue_id = $1',
+        [issueId],
+      );
+      if (Number(childCount?.count || '0') > 0) {
+        return reply.status(400).send({
+          error: 'Parent issue has child issues; post bounties on child issues only',
+        });
+      }
+    }
     if (issue.status === 'closed' || issue.status === 'cancelled') {
       return reply.status(400).send({ error: 'Cannot post bounty on a closed/cancelled issue' });
     }
@@ -426,7 +744,7 @@ export async function issueRoutes(app: FastifyInstance) {
    * Submit a solution for a bounty
    * Any agent (except the poster) can submit within the deadline and max_submissions cap.
    */
-  app.post('/:repoId/issues/:issueId/bounty-submit', async (req, reply) => {
+  app.post('/:repoId/issues/:issueId/bounty-submit', { preHandler: requireAuth }, async (req, reply) => {
     const { repoId, issueId } = req.params as any;
     const { agent_ens, content } = req.body as any;
 
@@ -655,4 +973,82 @@ function validateScorecard(input: any): Scorecard {
       : defaults.time_limit_hours,
     required_language: input.required_language,
   };
+}
+
+function allocateChildBounties(
+  total: number,
+  children: Array<{ estimated_effort?: number }>,
+  strategy: 'effort' | 'equal',
+): number[] {
+  const roundedTotal = Math.max(0, Math.round(total * 10000) / 10000);
+  if (roundedTotal <= 0 || children.length === 0) return children.map(() => 0);
+
+  const effortWeights = children.map((c) => Math.max(0, Number(c.estimated_effort || 0)));
+  const sumEffort = effortWeights.reduce((acc, v) => acc + v, 0);
+  const useEffort = strategy === 'effort' && sumEffort > 0;
+  const baseWeights = useEffort ? effortWeights : children.map(() => 1);
+  const weightSum = baseWeights.reduce((acc, v) => acc + v, 0);
+
+  const allocations = baseWeights.map((w) => Math.round((roundedTotal * (w / weightSum)) * 10000) / 10000);
+  const current = allocations.reduce((a, b) => a + b, 0);
+  const delta = Math.round((roundedTotal - current) * 10000) / 10000;
+  allocations[allocations.length - 1] = Math.max(
+    0,
+    Math.round((allocations[allocations.length - 1] + delta) * 10000) / 10000,
+  );
+
+  return allocations;
+}
+
+async function rollupParentIssueStatus(issueId: string): Promise<void> {
+  let cursorIssueId: string | null = issueId;
+
+  while (cursorIssueId) {
+    const relation: { parent_issue_id: string | null } | null = await queryOne<{ parent_issue_id: string | null }>(
+      'SELECT parent_issue_id FROM issues WHERE id = $1',
+      [cursorIssueId],
+    );
+    const parentId: string | null = relation?.parent_issue_id ?? null;
+    if (!parentId) return;
+
+    const parent = await queryOne<{ id: string; status: string }>(
+      'SELECT id, status FROM issues WHERE id = $1',
+      [parentId],
+    );
+    if (!parent) {
+      cursorIssueId = parentId;
+      continue;
+    }
+
+    const children = await query<{ status: string }>(
+      'SELECT status FROM issues WHERE parent_issue_id = $1',
+      [parentId],
+    );
+    if (children.length === 0) {
+      cursorIssueId = parentId;
+      continue;
+    }
+
+    const allTerminal = children.every((c) => c.status === 'closed' || c.status === 'cancelled');
+    const anyStarted = children.some(
+      (c) => c.status === 'in_progress' || c.status === 'closed' || c.status === 'cancelled',
+    );
+    const nextStatus: 'open' | 'in_progress' | 'closed' = allTerminal
+      ? 'closed'
+      : anyStarted
+        ? 'in_progress'
+        : 'open';
+
+    if (parent.status !== 'cancelled' && nextStatus !== parent.status) {
+      await query(
+        `UPDATE issues
+         SET status = $1,
+             closed_at = CASE WHEN $1 = 'closed' THEN NOW() ELSE NULL END
+         WHERE id = $2`,
+        [nextStatus, parentId],
+      );
+    }
+
+    cursorIssueId = parentId;
+  }
 }
