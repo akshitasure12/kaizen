@@ -1,13 +1,17 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import crypto from "crypto";
 import { Octokit } from "@octokit/rest";
 import simpleGit from "simple-git";
 import { pool, query, queryOne } from "../db/client";
 import { env } from "../env";
-import { getGitHubLinkForRepo, getGitHubTokenForUser } from "./github-integration";
+import { getGitHubAppInstallationToken, getGitHubLinkForRepo } from "./github-integration";
 import * as bountyService from "./bounty";
+import {
+  parseJobCliHints,
+  refineCliHintsForWorkspace,
+  renderKaizenAgentNote,
+} from "./cli-context-hints";
 import { judgeGitDiffContext, storeJudgement, type Scorecard } from "./judge";
 
 interface GitJobRow {
@@ -19,12 +23,14 @@ interface GitJobRow {
   base_branch: string;
   status: string;
   stage: string;
+  lease_token: string | null;
   attempt_count: number;
+  attempt: number;
   max_attempts: number;
   branch_name: string | null;
   github_pr_number: number | null;
-  plan_hash: string | null;
-  armoriq_intent_id: string | null;
+  judge_comment_id: number | null;
+  diff_summary_json: unknown;
   payload: Record<string, unknown> | null;
 }
 
@@ -50,11 +56,17 @@ function classifyError(message: string): ErrorClass {
   const m = message.toLowerCase();
   if (
     m.includes("rate limit") ||
+    m.includes("secondary rate") ||
+    m.includes("http 429") ||
+    m.includes("http 502") ||
+    m.includes("http 503") ||
+    (m.includes("403") && m.includes("rate")) ||
     m.includes("timeout") ||
     m.includes("temporar") ||
     m.includes("econnreset") ||
     m.includes("enotfound") ||
-    m.includes("network")
+    m.includes("network") ||
+    m.includes("eai_again")
   ) {
     return "transient";
   }
@@ -64,17 +76,14 @@ function classifyError(message: string): ErrorClass {
 function retryBackoffMs(attempt: number): number {
   const power = Math.max(0, attempt - 1);
   const value = env.WORKER_BASE_RETRY_MS * Math.pow(2, power);
-  return Math.min(env.WORKER_MAX_RETRY_MS, Math.floor(value));
-}
-
-function sha256Hex(value: string): string {
-  return crypto.createHash("sha256").update(value).digest("hex");
+  const capped = Math.min(env.WORKER_MAX_RETRY_MS, Math.floor(value));
+  const jitter = Math.floor(Math.random() * Math.max(250, Math.floor(capped * 0.2)));
+  return Math.min(env.WORKER_MAX_RETRY_MS, capped + jitter);
 }
 
 type WorkerEvent =
   | "job_claimed"
   | "planning_started"
-  | "intent_recorded"
   | "workspace_reset"
   | "clone_completed"
   | "branch_created"
@@ -134,165 +143,6 @@ async function setStage(jobId: string, stage: string, payloadPatch?: Record<stri
   );
 }
 
-async function recordInvocationReceipt(params: {
-  jobId: string;
-  stageName: string;
-  stageSeq: number;
-  actionName: string;
-  planHash: string;
-  success?: boolean;
-  requestPayload?: unknown;
-  responsePayload?: unknown;
-}): Promise<void> {
-  const requestJson = params.requestPayload == null ? "" : JSON.stringify(params.requestPayload);
-  const responseJson = params.responsePayload == null ? "" : JSON.stringify(params.responsePayload);
-  await query(
-    `INSERT INTO armoriq_invocation_receipts (
-       git_job_id,
-       stage_name,
-       stage_seq,
-       action_name,
-       mcp_name,
-       plan_hash,
-       proof_digest,
-       request_digest,
-       response_digest,
-       success,
-       execution_time_ms
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0)
-     ON CONFLICT (git_job_id, stage_name, stage_seq)
-     DO UPDATE SET
-       action_name = EXCLUDED.action_name,
-       plan_hash = EXCLUDED.plan_hash,
-       proof_digest = EXCLUDED.proof_digest,
-       request_digest = EXCLUDED.request_digest,
-       response_digest = EXCLUDED.response_digest,
-       success = EXCLUDED.success,
-       occurred_at = NOW()`,
-    [
-      params.jobId,
-      params.stageName,
-      params.stageSeq,
-      params.actionName,
-      "worker-runtime",
-      params.planHash,
-      sha256Hex(`${params.stageName}:${params.stageSeq}:${params.actionName}:${params.planHash}`),
-      requestJson ? sha256Hex(requestJson) : null,
-      responseJson ? sha256Hex(responseJson) : null,
-      params.success ?? true,
-    ],
-  );
-
-  await query(
-    `UPDATE git_jobs
-     SET verification_status = CASE WHEN $1 THEN 'verified' ELSE 'failed' END,
-         last_verified_stage = $2,
-         updated_at = NOW()
-     WHERE id = $3`,
-    [params.success ?? true, params.stageName, params.jobId],
-  );
-}
-
-async function recordStageEvidence(params: {
-  jobId: string;
-  stageName: string;
-  evidenceType: string;
-  evidenceUrl?: string | null;
-  evidencePayload?: unknown;
-}): Promise<void> {
-  const payload = params.evidencePayload == null ? "" : JSON.stringify(params.evidencePayload);
-  await query(
-    `INSERT INTO stage_evidence_links (git_job_id, stage_name, evidence_type, evidence_url, evidence_digest)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [
-      params.jobId,
-      params.stageName,
-      params.evidenceType,
-      params.evidenceUrl ?? null,
-      payload ? sha256Hex(payload) : null,
-    ],
-  );
-}
-
-async function ensureJobIntent(params: {
-  job: GitJobRow;
-  issueTitle: string;
-  issueBody: string;
-  baseBranch: string;
-}): Promise<{ planHash: string; intentId: string }> {
-  if (params.job.plan_hash && params.job.armoriq_intent_id) {
-    return { planHash: params.job.plan_hash, intentId: params.job.armoriq_intent_id };
-  }
-
-  const canonicalPlan = {
-    issue_id: params.job.issue_id,
-    agent_id: params.job.agent_id,
-    repo_id: params.job.repo_id,
-    base_branch: params.baseBranch,
-    issue_title: params.issueTitle,
-    issue_body: params.issueBody,
-    stages: [
-      "planning",
-      "cloning",
-      "editing",
-      "committing",
-      "pushing",
-      "pr_opened",
-      "judging",
-      "comment_posted",
-      "cleanup_done",
-      "awaiting_merge",
-    ],
-  };
-  const canonicalJson = JSON.stringify(canonicalPlan);
-  const planHash = sha256Hex(canonicalJson);
-  const merkleRoot = sha256Hex(`${planHash}:merkle`);
-  const tokenJwtHash = sha256Hex(`${planHash}:${params.job.id}:intent`);
-
-  const inserted = await query<{ id: string }>(
-    `INSERT INTO armoriq_intents (
-       git_job_id,
-       plan_hash,
-       merkle_root,
-       canonical_version,
-       token_jwt_hash,
-       token_issued_at,
-       token_policy_digest,
-       token_identity_json
-     ) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7::jsonb)
-     ON CONFLICT (git_job_id, plan_hash)
-     DO UPDATE SET
-       merkle_root = EXCLUDED.merkle_root,
-       canonical_version = EXCLUDED.canonical_version,
-       token_jwt_hash = EXCLUDED.token_jwt_hash,
-       token_policy_digest = EXCLUDED.token_policy_digest,
-       token_identity_json = EXCLUDED.token_identity_json
-     RETURNING id`,
-    [
-      params.job.id,
-      planHash,
-      merkleRoot,
-      "v1",
-      tokenJwtHash,
-      sha256Hex(canonicalJson),
-      JSON.stringify({ runtime: "worker", mode: "mvp-overlay" }),
-    ],
-  );
-
-  const intentId = inserted[0].id;
-  await query(
-    `UPDATE git_jobs
-     SET plan_hash = $1,
-         armoriq_intent_id = $2,
-         verification_status = 'tokenized',
-         updated_at = NOW()
-     WHERE id = $3`,
-    [planHash, intentId, params.job.id],
-  );
-
-  return { planHash, intentId };
-}
-
 async function failJob(job: GitJobRow, rawMessage: string, klass: ErrorClass): Promise<void> {
   const message = rawMessage.slice(0, 2000);
   const retryable = klass === "transient" && job.attempt_count < job.max_attempts;
@@ -307,6 +157,7 @@ async function failJob(job: GitJobRow, rawMessage: string, klass: ErrorClass): P
          END,
          last_error_classification = $3,
          error_message = $4,
+         lease_token = NULL,
          lease_owner = NULL,
          lease_expires_at = NULL,
          updated_at = NOW()
@@ -331,9 +182,17 @@ export async function processGitJobById(jobId: string): Promise<void> {
   await heartbeat(job.id);
 
   const link = await getGitHubLinkForRepo(job.repo_id);
-  const token = await getGitHubTokenForUser(job.user_id);
-  if (!link || !token) {
-    await failJob(job, "Missing GitHub remote on repository or GitHub API key on user", "permanent");
+  if (!link) {
+    await failJob(job, "Missing GitHub repository link for git job", "permanent");
+    return;
+  }
+
+  let token: string;
+  try {
+    token = await getGitHubAppInstallationToken(link.installation_id);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await failJob(job, `Failed to derive installation token: ${msg}`, classifyError(msg));
     return;
   }
 
@@ -352,7 +211,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
   const dirName = `job-${job.id}-attempt-${job.attempt_count}`;
   const workDir = path.join(tmpRoot, dirName);
   let cleaned = false;
-  let planHash = job.plan_hash ?? "";
   let finalBranchName: string | null = null;
   let finalPrNumber: number | null = null;
   let didSucceed = false;
@@ -385,28 +243,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
       issue_len: (issue.body || "").length,
       base_branch: base,
     });
-    const intent = await ensureJobIntent({
-      job,
-      issueTitle: issue.title,
-      issueBody: issue.body || "",
-      baseBranch: base,
-    });
-    planHash = intent.planHash;
-    logWorkerEvent("intent_recorded", {
-      job_id: job.id,
-      intent_id: intent.intentId,
-      plan_hash: planHash,
-      dry_run: dryRun,
-    });
-    await recordInvocationReceipt({
-      jobId: job.id,
-      stageName: "planning",
-      stageSeq: 1,
-      actionName: "capture_plan",
-      planHash,
-      requestPayload: { issue_id: job.issue_id, repo_id: job.repo_id },
-      responsePayload: { intent_id: intent.intentId, plan_hash: intent.planHash },
-    });
 
     await setStage(job.id, "cloning");
     await heartbeat(job.id);
@@ -418,17 +254,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
       work_dir: workDir,
       attempt: job.attempt_count,
     });
-    await recordStageEvidence({
-      jobId: job.id,
-      stageName: "cloning",
-      evidenceType: "workspace",
-      evidencePayload: {
-        tmp_root: tmpRoot,
-        work_dir: workDir,
-        attempt: job.attempt_count,
-        strategy: job.attempt_count > 1 ? "fresh-retry" : "initial",
-      },
-    });
 
     const remote = `https://x-access-token:${token}@github.com/${link.github_owner}/${link.github_repo}.git`;
     const rootGit = simpleGit(tmpRoot);
@@ -438,14 +263,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
       work_dir: workDir,
       branch: base,
       dry_run: dryRun,
-    });
-    await recordInvocationReceipt({
-      jobId: job.id,
-      stageName: "cloning",
-      stageSeq: 2,
-      actionName: "git_clone",
-      planHash,
-      requestPayload: { base_branch: base, work_dir: workDir, attempt: job.attempt_count },
     });
 
     await setStage(job.id, "editing");
@@ -461,10 +278,35 @@ export async function processGitJobById(jobId: string): Promise<void> {
       dry_run: dryRun,
     });
 
+    const parsedHints = parseJobCliHints(job.payload);
+    const contextHints = env.CLI_CONTEXT_HINTS_ENABLED
+      ? await refineCliHintsForWorkspace({
+          git,
+          issueTitle: issue.title,
+          issueBody: issue.body || "",
+          seedHints: parsedHints.contextHints,
+          maxFiles: env.CLI_CONTEXT_HINTS_MAX_FILES,
+          maxTests: env.CLI_CONTEXT_HINTS_MAX_TESTS,
+          scanLimit: env.CLI_CONTEXT_HINTS_SCAN_LIMIT,
+        })
+      : parsedHints.contextHints;
+
+    await setStage(job.id, "editing", {
+      context_hint_count: contextHints?.ranked_files.length ?? 0,
+      test_hint_count: contextHints?.ranked_tests.length ?? 0,
+      search_term_count: contextHints?.search_terms.length ?? 0,
+    });
+
     const agentNote = path.join(workDir, "KAIZEN_AGENT.md");
+    const agentNoteContent = renderKaizenAgentNote({
+      issueTitle: issue.title,
+      issueBody: issue.body || "",
+      contextHints,
+      verificationHints: parsedHints.verificationHints,
+    });
     await fs.writeFile(
       agentNote,
-      `# Agent proposal\n\n**Issue:** ${issue.title}\n\n${issue.body || ""}\n\n_Updated ${new Date().toISOString()}_\n`,
+      agentNoteContent,
       "utf8",
     );
 
@@ -476,14 +318,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
       branch_name: branchName,
       dry_run: dryRun,
     });
-    await recordInvocationReceipt({
-      jobId: job.id,
-      stageName: "committing",
-      stageSeq: 3,
-      actionName: "git_commit",
-      planHash,
-      requestPayload: { branch_name: branchName },
-    });
 
     if (!dryRun) {
       await setStage(job.id, "pushing", { branch_name: branchName });
@@ -493,33 +327,15 @@ export async function processGitJobById(jobId: string): Promise<void> {
         job_id: job.id,
         branch_name: branchName,
       });
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: "pushing",
-        stageSeq: 4,
-        actionName: "git_push",
-        planHash,
-        requestPayload: { branch_name: branchName },
-      });
     } else {
       await setStage(job.id, "judging", {
         branch_name: branchName,
         dry_run: true,
       });
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: "pushing",
-        stageSeq: 4,
-        actionName: "dry_run_skip_git_push",
-        planHash,
-        requestPayload: { branch_name: branchName },
-        responsePayload: { skipped: true, reason: "worker dry-run" },
-      });
     }
 
     const octokit = new Octokit({ auth: token });
     let prNumber: number | null = null;
-    let prUrl: string | undefined;
     if (!dryRun) {
       const existingOpenPr = await octokit.rest.pulls.list({
         owner: link.github_owner,
@@ -531,7 +347,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
 
       if (existingOpenPr.data.length > 0) {
         prNumber = existingOpenPr.data[0].number;
-        prUrl = existingOpenPr.data[0].html_url;
       } else {
         const { data: prData } = await octokit.rest.pulls.create({
           owner: link.github_owner,
@@ -542,7 +357,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
           body: `Automated agent work for internal issue \`${job.issue_id}\`.`,
         });
         prNumber = prData.number;
-        prUrl = prData.html_url;
       }
 
       await setStage(job.id, "pr_opened", { github_pr_number: prNumber, branch_name: branchName });
@@ -551,27 +365,28 @@ export async function processGitJobById(jobId: string): Promise<void> {
         pr_number: prNumber,
         branch_name: branchName,
       });
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: "pr_opened",
-        stageSeq: 5,
-        actionName: "github_pr_open_or_resume",
-        planHash,
-        responsePayload: { pr_number: prNumber },
-      });
-      await recordStageEvidence({
-        jobId: job.id,
-        stageName: "pr_opened",
-        evidenceType: "pull_request",
-        evidenceUrl: prUrl,
-        evidencePayload: { pr_number: prNumber, branch_name: branchName },
-      });
     }
 
     const diffRange = `${base}...${branchName}`;
     const diffSummary = await git.diffSummary([diffRange]);
     const diffText =
       (await git.diff([diffRange])) || `Files changed: ${diffSummary.files.length}`;
+
+    await query(
+      `UPDATE git_jobs
+       SET diff_summary_json = $1::jsonb,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [
+        JSON.stringify({
+          changed_files: diffSummary.changed,
+          insertions: diffSummary.insertions,
+          deletions: diffSummary.deletions,
+          files: diffSummary.files,
+        }),
+        job.id,
+      ],
+    );
 
     await setStage(job.id, "judging");
     await heartbeat(job.id);
@@ -591,17 +406,15 @@ export async function processGitJobById(jobId: string): Promise<void> {
       dry_run: dryRun,
     });
 
-    await storeJudgement(job.issue_id, job.agent_id, judgeResult);
-    await recordInvocationReceipt({
-      jobId: job.id,
-      stageName: "judging",
-      stageSeq: 6,
-      actionName: "judge_diff",
-      planHash,
-      responsePayload: {
-        score: judgeResult.verdict.code_quality_score,
-        is_mock: judgeResult.is_mock,
-      },
+    const analysis =
+      `## Judge (${judgeResult.is_mock ? "mock" : "LLM"})\n\n` +
+      `<!-- kaizen-judge:${job.id} -->\n\n` +
+      `**Score:** ${judgeResult.verdict.code_quality_score}/10\n\n` +
+      `${judgeResult.verdict.reasoning}\n`;
+
+    await storeJudgement(job.issue_id, job.agent_id, judgeResult, {
+      prNumber: prNumber ?? null,
+      commentBody: analysis,
     });
 
     if (bounty && !dryRun) {
@@ -616,67 +429,46 @@ export async function processGitJobById(jobId: string): Promise<void> {
     }
 
     if (!dryRun && prNumber != null) {
-      const analysis =
-        `## Judge (${judgeResult.is_mock ? "mock" : "LLM"})\n\n` +
-        `<!-- kaizen-judge:${job.id} -->\n\n` +
-        `**Score:** ${judgeResult.verdict.code_quality_score}/10\n\n` +
-        `${judgeResult.verdict.reasoning}\n`;
-      const existingComments = await octokit.rest.issues.listComments({
-        owner: link.github_owner,
-        repo: link.github_repo,
-        issue_number: prNumber,
-        per_page: 100,
-      });
-      const dedupeMarker = `<!-- kaizen-judge:${job.id} -->`;
-      const existingComment = existingComments.data.find((c) => (c.body || "").includes(dedupeMarker));
-
       let commentId: number;
-      let commentUrl: string | undefined;
-      if (existingComment) {
-        commentId = existingComment.id;
-        commentUrl = existingComment.html_url;
+      if (job.judge_comment_id) {
+        commentId = job.judge_comment_id;
       } else {
-        const createdComment = await octokit.rest.issues.createComment({
+        const existingComments = await octokit.rest.issues.listComments({
           owner: link.github_owner,
           repo: link.github_repo,
           issue_number: prNumber,
-          body: analysis,
+          per_page: 100,
         });
-        commentId = createdComment.data.id;
-        commentUrl = createdComment.data.html_url;
+        const dedupeMarker = `<!-- kaizen-judge:${job.id} -->`;
+        const existingComment = existingComments.data.find((c) => (c.body || "").includes(dedupeMarker));
+
+        if (existingComment) {
+          commentId = existingComment.id;
+        } else {
+          const createdComment = await octokit.rest.issues.createComment({
+            owner: link.github_owner,
+            repo: link.github_repo,
+            issue_number: prNumber,
+            body: analysis,
+          });
+          commentId = createdComment.data.id;
+        }
       }
+
+      await query(
+        `UPDATE git_jobs
+         SET judge_comment_id = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [commentId, job.id],
+      );
 
       logWorkerEvent("comment_posted", {
         job_id: job.id,
         pr_number: prNumber,
         comment_id: commentId,
       });
-
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: "comment_posted",
-        stageSeq: 7,
-        actionName: "github_pr_comment_dedupe",
-        planHash,
-        responsePayload: { comment_id: commentId },
-      });
-      await recordStageEvidence({
-        jobId: job.id,
-        stageName: "comment_posted",
-        evidenceType: "judge_comment",
-        evidenceUrl: commentUrl,
-        evidencePayload: { comment_id: commentId, pr_number: prNumber },
-      });
       await setStage(job.id, "comment_posted");
-    } else {
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: "comment_posted",
-        stageSeq: 7,
-        actionName: "dry_run_skip_pr_comment",
-        planHash,
-        responsePayload: { skipped: true, reason: "worker dry-run" },
-      });
     }
 
     finalBranchName = branchName;
@@ -697,17 +489,6 @@ export async function processGitJobById(jobId: string): Promise<void> {
       dry_run: dryRun,
     });
     await failJob(job, msg, classifyError(msg));
-    if (planHash) {
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: job.stage || "failed",
-        stageSeq: 999,
-        actionName: "execution_failure",
-        planHash,
-        success: false,
-        responsePayload: { error: msg.slice(0, 500) },
-      });
-    }
   } finally {
     await cleanup();
     logWorkerEvent("cleanup_completed", {
@@ -716,18 +497,12 @@ export async function processGitJobById(jobId: string): Promise<void> {
       dry_run: dryRun,
     });
     if (didSucceed) {
-      await recordInvocationReceipt({
-        jobId: job.id,
-        stageName: "cleanup_done",
-        stageSeq: 8,
-        actionName: "cleanup_temp_clone",
-        planHash,
-      });
       if (dryRun) {
         await query(
           `UPDATE git_jobs
-           SET status = 'done',
+           SET status = 'completed',
                stage = 'completed',
+               lease_token = NULL,
                lease_owner = NULL,
                lease_expires_at = NULL,
                retry_after = NULL,
@@ -740,10 +515,11 @@ export async function processGitJobById(jobId: string): Promise<void> {
       } else {
         await query(
           `UPDATE git_jobs
-           SET status = 'done',
+           SET status = 'awaiting_merge',
                stage = 'awaiting_merge',
                branch_name = $1,
                github_pr_number = $2,
+               lease_token = NULL,
                lease_owner = NULL,
                lease_expires_at = NULL,
                retry_after = NULL,
@@ -764,7 +540,13 @@ export async function processGitJobById(jobId: string): Promise<void> {
         dry_run: dryRun,
       });
     } else {
-      await setStage(job.id, "cleanup_done");
+      await query(
+        `UPDATE git_jobs
+         SET payload = COALESCE(payload, '{}'::jsonb) || '{"cleanup_done": true}'::jsonb,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [job.id],
+      );
     }
   }
 }
@@ -795,6 +577,8 @@ export async function claimNextPendingGitJob(): Promise<string | null> {
       `UPDATE git_jobs
        SET status = 'running',
            stage = 'leased',
+           lease_token = uuid_generate_v4()::text,
+           attempt = attempt + 1,
            attempt_count = attempt_count + 1,
            lease_owner = $2,
            lease_expires_at = NOW() + (($3::bigint || ' milliseconds')::interval),

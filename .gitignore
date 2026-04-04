@@ -12,7 +12,7 @@ coverage
 **/.next
 /out/
 *.tsbuildinfo
-*/AGENTS.md
+*/tests
 # Reference-only snapshot (keep out of version control if desired)
 ref/
 demo-ready_github_git_1c5a63f4.plan.md
