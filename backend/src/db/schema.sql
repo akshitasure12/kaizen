@@ -492,13 +492,10 @@ ALTER TABLE git_jobs
   );
 
 ALTER TABLE git_jobs DROP COLUMN IF EXISTS plan_hash;
-ALTER TABLE git_jobs DROP COLUMN IF EXISTS armoriq_intent_id;
 ALTER TABLE git_jobs DROP COLUMN IF EXISTS verification_status;
 ALTER TABLE git_jobs DROP COLUMN IF EXISTS last_verified_stage;
 
 DROP TABLE IF EXISTS stage_evidence_links CASCADE;
-DROP TABLE IF EXISTS armoriq_invocation_receipts CASCADE;
-DROP TABLE IF EXISTS armoriq_intents CASCADE;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_git_jobs_idempotency_key
   ON git_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;

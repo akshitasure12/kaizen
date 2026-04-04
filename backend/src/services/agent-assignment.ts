@@ -1,5 +1,6 @@
 import { query } from '../db/client';
 import { env } from '../env';
+import { cosineSimilarity, generateEmbedding, isEmbeddingsEnabled } from './embeddings';
 
 interface AgentRow {
   id: string;
@@ -59,6 +60,15 @@ function overlapScore(issueTokens: Set<string>, agentTokens: Set<string>): numbe
   return clamp01(hit / issueTokens.size);
 }
 
+function normalizeCosineScore(score: number): number {
+  return clamp01((score + 1) / 2);
+}
+
+function buildAgentProfileText(agent: AgentRow): string {
+  const cap = Array.isArray(agent.capabilities) ? agent.capabilities.join(' ') : '';
+  return `${agent.ens_name} ${agent.role || ''} ${cap}`;
+}
+
 export async function rankAgentsForIssue(params: {
   issueTitle: string;
   issueBody: string;
@@ -106,12 +116,36 @@ export async function rankAgentsForIssue(params: {
 
   const outcomeMap = new Map(outcomes.map((o) => [o.agent_id, o]));
   const penaltyMap = new Map(recentPenalties.map((row) => [row.agent_id, row]));
-  const issueTokens = new Set(tokenize(`${params.issueTitle} ${params.issueBody || ''}`));
+  const issueText = `${params.issueTitle} ${params.issueBody || ''}`;
+  const issueTokens = new Set(tokenize(issueText));
+  const shouldUseVectors = isEmbeddingsEnabled();
+  const issueEmbedding = shouldUseVectors ? await generateEmbedding(issueText) : null;
+
+  const relevanceEntries = await Promise.all(
+    agents.map(async (agent) => {
+      const agentProfileText = buildAgentProfileText(agent);
+      const agentTokens = new Set(tokenize(agentProfileText));
+      const tokenScore = overlapScore(issueTokens, agentTokens);
+
+      if (!issueEmbedding) {
+        return [agent.id, tokenScore] as const;
+      }
+
+      const agentEmbedding = await generateEmbedding(agentProfileText);
+      if (!agentEmbedding) {
+        return [agent.id, tokenScore] as const;
+      }
+
+      const vectorScore = normalizeCosineScore(cosineSimilarity(issueEmbedding, agentEmbedding));
+      const blendedRelevance = clamp01(0.6 * tokenScore + 0.4 * vectorScore);
+      return [agent.id, blendedRelevance] as const;
+    }),
+  );
+
+  const relevanceMap = new Map(relevanceEntries);
 
   const ranked = agents.map<RankedAgent>((agent) => {
-    const cap = Array.isArray(agent.capabilities) ? agent.capabilities.join(' ') : '';
-    const agentTokens = new Set(tokenize(`${agent.ens_name} ${agent.role || ''} ${cap}`));
-    const relevance = overlapScore(issueTokens, agentTokens);
+    const relevance = relevanceMap.get(agent.id) ?? 0;
 
     const outcome = outcomeMap.get(agent.id);
     const penalty = penaltyMap.get(agent.id);

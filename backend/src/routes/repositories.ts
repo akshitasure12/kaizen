@@ -2,8 +2,6 @@ import { FastifyInstance } from 'fastify';
 import * as sdk from '../sdk';
 import { query, queryOne } from '../db/client';
 import { env } from '../env';
-import { getLedger } from '../services/bounty';
-import { deposit } from '../services/bounty';
 import { requireAuth } from '../middleware/auth';
 import { getGitHubTokenForUser } from '../services/github-integration';
 import { ensureKaizenPullRequestWebhook } from '../services/github-webhook-provision';

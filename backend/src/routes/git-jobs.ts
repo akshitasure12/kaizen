@@ -445,7 +445,34 @@ export async function gitJobRoutes(app: FastifyInstance) {
       options.knowledgeContext = body.knowledge_context as sdk.KnowledgeContext;
     }
     if (isRecord(body.failure_context)) {
-      options.failureContext = body.failure_context as sdk.FailureContext;
+      const rawFailure = body.failure_context;
+      if (typeof rawFailure.failed === "boolean") {
+        const severity =
+          rawFailure.severity === "low" ||
+          rawFailure.severity === "medium" ||
+          rawFailure.severity === "high"
+            ? rawFailure.severity
+            : undefined;
+
+        options.failureContext = {
+          failed: rawFailure.failed,
+          error_type: typeof rawFailure.error_type === "string" ? rawFailure.error_type : undefined,
+          error_detail: typeof rawFailure.error_detail === "string" ? rawFailure.error_detail : undefined,
+          failed_approach:
+            typeof rawFailure.failed_approach === "string" ? rawFailure.failed_approach : undefined,
+          root_cause: typeof rawFailure.root_cause === "string" ? rawFailure.root_cause : undefined,
+          severity,
+          corrective_actions: Array.isArray(rawFailure.corrective_actions)
+            ? rawFailure.corrective_actions.filter((v): v is string => typeof v === "string")
+            : undefined,
+          next_attempt_constraints: Array.isArray(rawFailure.next_attempt_constraints)
+            ? rawFailure.next_attempt_constraints.filter((v): v is string => typeof v === "string")
+            : undefined,
+          related_examples: Array.isArray(rawFailure.related_examples)
+            ? rawFailure.related_examples.filter((v): v is string => typeof v === "string")
+            : undefined,
+        };
+      }
     }
 
     const commit = await sdk.commitMemory(
