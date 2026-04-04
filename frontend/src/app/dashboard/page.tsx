@@ -220,7 +220,7 @@ export default function DashboardPage() {
 					{visibleRepos.map((repo) => (
 						<Link
 							key={repo.title}
-							href={`/repositories/${encodeURIComponent(repo.title)}`}
+							href={`/repositories/${encodeURIComponent(repo.title)}?description=${encodeURIComponent(repo.description?.trim() || "No description available")}`}
 							className="rounded-lg border px-4 py-3 flex items-center justify-between gap-3 transition-colors"
 							style={{ borderColor: "rgba(255, 255, 255, 0.1)", backgroundColor: "rgba(255, 255, 255, 0.08)" }}
 							onMouseEnter={(e) => {
