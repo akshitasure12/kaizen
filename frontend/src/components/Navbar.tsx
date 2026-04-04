@@ -94,7 +94,7 @@ export function Navbar() {
               <div className="flex items-center gap-3">
                 <span
                   className="text-sm"
-                  style={{ color: "#000000" }}
+                  style={{ color: "#ffffff" }}
                 >
                   {user?.username}
                 </span>
