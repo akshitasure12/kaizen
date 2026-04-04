@@ -3,14 +3,19 @@ import * as sdk from '../sdk';
 import { query } from '../db/client';
 import { requireAuth } from '../middleware/auth';
 import * as bountyService from '../services/bounty';
+import { createAgentBodySchema, formatZodError } from '../schemas/agent';
 
 export async function agentRoutes(app: FastifyInstance) {
   // Register agent
   app.post('/', { preHandler: requireAuth }, async (req, reply) => {
-    const { ens_name, role, capabilities } = req.body as any;
-    if (!ens_name) return reply.status(400).send({ error: 'ens_name is required' });
+    const parsed = createAgentBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: formatZodError(parsed.error) });
+    }
+
+    const { ens_name, role, capabilities } = parsed.data;
     try {
-      const agent = await sdk.registerAgent(ens_name, role ?? 'agent', capabilities ?? [], {
+      const agent = await sdk.registerAgent(ens_name, role ?? 'agent', capabilities, {
         userId: req.user!.userId,
       });
       return reply.status(201).send(agent);
@@ -61,7 +66,7 @@ export async function agentRoutes(app: FastifyInstance) {
   /**
    * Get agent wallet info: balance, spending cap, recent transactions
    */
-  app.get('/:ens_name/wallet', async (req, reply) => {
+  app.get('/:ens_name/wallet', { preHandler: requireAuth }, async (req, reply) => {
     const { ens_name } = req.params as any;
 
     const agent = await sdk.getAgent(ens_name);

@@ -72,7 +72,8 @@ async function buildApp() {
     hasGemini: Boolean(env.GEMINI_API_KEY),
     github: {
       webhook: Boolean(env.GITHUB_WEBHOOK_SECRET),
-      userApiKey: "PATCH /auth/github-api-key",
+      appConfigured: Boolean(env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY),
+      legacyUserApiKey: "PATCH /auth/github-api-key",
     },
     corsOrigin: env.CORS_ORIGIN === "*" ? "*" : "[set]",
     features: {

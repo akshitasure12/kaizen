@@ -1,6 +1,6 @@
 # Git worker package runtime (monorepo root: docker build -f worker/Dockerfile .)
 FROM node:22-alpine AS deps
-RUN apk add --no-cache git
+RUN apk add --no-cache git ca-certificates
 WORKDIR /app/worker
 COPY worker/package.json ./package.json
 COPY worker/package-lock.json ./package-lock.json
@@ -11,9 +11,10 @@ COPY worker/ ./
 RUN npm run build
 
 FROM node:22-alpine AS runner
-RUN apk add --no-cache git
+RUN apk add --no-cache git ca-certificates
 WORKDIR /app/worker
 ENV NODE_ENV=production
+ENV GIT_SSH_COMMAND=/bin/false
 COPY worker/package.json ./package.json
 COPY worker/package-lock.json ./package-lock.json
 RUN npm ci --omit=dev

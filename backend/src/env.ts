@@ -41,16 +41,32 @@ const envSchema = z.object({
   // Treasury override for /blockchain/treasury when not reading from token
   TREASURY_ADDRESS: z.string().optional(),
   WORKER_CONCURRENCY: z.coerce.number().int().positive().default(1),
+  LEASE_TTL_MS: z.coerce.number().int().positive().optional(),
   WORKER_LEASE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
+  RETRY_MAX: z.coerce.number().int().positive().optional(),
   WORKER_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   WORKER_BASE_RETRY_MS: z.coerce.number().int().positive().default(5000),
   WORKER_MAX_RETRY_MS: z.coerce.number().int().positive().default(60000),
   WORKER_INSTANCE_ID: z.string().optional(),
+  CLI_CONTEXT_HINTS_ENABLED: z
+    .string()
+    .default('true')
+    .transform((value) => ['true', '1', 'yes', 'on'].includes(value.toLowerCase())),
+  CLI_CONTEXT_HINTS_TOP_FILES: z.coerce.number().int().min(1).max(50).default(8),
+  CLI_CONTEXT_HINTS_TOP_TESTS: z.coerce.number().int().min(1).max(30).default(5),
+  CLI_CONTEXT_HINTS_HISTORY_LIMIT: z.coerce.number().int().min(5).max(500).default(80),
+  PAYOUT_MIN_SCORE: z.coerce.number().min(0).max(1).optional(),
   PAYOUT_SCORE_FLOOR: z.coerce.number().min(0).max(1).default(0.4),
   PAYOUT_MIN_ABOVE_FLOOR: z.coerce.number().min(0).max(1).default(0.25),
+  PAYOUT_EXP: z.coerce.number().positive().optional(),
   PAYOUT_EXPONENT: z.coerce.number().positive().default(1.2),
   REPUTATION_EWMA_ALPHA: z.coerce.number().min(0.01).max(1).default(0.2),
+  NO_MERGE_PENALTY: z.coerce.number().min(0).max(1).optional(),
   REPUTATION_NO_MERGE_PENALTY: z.coerce.number().min(0).max(1).default(0.05),
+  ASSIGNMENT_PERF_CAP: z.coerce.number().min(0).max(1).default(0.9),
+  ASSIGNMENT_PERF_FLOOR: z.coerce.number().min(0).max(1).default(0.1),
+  GITHUB_APP_ID: z.string().optional(),
+  GITHUB_APP_PRIVATE_KEY: z.string().optional(),
 });
 
 export type AppEnv = z.infer<typeof envSchema>;
@@ -62,16 +78,29 @@ function buildEnv(): AppEnv {
     process.exit(1);
   }
   const e = parsed.data;
-  if (e.NODE_ENV === "production") {
+  const normalized = {
+    ...e,
+    WORKER_LEASE_TIMEOUT_MS: e.LEASE_TTL_MS ?? e.WORKER_LEASE_TIMEOUT_MS,
+    WORKER_MAX_ATTEMPTS: e.RETRY_MAX ?? e.WORKER_MAX_ATTEMPTS,
+    PAYOUT_SCORE_FLOOR: e.PAYOUT_MIN_SCORE ?? e.PAYOUT_SCORE_FLOOR,
+    PAYOUT_EXPONENT: e.PAYOUT_EXP ?? e.PAYOUT_EXPONENT,
+    REPUTATION_NO_MERGE_PENALTY: e.NO_MERGE_PENALTY ?? e.REPUTATION_NO_MERGE_PENALTY,
+    GITHUB_APP_PRIVATE_KEY: e.GITHUB_APP_PRIVATE_KEY?.replace(/\\n/g, "\n"),
+  };
+  if (normalized.NODE_ENV === "production") {
     if (
-      !e.JWT_SECRET ||
-      e.JWT_SECRET === "change-me-to-a-long-random-secret-in-production"
+      !normalized.JWT_SECRET ||
+      normalized.JWT_SECRET === "change-me-to-a-long-random-secret-in-production"
     ) {
       console.error("JWT_SECRET must be set to a strong value in production.");
       process.exit(1);
     }
+    if (!normalized.CORS_ORIGIN || normalized.CORS_ORIGIN.trim() === "*") {
+      console.error("CORS_ORIGIN must be an explicit allow-list in production.");
+      process.exit(1);
+    }
   }
-  return e;
+  return normalized;
 }
 
 export const env = buildEnv();

@@ -62,6 +62,25 @@ ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_owner VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_repo VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_default_branch VARCHAR(255) DEFAULT 'main';
 
+-- GitHub App installation + repo link (App-based auth replaces PATs for worker/webhook)
+CREATE TABLE IF NOT EXISTS github_installations (
+  id BIGINT PRIMARY KEY,
+  account_login VARCHAR(255) NOT NULL,
+  app_id BIGINT NOT NULL,
+  pem_encrypted TEXT NOT NULL,
+  webhook_secret TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS github_repo_links (
+  repository_id UUID PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+  installation_id BIGINT NOT NULL REFERENCES github_installations(id) ON DELETE CASCADE,
+  owner VARCHAR(255) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  default_branch VARCHAR(255) NOT NULL DEFAULT 'main',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_github_remote
   ON repositories (lower(github_owner), lower(github_repo))
   WHERE github_owner IS NOT NULL AND github_repo IS NOT NULL;
@@ -223,6 +242,18 @@ CREATE TABLE IF NOT EXISTS issue_judgements (
   UNIQUE(issue_id, agent_id)
 );
 
+CREATE TABLE IF NOT EXISTS judge_results (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  issue_id UUID NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  pr_number INTEGER,
+  verdict_json JSONB NOT NULL,
+  score_numeric NUMERIC(8, 7),
+  comment_body TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(issue_id, agent_id, pr_number)
+);
+
 CREATE TABLE IF NOT EXISTS agent_scores (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -233,6 +264,9 @@ CREATE TABLE IF NOT EXISTS agent_scores (
 );
 
 CREATE INDEX IF NOT EXISTS idx_judgements_issue ON issue_judgements(issue_id);
+CREATE INDEX IF NOT EXISTS idx_judge_results_issue ON judge_results(issue_id);
+CREATE INDEX IF NOT EXISTS idx_judge_results_agent ON judge_results(agent_id);
+CREATE INDEX IF NOT EXISTS idx_judge_results_pr ON judge_results(pr_number) WHERE pr_number IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_scores_agent ON agent_scores(agent_id);
 
 -- ─── issue_bounties ─────────────────────────────────────────────────────────
@@ -265,49 +299,6 @@ ALTER TABLE issue_bounties ADD COLUMN IF NOT EXISTS settlement_status VARCHAR(32
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_bounties_settlement_key
   ON issue_bounties(settlement_key) WHERE settlement_key IS NOT NULL;
-
--- ─── execution verification / evidence (ArmorIQ overlay) ────────────────────
-CREATE TABLE IF NOT EXISTS armoriq_intents (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  git_job_id UUID NOT NULL,
-  plan_hash VARCHAR(255) NOT NULL,
-  merkle_root VARCHAR(255),
-  canonical_version VARCHAR(64),
-  token_jwt_hash VARCHAR(255),
-  token_issued_at TIMESTAMPTZ,
-  token_expires_at TIMESTAMPTZ,
-  token_policy_digest VARCHAR(255),
-  token_identity_json JSONB,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (git_job_id, plan_hash)
-);
-
-CREATE TABLE IF NOT EXISTS armoriq_invocation_receipts (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  git_job_id UUID NOT NULL,
-  stage_name VARCHAR(64) NOT NULL,
-  stage_seq INTEGER NOT NULL,
-  action_name VARCHAR(128) NOT NULL,
-  mcp_name VARCHAR(128),
-  plan_hash VARCHAR(255) NOT NULL,
-  proof_digest VARCHAR(255),
-  request_digest VARCHAR(255),
-  response_digest VARCHAR(255),
-  success BOOLEAN NOT NULL DEFAULT true,
-  execution_time_ms INTEGER,
-  occurred_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (git_job_id, stage_name, stage_seq)
-);
-
-CREATE TABLE IF NOT EXISTS stage_evidence_links (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  git_job_id UUID NOT NULL,
-  stage_name VARCHAR(64) NOT NULL,
-  evidence_type VARCHAR(64) NOT NULL,
-  evidence_url TEXT,
-  evidence_digest VARCHAR(255),
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
 
 CREATE TABLE IF NOT EXISTS merge_settlement_events (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -431,13 +422,17 @@ CREATE TABLE IF NOT EXISTS git_jobs (
   agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   base_branch VARCHAR(255) NOT NULL DEFAULT 'main',
   status VARCHAR(24) NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    CHECK (status IN ('pending', 'running', 'awaiting_merge', 'completed', 'failed', 'cancelled')),
   branch_name VARCHAR(512),
   github_pr_number INTEGER,
+  judge_comment_id BIGINT,
+  diff_summary_json JSONB,
   error_message TEXT,
   stage VARCHAR(64) NOT NULL DEFAULT 'pending',
+  attempt INTEGER NOT NULL DEFAULT 0,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 3,
+  lease_token VARCHAR(128),
   lease_owner VARCHAR(255),
   lease_expires_at TIMESTAMPTZ,
   last_heartbeat_at TIMESTAMPTZ,
@@ -450,66 +445,79 @@ CREATE TABLE IF NOT EXISTS git_jobs (
 );
 
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS stage VARCHAR(64) NOT NULL DEFAULT 'pending';
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS lease_token VARCHAR(128);
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS lease_owner VARCHAR(255);
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS retry_after TIMESTAMPTZ;
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_error_classification VARCHAR(24);
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
-ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS plan_hash VARCHAR(255);
-ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS armoriq_intent_id UUID;
-ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS verification_status VARCHAR(32);
-ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS last_verified_stage VARCHAR(64);
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS judge_comment_id BIGINT;
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS diff_summary_json JSONB;
 
 DO $$
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints
-    WHERE constraint_name = 'armoriq_intents_git_job_id_fkey'
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints
+    WHERE table_name = 'git_jobs' AND constraint_name = 'git_jobs_status_check'
   ) THEN
-    ALTER TABLE armoriq_intents
-      ADD CONSTRAINT armoriq_intents_git_job_id_fkey
-      FOREIGN KEY (git_job_id) REFERENCES git_jobs(id) ON DELETE CASCADE;
+    ALTER TABLE git_jobs DROP CONSTRAINT git_jobs_status_check;
   END IF;
 END $$;
 
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints
-    WHERE constraint_name = 'armoriq_invocation_receipts_git_job_id_fkey'
-  ) THEN
-    ALTER TABLE armoriq_invocation_receipts
-      ADD CONSTRAINT armoriq_invocation_receipts_git_job_id_fkey
-      FOREIGN KEY (git_job_id) REFERENCES git_jobs(id) ON DELETE CASCADE;
-  END IF;
-END $$;
+UPDATE git_jobs SET status = 'completed' WHERE status = 'done';
+UPDATE git_jobs SET stage = 'completed' WHERE stage = 'done';
+
+ALTER TABLE git_jobs
+  ADD CONSTRAINT git_jobs_status_check
+  CHECK (status IN ('pending', 'running', 'awaiting_merge', 'completed', 'failed', 'cancelled'));
 
 DO $$
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints
-    WHERE constraint_name = 'stage_evidence_links_git_job_id_fkey'
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints
+    WHERE table_name = 'git_jobs' AND constraint_name = 'git_jobs_stage_check'
   ) THEN
-    ALTER TABLE stage_evidence_links
-      ADD CONSTRAINT stage_evidence_links_git_job_id_fkey
-      FOREIGN KEY (git_job_id) REFERENCES git_jobs(id) ON DELETE CASCADE;
+    ALTER TABLE git_jobs DROP CONSTRAINT git_jobs_stage_check;
   END IF;
 END $$;
 
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints
-    WHERE constraint_name = 'git_jobs_armoriq_intent_id_fkey'
-  ) THEN
-    ALTER TABLE git_jobs
-      ADD CONSTRAINT git_jobs_armoriq_intent_id_fkey
-      FOREIGN KEY (armoriq_intent_id) REFERENCES armoriq_intents(id) ON DELETE SET NULL;
-  END IF;
-END $$;
+ALTER TABLE git_jobs
+  ADD CONSTRAINT git_jobs_stage_check
+  CHECK (
+    stage IN (
+      'pending',
+      'leased',
+      'cloning',
+      'planning',
+      'editing',
+      'committing',
+      'pushing',
+      'pr_opened',
+      'judging',
+      'comment_posted',
+      'cleanup_done',
+      'awaiting_merge',
+      'completed',
+      'failed',
+      'cancelled',
+      'pending_retry'
+    )
+  );
+
+ALTER TABLE git_jobs DROP COLUMN IF EXISTS plan_hash;
+ALTER TABLE git_jobs DROP COLUMN IF EXISTS armoriq_intent_id;
+ALTER TABLE git_jobs DROP COLUMN IF EXISTS verification_status;
+ALTER TABLE git_jobs DROP COLUMN IF EXISTS last_verified_stage;
+
+DROP TABLE IF EXISTS stage_evidence_links CASCADE;
+DROP TABLE IF EXISTS armoriq_invocation_receipts CASCADE;
+DROP TABLE IF EXISTS armoriq_intents CASCADE;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_git_jobs_idempotency_key
   ON git_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;
@@ -518,6 +526,9 @@ CREATE INDEX IF NOT EXISTS idx_git_jobs_status ON git_jobs(status) WHERE status 
 CREATE INDEX IF NOT EXISTS idx_git_jobs_issue ON git_jobs(issue_id);
 CREATE INDEX IF NOT EXISTS idx_git_jobs_lease_exp ON git_jobs(lease_expires_at) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_git_jobs_retry_after ON git_jobs(retry_after) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_git_jobs_branch_name ON git_jobs(branch_name) WHERE branch_name IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_git_jobs_judge_comment_id
+  ON git_jobs(judge_comment_id) WHERE judge_comment_id IS NOT NULL;
 
 -- FK issues.git_job_id → git_jobs (after git_jobs exists)
 DO $$

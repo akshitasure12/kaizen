@@ -74,6 +74,10 @@ export interface WalletTransaction {
   created_at: string;
 }
 
+interface DbClientLike {
+  query<T = unknown>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
+}
+
 export async function deposit(repoId: string, agentId: string, amount: number, note?: string): Promise<LedgerEntry> {
   // Update repo bounty pool
   await query('UPDATE repositories SET bounty_pool = bounty_pool + $1 WHERE id = $2', [amount, repoId]);
@@ -466,9 +470,9 @@ export async function findIssueBountyByGithubPr(
     `SELECT ib.*
      FROM issue_bounties ib
      JOIN issues i ON i.id = ib.issue_id
-     JOIN repositories r ON r.id = i.repo_id
-     WHERE lower(r.github_owner) = lower($1)
-       AND lower(r.github_repo) = lower($2)
+     JOIN github_repo_links grl ON grl.repository_id = i.repo_id
+     WHERE lower(grl.owner) = lower($1)
+       AND lower(grl.name) = lower($2)
        AND ib.github_pr_number = $3
      ORDER BY ib.created_at DESC
      LIMIT 1`,
@@ -508,7 +512,33 @@ export async function applyGitHubMergePayout(params: {
   winnerAgentId: string;
   deliveryId: string;
 }): Promise<{ paid: number; skipped: boolean; reason?: string }> {
-  const bounty = await getIssueBountyById(params.bountyId);
+  return applyGitHubMergePayoutInTransaction(null, params);
+}
+
+async function getIssueBountyByIdTx(
+  client: DbClientLike | null,
+  bountyId: string,
+): Promise<IssueBounty | null> {
+  if (client) {
+    const res = await client.query<IssueBounty>(
+      'SELECT * FROM issue_bounties WHERE id = $1 FOR UPDATE',
+      [bountyId],
+    );
+    return res.rows[0] ?? null;
+  }
+  return getIssueBountyById(bountyId);
+}
+
+export async function applyGitHubMergePayoutInTransaction(
+  client: DbClientLike | null,
+  params: {
+    bountyId: string;
+    winnerAgentId: string;
+    deliveryId: string;
+  },
+): Promise<{ paid: number; skipped: boolean; reason?: string }> {
+  const tx = client;
+  const bounty = await getIssueBountyByIdTx(tx, params.bountyId);
   if (!bounty) return { paid: 0, skipped: true, reason: 'bounty_not_found' };
 
   if (bounty.payout_status === 'paid') {
@@ -525,40 +555,55 @@ export async function applyGitHubMergePayout(params: {
     bounty.judge_payout_fraction != null ? Number(bounty.judge_payout_fraction) : 0;
   const payAmount = Math.round(Number(bounty.amount) * fraction * 100) / 100;
   if (payAmount <= 0) {
-    await query(
-      `UPDATE issue_bounties SET merge_webhook_delivery_id = $1, payout_status = 'paid' WHERE id = $2`,
-      [params.deliveryId, params.bountyId],
-    );
+    if (tx) {
+      await tx.query(
+        `UPDATE issue_bounties SET merge_webhook_delivery_id = $1, payout_status = 'paid' WHERE id = $2`,
+        [params.deliveryId, params.bountyId],
+      );
+    } else {
+      await query(
+        `UPDATE issue_bounties SET merge_webhook_delivery_id = $1, payout_status = 'paid' WHERE id = $2`,
+        [params.deliveryId, params.bountyId],
+      );
+    }
     return { paid: 0, skipped: true, reason: 'zero_payout' };
   }
 
-  await query(
+  const exec = async (text: string, values?: unknown[]) => {
+    if (tx) {
+      await tx.query(text, values);
+      return;
+    }
+    await query(text, values);
+  };
+
+  await exec(
     'UPDATE agents SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2',
     [payAmount, params.winnerAgentId],
   );
-  await query(
+  await exec(
     `UPDATE issue_bounties
      SET status = 'awarded', winner_agent_id = $1, merge_webhook_delivery_id = $2, payout_status = 'paid'
      WHERE id = $3`,
     [params.winnerAgentId, params.deliveryId, params.bountyId],
   );
-  await query(
+  await exec(
     `INSERT INTO wallet_transactions (agent_id, amount, tx_type, reference_id, note)
      VALUES ($1, $2, 'bounty_win', $3, $4)`,
     [params.winnerAgentId, payAmount, bounty.id, `GitHub merge payout (${fraction * 100}%)`],
   );
-  await query(
+  await exec(
     'UPDATE agents SET reputation_score = reputation_score + 15 WHERE id = $1',
     [params.winnerAgentId],
   );
 
   const refund = Number(bounty.amount) - payAmount;
   if (refund > 0) {
-    await query(
+    await exec(
       'UPDATE agents SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2',
       [refund, bounty.poster_agent_id],
     );
-    await query(
+    await exec(
       `INSERT INTO wallet_transactions (agent_id, amount, tx_type, reference_id, note)
        VALUES ($1, $2, 'bounty_refund', $3, $4)`,
       [bounty.poster_agent_id, refund, bounty.id, 'GitHub merge: remainder to poster after partial payout'],
@@ -573,13 +618,49 @@ export async function refundBountyOnGitHubCloseWithoutMerge(
   bountyId: string,
   deliveryId: string,
 ): Promise<void> {
-  const bounty = await getIssueBountyById(bountyId);
+  await refundBountyOnGitHubCloseWithoutMergeInTransaction(null, bountyId, deliveryId);
+}
+
+export async function refundBountyOnGitHubCloseWithoutMergeInTransaction(
+  client: DbClientLike | null,
+  bountyId: string,
+  deliveryId: string,
+): Promise<void> {
+  const bounty = await getIssueBountyByIdTx(client, bountyId);
   if (!bounty) return;
   if (bounty.merge_webhook_delivery_id) return;
 
-  await query(
-    `UPDATE issue_bounties SET merge_webhook_delivery_id = $1, payout_status = 'closed_no_merge' WHERE id = $2`,
+  const exec = async (text: string, values?: unknown[]) => {
+    if (client) {
+      await client.query(text, values);
+      return;
+    }
+    await query(text, values);
+  };
+
+  await exec(
+    `UPDATE issue_bounties
+     SET merge_webhook_delivery_id = $1,
+         payout_status = 'closed_no_merge',
+         settlement_status = 'failed_non_merge'
+     WHERE id = $2`,
     [deliveryId, bountyId],
   );
-  await refundIssueBounty(bountyId);
+
+  await exec(
+    'UPDATE agents SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2',
+    [bounty.amount, bounty.poster_agent_id],
+  );
+  const newStatus = bounty.status === 'funded' ? 'cancelled' : 'expired';
+  await exec(
+    `UPDATE issue_bounties
+     SET status = $1
+     WHERE id = $2`,
+    [newStatus, bountyId],
+  );
+  await exec(
+    `INSERT INTO wallet_transactions (agent_id, amount, tx_type, reference_id, note)
+     VALUES ($1, $2, 'bounty_refund', $3, $4)`,
+    [bounty.poster_agent_id, bounty.amount, bountyId, `Bounty refund of ${bounty.amount}`],
+  );
 }

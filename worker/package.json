@@ -2,10 +2,13 @@
   "name": "kaizen-worker",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "bun@1.2.5",
   "description": "DB-backed git worker runtime for clone/PR/judge/comment/cleanup flow.",
   "scripts": {
     "dev": "tsx src/main.ts",
     "build": "tsc",
+    "test": "vitest run",
+    "test:gemini": "vitest run tests/gemini-orchestration.test.ts tests/judge.test.ts",
     "start": "node dist/main.js"
   },
   "dependencies": {
@@ -20,6 +23,7 @@
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.2"
   }
 }
