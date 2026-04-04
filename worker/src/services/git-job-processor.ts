@@ -5,7 +5,7 @@ import { Octokit } from "@octokit/rest";
 import simpleGit from "simple-git";
 import { pool, query, queryOne } from "../db/client";
 import { env } from "../env";
-import { getGitHubAppInstallationToken, getGitHubLinkForRepo } from "./github-integration";
+import { getGitHubLinkForRepo, getGitHubTokenForUser } from "./github-integration";
 import * as bountyService from "./bounty";
 import {
   parseJobCliHints,
@@ -534,16 +534,17 @@ export async function processGitJobById(jobId: string): Promise<void> {
 
   const link = await getGitHubLinkForRepo(job.repo_id);
   if (!link) {
-    await failJob(job, "Missing GitHub repository link for git job", "permanent");
+    await failJob(job, "Missing GitHub remote on repository (import with PAT)", "permanent");
     return;
   }
 
-  let token: string;
-  try {
-    token = await getGitHubAppInstallationToken(link.installation_id);
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    await failJob(job, `Failed to derive installation token: ${msg}`, classifyError(msg));
+  const token = await getGitHubTokenForUser(job.user_id);
+  if (!token) {
+    await failJob(
+      job,
+      "No GitHub personal access token for job user (PATCH /auth/github-api-key)",
+      "permanent",
+    );
     return;
   }
 

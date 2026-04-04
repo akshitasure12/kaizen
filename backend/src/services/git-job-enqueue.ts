@@ -119,9 +119,9 @@ export async function enqueueGitJob(params: EnqueueGitJobParams): Promise<Enqueu
     const existing = await queryOne<{ id: string; status: string }>(
       `SELECT id, status
        FROM git_jobs
-       WHERE idempotency_key = $1
+       WHERE idempotency_key = $1 AND user_id = $2
        LIMIT 1`,
-      [dedupeKey],
+      [dedupeKey, params.user_id],
     );
     if (existing) {
       return {

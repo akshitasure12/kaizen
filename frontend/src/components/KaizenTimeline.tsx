@@ -37,6 +37,8 @@ const phases: Phase[] = [
   },
 ];
 
+export const KAIZEN_TIMELINE_PHASE_COUNT = phases.length;
+
 // ─── Conway's Game of Life ──────────────────────────────────────────────────
 function useGameOfLife(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
   const stateRef = useRef<Uint8Array | null>(null);
@@ -122,7 +124,12 @@ function useGameOfLife(canvasRef: React.RefObject<HTMLCanvasElement | null>) {
 }
 
 // ─── Main Component ──────────────────────────────────────────────────────────
-export default function KaizenTimeline() {
+type KaizenTimelineProps = {
+  /** When set, phase is driven by parent (e.g. document scroll). Wheel/touch step navigation is disabled. */
+  controlledPhase?: number;
+};
+
+export default function KaizenTimeline({ controlledPhase }: KaizenTimelineProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const trackWrapperRef = useRef<HTMLDivElement>(null);
   const golRef = useRef<HTMLCanvasElement>(null);
@@ -288,8 +295,35 @@ export default function KaizenTimeline() {
     setTimeout(() => { setDisplayIndex(next); setTextVisible(true); }, 230);
   }, [fireRay]);
 
+  const applyPhaseInstant = useCallback((next: number) => {
+    const ra = rayAnim.current;
+    if (ra.rafId) cancelAnimationFrame(ra.rafId);
+    ra.rafId = null;
+    prevCurrent.current = next;
+    setCurrent(next);
+    setDisplayIndex(next);
+    setTextVisible(true);
+    segmentLit.current = segmentLit.current.map((_, i) => (i < next ? 1 : 0));
+    drawTimeline(1, 1, next, next);
+  }, [drawTimeline]);
+
+  // ─── Controlled phase (scroll-driven from parent) ─────────────────────────
+  useEffect(() => {
+    if (controlledPhase === undefined) return;
+    const target = Math.max(0, Math.min(phases.length - 1, Math.round(controlledPhase)));
+    const from = prevCurrent.current;
+    if (target === from) return;
+    if (Math.abs(target - from) === 1) {
+      goTo(target);
+    } else {
+      applyPhaseInstant(target);
+    }
+  }, [controlledPhase, goTo, applyPhaseInstant]);
+
   // ─── Scroll hijack (wheel + touch) ───────────────────────────────────────
   useEffect(() => {
+    if (controlledPhase !== undefined) return;
+
     const THRESH = 20;
 
     const onWheel = (e: WheelEvent) => {
@@ -342,7 +376,7 @@ export default function KaizenTimeline() {
       el.removeEventListener("touchend", onTouchEnd);
       window.removeEventListener("keydown", onKey);
     };
-  }, [goTo]);
+  }, [goTo, controlledPhase]);
 
   // ─── Center active node ───────────────────────────────────────────────────
   useEffect(() => {

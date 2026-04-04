@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@/contexts/AuthContext";
-import importableRepos from "@/data/importable-repos.json";
 import {
   authApi,
   integrationsApi,
@@ -13,43 +12,13 @@ import {
   type Repository,
 } from "@/lib/api";
 
-// API endpoints
 const PAGE_SIZE = 10;
-const DASHBOARD_REPOS_API_URL = `http://localhost:3001/integrations/github/repos?page=1&per_page=${PAGE_SIZE}`;
-const IMPORT_REPOS_API_URL = `http://localhost:3001/integrations/github/repos?page=3&per_page=${PAGE_SIZE}`;
-
-type LocalRepo = {
-  title: string;
-  owner: string;
-  issues: number;
-  description?: string;
-};
-
-type GithubRepoItem = {
-  id: number;
-  name: string;
-  full_name: string;
-  default_branch: string;
-  private: boolean;
-  html_url: string;
-  description?: string | null;
-};
-
-type GithubReposResponse = {
-  items: GithubRepoItem[];
-  page: number;
-  per_page: number;
-  has_next: boolean;
-  has_prev: boolean;
-};
 
 export default function DashboardPage() {
   const {
     isAuthenticated,
     isLoading: authLoading,
     agents,
-    selectedAgent,
-    selectAgent,
     github,
     refreshSession,
   } = useAuth();
@@ -75,13 +44,18 @@ export default function DashboardPage() {
 
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
+  const [repoTotal, setRepoTotal] = useState(0);
 
   const loadRepos = useCallback(async () => {
     setReposLoading(true);
     setReposError(null);
     try {
-      const list = await repoApi.list();
-      setRepos(list);
+      const res = await repoApi.list({
+        limit: PAGE_SIZE,
+        offset: page * PAGE_SIZE,
+      });
+      setRepos(res.data);
+      setRepoTotal(res.pagination.total);
     } catch (e) {
       setReposError(
         e instanceof Error ? e.message : "Failed to load repositories",
@@ -89,10 +63,10 @@ export default function DashboardPage() {
     } finally {
       setReposLoading(false);
     }
-  }, []);
+  }, [page]);
 
   useEffect(() => {
-    if (isAuthenticated) loadRepos();
+    if (isAuthenticated) void loadRepos();
   }, [isAuthenticated, loadRepos]);
 
   const loadGithubPage = useCallback(async (p: number, append: boolean) => {
@@ -138,7 +112,7 @@ export default function DashboardPage() {
   };
 
   const runImport = async () => {
-    if (!selectedGh || !selectedAgent) return;
+    if (!selectedGh) return;
     const [owner, repoName] = selectedGh.full_name.split("/");
     if (!owner || !repoName) {
       setImportError("Invalid full_name from GitHub");
@@ -148,13 +122,11 @@ export default function DashboardPage() {
     setImportError(null);
     try {
       await repoApi.importFromGitHub({
-        owner_ens: selectedAgent.ens_name,
         github_owner: owner,
         github_repo: repoName,
         github_default_branch: selectedGh.default_branch,
         name: selectedGh.name,
         description: "",
-        repo_type: "general",
       });
       setImportOpen(false);
       setSelectedGh(null);
@@ -171,19 +143,19 @@ export default function DashboardPage() {
     }
   };
 
-  const totalPages = Math.max(1, Math.ceil(repos.length / PAGE_SIZE));
-  const visibleRepos = repos.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const totalPages = Math.max(1, Math.ceil(repoTotal / PAGE_SIZE));
+  const visibleRepos = repos;
 
   const summaryCards = [
     {
       label: "Repositories",
-      value: String(repos.length),
+      value: String(repoTotal),
       hint: isAuthenticated ? "Linked in Kaizen" : "Sign in to sync",
     },
     {
       label: "Your agents",
       value: String(agents.length),
-      hint: agents.length ? "Owner for new imports" : "Register an agent first",
+      hint: agents.length ? "For bounties & resolve" : "Create agents from Agents tab",
     },
     {
       label: "GitHub PAT",
@@ -465,42 +437,6 @@ export default function DashboardPage() {
               </div>
             ) : (
               <>
-                <div className="flex flex-col gap-1">
-                  <label
-                    className="text-xs uppercase tracking-wide"
-                    style={{ color: "var(--fg-subtle)" }}
-                  >
-                    Owner agent (Kaizen)
-                  </label>
-                  {agents.length === 0 ? (
-                    <p className="text-sm" style={{ color: "#f87171" }}>
-                      Register an agent for your account before importing (POST
-                      /agents or your onboarding flow).
-                    </p>
-                  ) : (
-                    <select
-                      value={selectedAgent?.ens_name ?? ""}
-                      onChange={(e) => {
-                        const a = agents.find(
-                          (x) => x.ens_name === e.target.value,
-                        );
-                        if (a) selectAgent(a);
-                      }}
-                      className="rounded-md border px-3 py-2 text-sm bg-transparent"
-                      style={{
-                        borderColor: "var(--border-default)",
-                        color: "var(--fg-default)",
-                      }}
-                    >
-                      {agents.map((a) => (
-                        <option key={a.id} value={a.ens_name}>
-                          {a.ens_name}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </div>
-
                 {ghError && (
                   <p className="text-sm" style={{ color: "#f87171" }}>
                     {ghError}
@@ -573,12 +509,7 @@ export default function DashboardPage() {
 
                 <button
                   type="button"
-                  disabled={
-                    !selectedGh ||
-                    !selectedAgent ||
-                    agents.length === 0 ||
-                    importing
-                  }
+                  disabled={!selectedGh || importing}
                   onClick={() => void runImport()}
                   className="text-sm rounded-lg px-3 py-2 font-medium disabled:opacity-40"
                   style={{

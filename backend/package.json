@@ -22,7 +22,6 @@
     "fastify": "^4.28.1",
     "fastify-raw-body": "4",
     "jsonwebtoken": "^9.0.2",
-    "openai": "^4.52.0",
     "pg": "^8.13.1",
     "simple-git": "^3.27.0",
     "zod": "^3.23.8"

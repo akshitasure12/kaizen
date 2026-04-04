@@ -5,9 +5,6 @@ import { env } from "./env";
 import { authPlugin } from "./middleware/auth";
 import { agentRoutes } from "./routes/agents";
 import { repositoryRoutes } from "./routes/repositories";
-import { branchRoutes } from "./routes/branches";
-import { commitRoutes } from "./routes/commits";
-import { pullRequestRoutes } from "./routes/pullrequests";
 import { authRoutes } from "./routes/auth";
 import { issueRoutes } from "./routes/issues";
 import { leaderboardRoutes } from "./routes/leaderboard";
@@ -21,6 +18,10 @@ import {
   isBlockchainEnabled,
   getBlockchainConfig,
 } from "./services/blockchain";
+import {
+  isOnchainIndexerEnabled,
+  runOnchainIndexerCycle,
+} from "./services/onchain-indexer";
 
 function parseCorsOrigin(raw: string): boolean | string | string[] {
   const t = raw.trim();
@@ -84,9 +85,6 @@ async function buildApp() {
   await app.register(authRoutes, { prefix: "/auth" });
   await app.register(agentRoutes, { prefix: "/agents" });
   await app.register(repositoryRoutes, { prefix: "/repositories" });
-  await app.register(branchRoutes, { prefix: "/repositories" });
-  await app.register(commitRoutes, { prefix: "/repositories" });
-  await app.register(pullRequestRoutes, { prefix: "/repositories" });
   await app.register(issueRoutes, { prefix: "/repositories" });
   await app.register(gitJobRoutes);
   await app.register(leaderboardRoutes, { prefix: "/leaderboard" });
@@ -124,6 +122,17 @@ async function main() {
   const app = await buildApp();
   await app.listen({ host: env.HOST, port: env.PORT });
   app.log.info(`API listening on http://${env.HOST}:${env.PORT}`);
+
+  if (isOnchainIndexerEnabled()) {
+    void runOnchainIndexerCycle().catch((e) =>
+      console.warn("[onchain-indexer] initial cycle failed:", e),
+    );
+    setInterval(() => {
+      void runOnchainIndexerCycle().catch((e) =>
+        console.warn("[onchain-indexer] cycle failed:", e),
+      );
+    }, env.ONCHAIN_INDEXER_POLL_MS);
+  }
 }
 
 main().catch((err) => {

@@ -399,9 +399,9 @@ export async function findIssueBountyByGithubPr(
     `SELECT ib.*
      FROM issue_bounties ib
      JOIN issues i ON i.id = ib.issue_id
-     JOIN github_repo_links grl ON grl.repository_id = i.repo_id
-     WHERE lower(grl.owner) = lower($1)
-       AND lower(grl.name) = lower($2)
+     JOIN repositories r ON r.id = i.repo_id
+     WHERE lower(r.github_owner) = lower($1)
+       AND lower(r.github_repo) = lower($2)
        AND ib.github_pr_number = $3
      ORDER BY ib.created_at DESC
      LIMIT 1`,

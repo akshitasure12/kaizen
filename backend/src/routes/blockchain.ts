@@ -5,6 +5,8 @@
 import { FastifyInstance } from "fastify";
 import { query, queryOne } from "../db/client";
 import { requireAuth } from "../middleware/auth";
+import { parseListPagination, paginationMeta } from "../lib/pagination";
+import { env } from "../env";
 import {
   verifyDepositTransaction,
   isBlockchainEnabled,
@@ -14,10 +16,6 @@ import {
   generateMockTxHash,
   getBlockchainConfig,
 } from "../services/blockchain";
-import {
-  blockchainRegisterAgentBodySchema,
-  formatZodError,
-} from "../schemas/agent";
 
 interface AgentRow {
   id: string;
@@ -102,6 +100,72 @@ export async function blockchainRoutes(app: FastifyInstance) {
     address: await getTreasuryAddress(),
     required_deposit: (await getRequiredDeposit()).toString(),
   }));
+
+  /**
+   * Indexed on-chain events visible when tied to the user's agents or imported repos.
+   */
+  app.get("/onchain-events", { preHandler: requireAuth }, async (req, reply) => {
+    if (!env.DATABASE_URL) {
+      return reply.status(503).send({ error: "Database not configured" });
+    }
+    const { limit, offset } = parseListPagination(req.query as Record<string, unknown>, {
+      limit: 30,
+      maxLimit: 100,
+    });
+    const q = req.query as { event_name?: string };
+    const eventName =
+      typeof q.event_name === "string" && q.event_name.trim() !== ""
+        ? q.event_name.trim()
+        : null;
+    const chainId = env.ONCHAIN_CHAIN_ID;
+    const userId = req.user!.userId;
+
+    const visibility = `(
+      (a.user_id IS NOT NULL AND a.user_id = $1::uuid)
+      OR (r.imported_by_user_id IS NOT NULL AND r.imported_by_user_id = $1::uuid)
+      OR (
+        e.ens_name IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM agents a2
+          WHERE lower(a2.ens_name) = lower(e.ens_name) AND a2.user_id = $1::uuid
+        )
+      )
+    )`;
+
+    const listSql = `
+      SELECT e.id, e.chain_id, e.block_number, e.tx_hash, e.log_index, e.contract_address,
+             e.event_name, e.payload, e.bounty_id, e.ens_name, e.issue_id, e.agent_id, e.created_at
+      FROM onchain_events e
+      LEFT JOIN agents a ON e.agent_id = a.id
+      LEFT JOIN issues i ON e.issue_id = i.id
+      LEFT JOIN repositories r ON i.repo_id = r.id
+      WHERE e.chain_id = $4::bigint
+        AND ${visibility}
+        AND ($5::text IS NULL OR e.event_name = $5)
+      ORDER BY e.block_number DESC, e.log_index DESC
+      LIMIT $2 OFFSET $3`;
+    const listParams: unknown[] = [userId, limit, offset, chainId, eventName];
+
+    const countSql = `
+      SELECT COUNT(*)::text AS c
+      FROM onchain_events e
+      LEFT JOIN agents a ON e.agent_id = a.id
+      LEFT JOIN issues i ON e.issue_id = i.id
+      LEFT JOIN repositories r ON i.repo_id = r.id
+      WHERE e.chain_id = $2::bigint
+        AND ${visibility}
+        AND ($3::text IS NULL OR e.event_name = $3)`;
+    const countParams: unknown[] = [userId, chainId, eventName];
+
+    const rows = await query<Record<string, unknown>>(listSql, listParams);
+    const countRow = await queryOne<{ c: string }>(countSql, countParams);
+    const total = parseInt(countRow?.c ?? "0", 10);
+
+    return {
+      data: rows,
+      pagination: paginationMeta(total, limit, offset),
+    };
+  });
 }
 function validateEnsName(ens_name: string): boolean {
   const value = ens_name.trim().toLowerCase();

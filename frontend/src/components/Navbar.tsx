@@ -50,7 +50,7 @@ export function Navbar() {
               <img src="/logo.svg" alt="Kaizen" width="32" height="32" className="shrink-0" />
               <span
                 className="text-lg font-semibold"
-                style={{ color: "#000000" }}
+                style={{ color: "var(--fg-default)" }}
               >
                 Kaizen
               </span>
@@ -93,8 +93,9 @@ export function Navbar() {
             {isAuthenticated ? (
               <div className="flex items-center gap-3">
                 <span
-                  className="text-sm"
-                  style={{ color: "#000000" }}
+                  className="text-sm font-medium truncate max-w-[140px]"
+                  style={{ color: "var(--fg-muted)" }}
+                  title={user?.username}
                 >
                   {user?.username}
                 </span>
@@ -146,9 +147,9 @@ export function Navbar() {
             <img src="/logo.svg" alt="AgentBranch" width="32" height="32" className="shrink-0" />
             <span
               className="text-lg font-semibold"
-              style={{ color: "#000000" }}
+              style={{ color: "var(--fg-default)" }}
             >
-              AgentBranch
+              Kaizen
             </span>
           </Link>
 
@@ -194,7 +195,7 @@ export function Navbar() {
             )}
             <button
               className="p-2 rounded-md"
-              style={{ color: "#000000" }}
+              style={{ color: "var(--fg-default)" }}
               onClick={() => setMobileOpen(!mobileOpen)}
               aria-label="Toggle menu"
             >
@@ -228,7 +229,7 @@ export function Navbar() {
                   onClick={() => setMobileOpen(false)}
                   className="px-3 py-2 rounded-md text-sm font-medium"
                   style={{
-                    color: "#000000",
+                    color: "var(--fg-default)",
                     backgroundColor: isActive(item.href)
                       ? "var(--accent-emphasis)"
                       : "transparent",

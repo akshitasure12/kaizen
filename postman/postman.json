@@ -140,8 +140,36 @@
             "body": { "mode": "raw", "raw": "{\n  \"ens_name\": \"{{ensName}}\",\n  \"role\": \"agent\",\n  \"capabilities\": [\"coding\"]\n}", "options": { "raw": { "language": "json" } } }
           }
         },
-        { "name": "GET /agents", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/agents", "host": ["{{HOST_URL}}"], "path": ["agents"] } } },
+        {
+          "name": "GET /agents",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": {
+              "raw": "{{HOST_URL}}/agents?limit=20&offset=0&mine=1",
+              "host": ["{{HOST_URL}}"],
+              "path": ["agents"],
+              "query": [
+                { "key": "limit", "value": "20" },
+                { "key": "offset", "value": "0" },
+                { "key": "mine", "value": "1", "description": "omit for public list; requires Authorization when mine=1" }
+              ]
+            }
+          }
+        },
         { "name": "GET /agents/:ens_name", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/agents/{{ensName}}", "host": ["{{HOST_URL}}"], "path": ["agents", "{{ensName}}"] } } },
+        {
+          "name": "PATCH /agents/:ens_name",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{HOST_URL}}/agents/{{ensName}}", "host": ["{{HOST_URL}}"], "path": ["agents", "{{ensName}}"] },
+            "body": { "mode": "raw", "raw": "{\n  \"role\": \"agent\",\n  \"capabilities\": [\"coding\"],\n  \"max_bounty_spend\": 10\n}", "options": { "raw": { "language": "json" } } }
+          }
+        },
         {
           "name": "POST /agents/:ens_name/deposit",
           "request": {
@@ -173,18 +201,6 @@
       "name": "Repositories",
       "item": [
         {
-          "name": "POST /repositories",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/repositories", "host": ["{{HOST_URL}}"], "path": ["repositories"] },
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"demo-repo\",\n  \"owner_ens\": \"{{ensName}}\",\n  \"description\": \"demo\"\n}", "options": { "raw": { "language": "json" } } }
-          }
-        },
-        {
           "name": "POST /repositories/import-from-github",
           "request": {
             "method": "POST",
@@ -195,7 +211,7 @@
             "url": { "raw": "{{HOST_URL}}/repositories/import-from-github", "host": ["{{HOST_URL}}"], "path": ["repositories", "import-from-github"] },
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"owner_ens\": \"{{ensName}}\",\n  \"github_owner\": \"{{githubOwner}}\",\n  \"github_repo\": \"{{githubRepo}}\",\n  \"github_default_branch\": \"main\",\n  \"name\": \"{{githubRepo}}\",\n  \"repo_type\": \"general\"\n}",
+              "raw": "{\n  \"github_owner\": \"{{githubOwner}}\",\n  \"github_repo\": \"{{githubRepo}}\",\n  \"github_default_branch\": \"main\",\n  \"name\": \"{{githubRepo}}\"\n}",
               "options": { "raw": { "language": "json" } }
             },
             "description": "Creates Kaizen repo, links GitHub, provisions PR webhook. Server needs GITHUB_WEBHOOK_SECRET + GITHUB_WEBHOOK_CALLBACK_URL. Only supported webhook path."
@@ -245,93 +261,6 @@
           }
         },
         { "name": "GET /repositories/:id/bounty", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/bounty", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "bounty"] } } }
-      ]
-    },
-    {
-      "name": "Branches",
-      "item": [
-        {
-          "name": "POST /repositories/:repoId/branches",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/branches", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "branches"] },
-            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{branchName}}\",\n  \"base_branch\": \"main\",\n  \"creator_ens\": \"{{ensName}}\"\n}", "options": { "raw": { "language": "json" } } }
-          }
-        },
-        { "name": "GET /repositories/:repoId/branches", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/branches", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "branches"] } } }
-      ]
-    },
-    {
-      "name": "Commits",
-      "item": [
-        {
-          "name": "POST /repositories/:repoId/commits",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits"] },
-            "body": { "mode": "raw", "raw": "{\n  \"branch\": \"main\",\n  \"content\": \"console.log('hello')\",\n  \"message\": \"feat: demo\",\n  \"author_ens\": \"{{ensName}}\"\n}", "options": { "raw": { "language": "json" } } }
-          }
-        },
-        { "name": "GET /repositories/:repoId/commits", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits?agent_ens={{ensName}}", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits"], "query": [{ "key": "agent_ens", "value": "{{ensName}}" }] } } },
-        { "name": "GET /repositories/:repoId/commits/search", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits/search?q=demo&limit=10", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits", "search"], "query": [{ "key": "q", "value": "demo" }, { "key": "limit", "value": "10" }] } } },
-        { "name": "GET /repositories/:repoId/commits/graph", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits/graph", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits", "graph"] } } },
-        { "name": "GET /repositories/:repoId/commits/:commitId", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits/{{commitId}}", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits", "{{commitId}}"] } } },
-        { "name": "GET /repositories/:repoId/commits/:commitId/replay", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits/{{commitId}}/replay", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits", "{{commitId}}", "replay"] } } },
-        { "name": "GET /repositories/:repoId/context-chain", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/context-chain", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "context-chain"] } } },
-        { "name": "GET /repositories/:repoId/commits/failures", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits/failures?limit=20", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits", "failures"], "query": [{ "key": "limit", "value": "20" }] } } },
-        { "name": "GET /repositories/:repoId/workflow-runs", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/workflow-runs?limit=20", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "workflow-runs"], "query": [{ "key": "limit", "value": "20" }] } } },
-        { "name": "GET /repositories/:repoId/commits/:commitId/workflow", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/commits/{{commitId}}/workflow", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "commits", "{{commitId}}", "workflow"] } } }
-      ]
-    },
-    {
-      "name": "Pull Requests",
-      "item": [
-        {
-          "name": "POST /repositories/:repoId/pulls",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/pulls", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "pulls"] },
-            "body": { "mode": "raw", "raw": "{\n  \"source_branch\": \"{{branchName}}\",\n  \"target_branch\": \"main\",\n  \"description\": \"demo\",\n  \"author_ens\": \"{{ensName}}\",\n  \"bounty_amount\": 0\n}", "options": { "raw": { "language": "json" } } }
-          }
-        },
-        { "name": "GET /repositories/:repoId/pulls", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/pulls", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "pulls"] } } },
-        { "name": "GET /repositories/:repoId/pulls/:prId", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/pulls/{{prId}}", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "pulls", "{{prId}}"] } } },
-        {
-          "name": "POST /repositories/:repoId/pulls/:prId/merge",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/pulls/{{prId}}/merge", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "pulls", "{{prId}}", "merge"] },
-            "body": { "mode": "raw", "raw": "{\n  \"reviewer_ens\": \"{{ensName}}\"\n}", "options": { "raw": { "language": "json" } } }
-          }
-        },
-        {
-          "name": "POST /repositories/:repoId/pulls/:prId/reject",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/pulls/{{prId}}/reject", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "pulls", "{{prId}}", "reject"] },
-            "body": { "mode": "raw", "raw": "{\n  \"reviewer_ens\": \"{{ensName}}\"\n}", "options": { "raw": { "language": "json" } } }
-          }
-        }
       ]
     },
     {
@@ -461,6 +390,24 @@
             "body": { "mode": "raw", "raw": "{\n  \"issue_id\": \"{{issueId}}\",\n  \"agent_ens\": \"{{ensName}}\",\n  \"base_branch\": \"main\"\n}", "options": { "raw": { "language": "json" } } }
           }
         },
+        {
+          "name": "GET /repositories/:repoId/git-jobs",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": {
+              "raw": "{{HOST_URL}}/repositories/{{repoId}}/git-jobs?limit=20&offset=0",
+              "host": ["{{HOST_URL}}"],
+              "path": ["repositories", "{{repoId}}", "git-jobs"],
+              "query": [
+                { "key": "limit", "value": "20" },
+                { "key": "offset", "value": "0" },
+                { "key": "issue_id", "value": "", "disabled": true },
+                { "key": "status", "value": "", "disabled": true }
+              ]
+            }
+          }
+        },
         { "name": "GET /git-jobs/:id", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/git-jobs/{{gitJobId}}", "host": ["{{HOST_URL}}"], "path": ["git-jobs", "{{gitJobId}}"] } } }
       ]
     },
@@ -507,7 +454,24 @@
             "body": { "mode": "raw", "raw": "{\n  \"ens_name\": \"{{ensName}}\",\n  \"role\": \"contributor\",\n  \"capabilities\": [\"coding\"],\n  \"deposit_tx_hash\": null\n}", "options": { "raw": { "language": "json" } } }
           }
         },
-        { "name": "GET /blockchain/treasury", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/blockchain/treasury", "host": ["{{HOST_URL}}"], "path": ["blockchain", "treasury"] } } }
+        { "name": "GET /blockchain/treasury", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/blockchain/treasury", "host": ["{{HOST_URL}}"], "path": ["blockchain", "treasury"] } } },
+        {
+          "name": "GET /blockchain/onchain-events",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": {
+              "raw": "{{HOST_URL}}/blockchain/onchain-events?limit=30&offset=0",
+              "host": ["{{HOST_URL}}"],
+              "path": ["blockchain", "onchain-events"],
+              "query": [
+                { "key": "limit", "value": "30" },
+                { "key": "offset", "value": "0" },
+                { "key": "event_name", "value": "", "disabled": true }
+              ]
+            }
+          }
+        }
       ]
     },
     {
@@ -528,23 +492,6 @@
               ]
             },
             "description": "Requires PAT via PATCH /auth/github-api-key. Response body is the raw JSON array from GitHub GET /user/repos (not paginated wrapper)."
-          }
-        },
-        {
-          "name": "POST /integrations/github/app/callback",
-          "request": {
-            "method": "POST",
-            "header": [
-              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
-              { "key": "Content-Type", "value": "application/json" }
-            ],
-            "url": { "raw": "{{HOST_URL}}/integrations/github/app/callback", "host": ["{{HOST_URL}}"], "path": ["integrations", "github", "app", "callback"] },
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"installation_id\": {{githubInstallationId}},\n  \"account_login\": \"{{githubAccountLogin}}\",\n  \"app_id\": {{githubAppId}},\n  \"pem_encrypted\": \"configured-via-env\"\n}",
-              "options": { "raw": { "language": "json" } }
-            },
-            "description": "Stores GitHub App installation metadata (optional; PAT + import-from-github does not use this). Requires GITHUB_WEBHOOK_SECRET in server env unless you add \"webhook_secret\" to the body."
           }
         }
       ]

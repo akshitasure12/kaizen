@@ -1,7 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import * as sdk from '../sdk';
-import { query } from '../db/client';
+import { query, queryOne } from '../db/client';
 import { requireAuth } from '../middleware/auth';
+import { parseListPagination, paginationMeta } from '../lib/pagination';
 import * as bountyService from '../services/bounty';
 import { createAgentBodySchema, formatZodError } from '../schemas/agent';
 
@@ -24,22 +25,35 @@ export async function agentRoutes(app: FastifyInstance) {
     }
   });
 
-  // Get agent by ENS name
-  app.get('/:ens_name', async (req, reply) => {
-    const { ens_name } = req.params as any;
-    const agent = await sdk.getAgent(ens_name);
-    if (!agent) return reply.status(404).send({ error: 'Agent not found' });
-    const earnings = await bountyService.getAgentEarnings(agent.id);
-    return { ...agent, earnings };
+  // List agents (paginated). Authenticated: current user's agents only (capabilities = memory).
+  app.get('/', { preHandler: requireAuth }, async (req, reply) => {
+    const { limit, offset } = parseListPagination(req.query as Record<string, unknown>, {
+      limit: 20,
+      maxLimit: 100,
+    });
+    const whereFinal = 'WHERE user_id = $1 AND lower(ens_name) <> \'kaizen.system\'';
+    const paramsList: unknown[] = [req.user!.userId];
+    const limitIdxL = paramsList.length + 1;
+    const offsetIdxL = paramsList.length + 2;
+    paramsList.push(limit, offset);
+    const rows = await query(
+      `SELECT * FROM agents ${whereFinal}
+       ORDER BY reputation_score DESC
+       LIMIT $${limitIdxL} OFFSET $${offsetIdxL}`,
+      paramsList,
+    );
+    const countSql = `SELECT COUNT(*)::text as c FROM agents WHERE user_id = $1 AND lower(ens_name) <> 'kaizen.system'`;
+    const countParams = [req.user!.userId];
+    const countRow = await queryOne<{ c: string }>(countSql, countParams);
+    const c = countRow?.c ?? '0';
+    const total = parseInt(c, 10);
+    return {
+      data: rows,
+      pagination: paginationMeta(total, limit, offset),
+    };
   });
 
-  // List all agents
-  app.get('/', async (_req, reply) => {
-    const agents = await query('SELECT * FROM agents ORDER BY reputation_score DESC');
-    return agents;
-  });
-
-  // ─── Wallet Endpoints (v3) ──────────────────────────────────────────────
+  // ─── Wallet (register before generic /:ens_name) ───────────────────────
 
   /**
    * Deposit tokens to an agent's wallet
@@ -53,7 +67,7 @@ export async function agentRoutes(app: FastifyInstance) {
     }
 
     const agent = await sdk.getAgent(ens_name);
-    if (!agent) {
+    if (!agent || agent.user_id !== req.user!.userId) {
       return reply.status(404).send({ error: 'Agent not found' });
     }
 
@@ -70,7 +84,7 @@ export async function agentRoutes(app: FastifyInstance) {
     const { ens_name } = req.params as any;
 
     const agent = await sdk.getAgent(ens_name);
-    if (!agent) {
+    if (!agent || agent.user_id !== req.user!.userId) {
       return reply.status(404).send({ error: 'Agent not found' });
     }
 
@@ -108,12 +122,61 @@ export async function agentRoutes(app: FastifyInstance) {
     }
 
     const agent = await sdk.getAgent(ens_name);
-    if (!agent) {
+    if (!agent || agent.user_id !== req.user!.userId) {
       return reply.status(404).send({ error: 'Agent not found' });
     }
 
     await bountyService.setSpendingCap(agent.id, spending_cap);
 
     return { ens_name, spending_cap };
+  });
+
+  // Update agent profile (owner only)
+  app.patch('/:ens_name', { preHandler: requireAuth }, async (req, reply) => {
+    const { ens_name } = req.params as { ens_name: string };
+    const body = req.body as {
+      role?: string;
+      capabilities?: string[];
+      max_bounty_spend?: number | null;
+    };
+    const agent = await sdk.getAgent(ens_name);
+    if (!agent) return reply.status(404).send({ error: 'Agent not found' });
+    if (agent.user_id !== req.user!.userId) {
+      return reply.status(403).send({ error: 'Not allowed to update this agent' });
+    }
+    const updates: string[] = [];
+    const vals: unknown[] = [];
+    let i = 1;
+    if (body.role !== undefined) {
+      updates.push(`role = $${i++}`);
+      vals.push(body.role);
+    }
+    if (body.capabilities !== undefined) {
+      updates.push(`capabilities = $${i++}`);
+      vals.push(body.capabilities);
+    }
+    if (body.max_bounty_spend !== undefined) {
+      updates.push(`max_bounty_spend = $${i++}`);
+      vals.push(body.max_bounty_spend);
+    }
+    if (updates.length === 0) {
+      return reply.status(400).send({ error: 'No valid fields to update' });
+    }
+    vals.push(agent.id);
+    const sql = `UPDATE agents SET ${updates.join(', ')} WHERE id = $${i} RETURNING *`;
+    const row = await queryOne<Record<string, unknown>>(sql, vals);
+    if (!row) return reply.status(500).send({ error: 'Update failed' });
+    return row;
+  });
+
+  // Get agent by ENS name (owner only — hides others' agents and earnings)
+  app.get('/:ens_name', { preHandler: requireAuth }, async (req, reply) => {
+    const { ens_name } = req.params as any;
+    const agent = await sdk.getAgent(ens_name);
+    if (!agent || agent.user_id !== req.user!.userId) {
+      return reply.status(404).send({ error: 'Agent not found' });
+    }
+    const earnings = await bountyService.getAgentEarnings(agent.id);
+    return { ...agent, earnings };
   });
 }

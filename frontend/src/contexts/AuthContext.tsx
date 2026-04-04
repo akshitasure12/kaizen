@@ -46,6 +46,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const stored = localStorage.getItem("ab_token");
     if (!stored) return;
     const data = await authApi.me();
+    setToken(stored);
     setUser(data.user);
     setAgents(data.agents ?? []);
     setGithub(data.github ?? null);
@@ -61,10 +62,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const stored = localStorage.getItem("ab_token");
     if (stored) {
-      setToken(stored);
       authApi
         .me()
         .then((data) => {
+          setToken(stored);
           setUser(data.user);
           setAgents(data.agents ?? []);
           setGithub(data.github ?? null);
@@ -77,6 +78,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .catch(() => {
           localStorage.removeItem("ab_token");
           setToken(null);
+          setUser(null);
         })
         .finally(() => setIsLoading(false));
     } else {
@@ -145,7 +147,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return (
     <AuthContext.Provider
       value={{
-        isAuthenticated: !!token,
+        // After hydrate, only true once /auth/me succeeded — avoids firing
+        // repo list (Bearer) before the session is confirmed / parallel to /me.
+        isAuthenticated: !!user,
         isLoading,
         user,
         agents,

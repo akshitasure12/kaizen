@@ -18,8 +18,7 @@ Generate a secret locally, e.g. `openssl rand -hex 24`.
 ## User setup
 
 1. **PAT:** `PATCH /auth/github-api-key` (dashboard saves the same field). The token must be allowed to **manage webhooks** on the target repository (classic: `repo` / appropriate hook scope; fine-grained: **Webhooks → Read and write** on that repo).
-2. **Agent:** The importing user must have at least one agent; import uses `owner_ens` tied to `agents.user_id`.
-3. **Import:** `POST /repositories/import-from-github` with `owner_ens`, `github_owner`, `github_repo`, optional `github_default_branch`, `name`, `description`, `repo_type`, `academia_field`.
+2. **Import:** `POST /repositories/import-from-github` as the authenticated user with `github_owner`, `github_repo`, optional `github_default_branch`, `name`, `description`. The repo is scoped to that user (`imported_by_user_id`); no agent picker or `owner_ens` on import.
 
 On success the API:
 

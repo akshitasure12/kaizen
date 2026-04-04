@@ -70,15 +70,26 @@ function buildAgentProfileText(agent: AgentRow): string {
 }
 
 export async function rankAgentsForIssue(params: {
+  /** Only agents owned by this user participate (capabilities / embeddings stay private). */
+  ownerUserId: string;
   issueTitle: string;
   issueBody: string;
   limit?: number;
 }): Promise<RankedAgent[]> {
-  const [agents, outcomes] = await Promise.all([
-    query<AgentRow>(
-      `SELECT id, ens_name, role, capabilities, reputation_score
-       FROM agents`,
-    ),
+  const agents = await query<AgentRow>(
+    `SELECT id, ens_name, role, capabilities, reputation_score
+     FROM agents
+     WHERE user_id = $1 AND lower(ens_name) <> 'kaizen.system'`,
+    [params.ownerUserId],
+  );
+
+  if (agents.length === 0) {
+    return [];
+  }
+
+  const agentIds = agents.map((a) => a.id);
+
+  const [outcomes, recentPenalties] = await Promise.all([
     query<OutcomeAggRow>(
       `SELECT agent_id,
               COUNT(*)::text as total_count,
@@ -86,12 +97,12 @@ export async function rankAgentsForIssue(params: {
               AVG(payout_fraction)::text as avg_payout_fraction,
               AVG(outcome_score)::text as avg_outcome_score
        FROM agent_outcomes
+       WHERE agent_id = ANY($1::uuid[])
        GROUP BY agent_id`,
+      [agentIds],
     ),
-  ]);
-
-  const recentPenalties = await query<RecentPenaltyRow>(
-    `SELECT agent_id,
+    query<RecentPenaltyRow>(
+      `SELECT agent_id,
             COUNT(*) FILTER (
               WHERE merged = false
                 AND (failure_category = 'closed_without_merge' OR failure_category IS NULL)
@@ -110,9 +121,12 @@ export async function rankAgentsForIssue(params: {
                  OR failure_category IS NOT NULL
             )::text AS reflection_required_count
      FROM agent_outcomes
-     WHERE created_at >= NOW() - INTERVAL '30 days'
+     WHERE agent_id = ANY($1::uuid[])
+       AND created_at >= NOW() - INTERVAL '30 days'
      GROUP BY agent_id`,
-  );
+      [agentIds],
+    ),
+  ]);
 
   const outcomeMap = new Map(outcomes.map((o) => [o.agent_id, o]));
   const penaltyMap = new Map(recentPenalties.map((row) => [row.agent_id, row]));

@@ -63,9 +63,6 @@ const envSchema = z.object({
   PAYOUT_MIN_ABOVE_FLOOR: z.coerce.number().min(0).max(1).default(0.25),
   PAYOUT_EXP: z.coerce.number().positive().optional(),
   PAYOUT_EXPONENT: z.coerce.number().positive().default(1.2),
-
-  GITHUB_APP_ID: z.string().optional(),
-  GITHUB_APP_PRIVATE_KEY: z.string().optional(),
 });
 
 export type WorkerEnv = z.infer<typeof envSchema>;
@@ -87,5 +84,4 @@ export const env = {
   WORKER_MAX_ATTEMPTS: parsed.data.RETRY_MAX ?? parsed.data.WORKER_MAX_ATTEMPTS,
   PAYOUT_SCORE_FLOOR: parsed.data.PAYOUT_MIN_SCORE ?? parsed.data.PAYOUT_SCORE_FLOOR,
   PAYOUT_EXPONENT: parsed.data.PAYOUT_EXP ?? parsed.data.PAYOUT_EXPONENT,
-  GITHUB_APP_PRIVATE_KEY: parsed.data.GITHUB_APP_PRIVATE_KEY?.replace(/\\n/g, "\n"),
 };

@@ -1,17 +1,11 @@
-/**
- * AgentBranch SDK v6
- *
- * Core functions for AI agents to interact with the version control system.
- * v2 adds: semantic commits, reasoning graph, replay traces
- * v3 adds: knowledge context for multi-agent collaboration handoffs
- * v5 adds: failure memory, workflow hooks, security scanning
- * v6 adds: multi-sort leaderboard
- */
-
-import { query, queryOne } from '../db/client';
-import { storeContent, retrieveContent } from '../services/fileverse';
-import { validateEnsName } from '../services/ens';
-import { processCommitSemantics, generateEmbedding, isEmbeddingsEnabled } from '../services/embeddings';
+import { query, queryOne } from "../db/client";
+import { storeContent, retrieveContent } from "../services/fileverse";
+import { validateEnsName } from "../services/ens";
+import {
+  processCommitSemantics,
+  generateEmbedding,
+  isEmbeddingsEnabled,
+} from "../services/embeddings";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -45,7 +39,12 @@ export interface Branch {
   created_at: string;
 }
 
-export type ReasoningType = 'knowledge' | 'hypothesis' | 'experiment' | 'conclusion' | 'trace';
+export type ReasoningType =
+  | "knowledge"
+  | "hypothesis"
+  | "experiment"
+  | "conclusion"
+  | "trace";
 
 export interface TraceData {
   prompt: string;
@@ -92,7 +91,7 @@ export interface FailureContext {
   /** Root cause analysis (why it failed) */
   root_cause?: string;
   /** Severity: low = minor inconvenience, medium = blocks progress, high = critical failure */
-  severity?: 'low' | 'medium' | 'high';
+  severity?: "low" | "medium" | "high";
   /** Concrete, actionable fixes that should be attempted next */
   corrective_actions?: string[];
   /** Hard constraints for the next attempt generated from this failure */
@@ -111,22 +110,16 @@ export interface Commit {
   content_type: string;
   parent_commit_id: string | null;
   created_at: string;
-  // Semantic fields (v2)
   embedding?: number[];
   semantic_summary?: string;
   tags?: string[];
-  // Reasoning graph fields (v2)
   reasoning_type?: ReasoningType;
-  // Replay trace fields (v2)
   trace_prompt?: string;
   trace_context?: Record<string, any>;
   trace_tools?: Array<{ name: string; input: any; output: any }>;
   trace_result?: string;
-  // Knowledge handoff (v3)
   knowledge_context?: KnowledgeContext;
-  // Failure memory (v5)
   failure_context?: FailureContext;
-  // Populated by readMemory
   content?: string;
   author_ens?: string;
   branch_name?: string;
@@ -140,13 +133,13 @@ export interface PullRequest {
   author_agent_id: string;
   reviewer_agent_id: string | null;
   description: string;
-  status: 'open' | 'approved' | 'merged' | 'rejected';
+  status: "open" | "approved" | "merged" | "rejected";
   bounty_amount: number;
   created_at: string;
   merged_at: string | null;
 }
 
-export type PermissionLevel = 'public' | 'team' | 'restricted' | 'encrypted';
+export type PermissionLevel = "public" | "team" | "restricted" | "encrypted";
 
 export interface CommitOptions {
   contentType?: string;
@@ -175,26 +168,74 @@ export async function registerAgent(
   ensName: string,
   role: string,
   capabilities: string[] = [],
-  opts: { userId?: string } = {}
+  opts: { userId?: string } = {},
 ): Promise<Agent> {
   if (!validateEnsName(ensName)) {
-    throw new Error(`Invalid ENS name: "${ensName}". Must match pattern agent.eth`);
+    throw new Error(
+      `Invalid ENS name: "${ensName}". Must match pattern agent.eth`,
+    );
   }
 
   const key = ensName.toLowerCase();
-  const existing = await queryOne<Agent>('SELECT * FROM agents WHERE ens_name = $1', [key]);
+  const existing = await queryOne<Agent>(
+    "SELECT * FROM agents WHERE ens_name = $1",
+    [key],
+  );
   if (existing) return existing;
 
   const [agent] = await query<Agent>(
     `INSERT INTO agents (ens_name, role, capabilities, user_id)
      VALUES ($1, $2, $3, $4) RETURNING *`,
-    [key, role, capabilities, opts.userId ?? null]
+    [key, role, capabilities, opts.userId ?? null],
   );
   return agent;
 }
 
 export async function getAgent(ensName: string): Promise<Agent | null> {
-  return queryOne<Agent>('SELECT * FROM agents WHERE ens_name = $1', [ensName.toLowerCase()]);
+  return queryOne<Agent>("SELECT * FROM agents WHERE ens_name = $1", [
+    ensName.toLowerCase(),
+  ]);
+}
+
+/** DB scaffolding only (repositories.owner_agent_id, branches.created_by); not product ownership. */
+export const SYSTEM_AGENT_ENS = "kaizen.system";
+
+export async function getOrCreateSystemAgent(): Promise<Agent> {
+  const existing = await getAgent(SYSTEM_AGENT_ENS);
+  if (existing) return existing;
+  try {
+    const [row] = await query<Agent>(
+      `INSERT INTO agents (ens_name, role, capabilities, reputation_score, user_id)
+       VALUES ($1, 'system', $2::text[], 0, NULL)
+       RETURNING *`,
+      [SYSTEM_AGENT_ENS, []],
+    );
+    return row;
+  } catch {
+    const again = await getAgent(SYSTEM_AGENT_ENS);
+    if (again) return again;
+    throw new Error("Failed to create system agent");
+  }
+}
+
+/** GitHub import: ties repo to importing user; uses system agent for required FKs. */
+export async function createRepositoryImportedFromGitHub(
+  importedByUserId: string,
+  name: string,
+  description: string = "",
+): Promise<Repository> {
+  const system = await getOrCreateSystemAgent();
+  const [repo] = await query<Repository>(
+    `INSERT INTO repositories (name, description, owner_agent_id, bounty_pool, imported_by_user_id)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [name, description, system.id, 0, importedByUserId],
+  );
+  await query(
+    `INSERT INTO branches (repo_id, name, base_branch_id, created_by)
+     VALUES ($1, 'main', NULL, $2)`,
+    [repo.id, system.id],
+  );
+  return repo;
 }
 
 // ─── Repository ───────────────────────────────────────────────────────────────
@@ -202,8 +243,8 @@ export async function getAgent(ensName: string): Promise<Agent | null> {
 export async function createRepository(
   name: string,
   ownerEns: string,
-  description: string = '',
-  _initialPermissionIgnored: PermissionLevel = 'public'
+  description: string = "",
+  _initialPermissionIgnored: PermissionLevel = "public",
 ): Promise<Repository> {
   const owner = await getAgent(ownerEns);
   if (!owner) throw new Error(`Agent not found: ${ownerEns}`);
@@ -211,14 +252,14 @@ export async function createRepository(
   const [repo] = await query<Repository>(
     `INSERT INTO repositories (name, description, owner_agent_id, bounty_pool)
      VALUES ($1, $2, $3, $4) RETURNING *`,
-    [name, description, owner.id, 0]
+    [name, description, owner.id, 0],
   );
 
   // Automatically create the main branch
   await query(
     `INSERT INTO branches (repo_id, name, base_branch_id, created_by)
      VALUES ($1, 'main', NULL, $2)`,
-    [repo.id, owner.id]
+    [repo.id, owner.id],
   );
 
   return repo;
@@ -230,27 +271,30 @@ export async function createBranch(
   repoId: string,
   branchName: string,
   baseBranchName: string,
-  creatorEns: string
+  creatorEns: string,
 ): Promise<Branch> {
   const creator = await getAgent(creatorEns);
   if (!creator) throw new Error(`Agent not found: ${creatorEns}`);
 
   const base = await queryOne<Branch>(
-    'SELECT * FROM branches WHERE repo_id = $1 AND name = $2',
-    [repoId, baseBranchName]
+    "SELECT * FROM branches WHERE repo_id = $1 AND name = $2",
+    [repoId, baseBranchName],
   );
-  if (!base) throw new Error(`Base branch "${baseBranchName}" not found in repo ${repoId}`);
+  if (!base)
+    throw new Error(
+      `Base branch "${baseBranchName}" not found in repo ${repoId}`,
+    );
 
   const existing = await queryOne<Branch>(
-    'SELECT * FROM branches WHERE repo_id = $1 AND name = $2',
-    [repoId, branchName]
+    "SELECT * FROM branches WHERE repo_id = $1 AND name = $2",
+    [repoId, branchName],
   );
   if (existing) return existing;
 
   const [branch] = await query<Branch>(
     `INSERT INTO branches (repo_id, name, base_branch_id, created_by)
      VALUES ($1, $2, $3, $4) RETURNING *`,
-    [repoId, branchName, base.id, creator.id]
+    [repoId, branchName, base.id, creator.id],
   );
   return branch;
 }
@@ -263,23 +307,31 @@ export async function commitMemory(
   content: string,
   message: string,
   authorEns: string,
-  options: CommitOptions = {}
+  options: CommitOptions = {},
 ): Promise<Commit> {
-  const { contentType = 'text', reasoningType, trace, skipSemantics = false, knowledgeContext, failureContext } = options;
+  const {
+    contentType = "text",
+    reasoningType,
+    trace,
+    skipSemantics = false,
+    knowledgeContext,
+    failureContext,
+  } = options;
 
   const author = await getAgent(authorEns);
   if (!author) throw new Error(`Agent not found: ${authorEns}`);
 
   const branch = await queryOne<Branch>(
-    'SELECT * FROM branches WHERE repo_id = $1 AND name = $2',
-    [repoId, branchName]
+    "SELECT * FROM branches WHERE repo_id = $1 AND name = $2",
+    [repoId, branchName],
   );
-  if (!branch) throw new Error(`Branch "${branchName}" not found in repo ${repoId}`);
+  if (!branch)
+    throw new Error(`Branch "${branchName}" not found in repo ${repoId}`);
 
   // Find parent commit
   const parent = await queryOne<Commit>(
-    'SELECT id FROM commits WHERE branch_id = $1 ORDER BY created_at DESC LIMIT 1',
-    [branch.id]
+    "SELECT id FROM commits WHERE branch_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [branch.id],
   );
 
   // Store content in Fileverse
@@ -297,7 +349,7 @@ export async function commitMemory(
       semanticSummary = semantics.summary;
       tags = semantics.tags;
     } catch (error) {
-      console.error('Semantic processing failed:', error);
+      console.error("Semantic processing failed:", error);
     }
   }
 
@@ -318,7 +370,7 @@ export async function commitMemory(
       contentRef,
       contentType,
       parent?.id ?? null,
-      embedding ? `[${embedding.join(',')}]` : null,
+      embedding ? `[${embedding.join(",")}]` : null,
       semanticSummary,
       tags,
       reasoningType ?? null,
@@ -328,7 +380,7 @@ export async function commitMemory(
       trace?.result ?? null,
       knowledgeContext ? JSON.stringify(knowledgeContext) : null,
       failureContext ? JSON.stringify(failureContext) : null,
-    ]
+    ],
   );
 
   return commit;
@@ -339,15 +391,15 @@ export async function commitMemory(
 export async function readMemory(
   repoId: string,
   _agentEns: string,
-  branchName?: string
+  branchName?: string,
 ): Promise<Commit[]> {
-  let branchFilter = '';
+  let branchFilter = "";
   const params: unknown[] = [repoId];
 
   if (branchName) {
     const branch = await queryOne<Branch>(
-      'SELECT id FROM branches WHERE repo_id = $1 AND name = $2',
-      [repoId, branchName]
+      "SELECT id FROM branches WHERE repo_id = $1 AND name = $2",
+      [repoId, branchName],
     );
     if (branch) {
       params.push(branch.id);
@@ -362,11 +414,12 @@ export async function readMemory(
      JOIN branches b ON c.branch_id = b.id
      WHERE c.repo_id = $1 ${branchFilter}
      ORDER BY c.created_at DESC`,
-    params
+    params,
   );
 
   for (const commit of commits) {
-    commit.content = (await retrieveContent(commit.content_ref)) ?? '[content not found]';
+    commit.content =
+      (await retrieveContent(commit.content_ref)) ?? "[content not found]";
   }
 
   return commits;
@@ -377,7 +430,7 @@ export async function readMemory(
 export async function searchCommits(
   repoId: string,
   queryText: string,
-  limit: number = 10
+  limit: number = 10,
 ): Promise<SearchResult[]> {
   // Try vector similarity search first
   if (isEmbeddingsEnabled()) {
@@ -393,10 +446,10 @@ export async function searchCommits(
          WHERE c.repo_id = $2 AND c.embedding IS NOT NULL
          ORDER BY c.embedding <=> $1::vector
          LIMIT $3`,
-        [`[${queryEmbedding.join(',')}]`, repoId, limit]
+        [`[${queryEmbedding.join(",")}]`, repoId, limit],
       );
 
-      return results.map(r => ({
+      return results.map((r) => ({
         commit: r,
         similarity: r.similarity,
       }));
@@ -413,10 +466,10 @@ export async function searchCommits(
      WHERE c.repo_id = $2 AND c.search_vector @@ plainto_tsquery('english', $1)
      ORDER BY rank DESC
      LIMIT $3`,
-    [queryText, repoId, limit]
+    [queryText, repoId, limit],
   );
 
-  return results.map(r => ({
+  return results.map((r) => ({
     commit: r,
     similarity: Math.min(1, r.rank / 10), // Normalize rank to 0-1
   }));
@@ -432,13 +485,14 @@ export async function searchFailures(
   repoId: string,
   options: {
     errorType?: string;
-    severity?: 'low' | 'medium' | 'high';
+    severity?: "low" | "medium" | "high";
     limit?: number;
-  } = {}
+  } = {},
 ): Promise<Commit[]> {
   const { errorType, severity, limit = 20 } = options;
 
-  let whereClause = 'WHERE c.repo_id = $1 AND c.failure_context IS NOT NULL AND (c.failure_context->>\'failed\')::boolean = true';
+  let whereClause =
+    "WHERE c.repo_id = $1 AND c.failure_context IS NOT NULL AND (c.failure_context->>'failed')::boolean = true";
   const params: any[] = [repoId];
 
   if (errorType) {
@@ -461,7 +515,7 @@ export async function searchFailures(
      ${whereClause}
      ORDER BY c.created_at DESC
      LIMIT $${params.length}`,
-    params
+    params,
   );
 
   return results;
@@ -471,7 +525,7 @@ export async function searchFailures(
 
 export async function getCommitGraph(
   repoId: string,
-  rootCommitId?: string
+  rootCommitId?: string,
 ): Promise<GraphNode[]> {
   // Get all commits with reasoning types
   const commits = await query<Commit>(
@@ -481,7 +535,7 @@ export async function getCommitGraph(
      JOIN branches b ON c.branch_id = b.id
      WHERE c.repo_id = $1 AND c.reasoning_type IS NOT NULL
      ORDER BY c.created_at ASC`,
-    [repoId]
+    [repoId],
   );
 
   // Build adjacency map
@@ -503,7 +557,7 @@ export async function getCommitGraph(
     const childIds = childrenMap.get(commitId) || [];
     return {
       commit,
-      children: childIds.map(id => buildNode(id)),
+      children: childIds.map((id) => buildNode(id)),
     };
   }
 
@@ -515,8 +569,10 @@ export async function getCommitGraph(
     return [];
   }
 
-  const roots = commits.filter(c => !c.parent_commit_id || !commitMap.has(c.parent_commit_id));
-  return roots.map(c => buildNode(c.id));
+  const roots = commits.filter(
+    (c) => !c.parent_commit_id || !commitMap.has(c.parent_commit_id),
+  );
+  return roots.map((c) => buildNode(c.id));
 }
 
 // ─── Replay Trace (v2) ────────────────────────────────────────────────────────
@@ -532,7 +588,7 @@ export async function getCommitReplay(commitId: string): Promise<{
      JOIN agents a ON c.author_agent_id = a.id
      JOIN branches b ON c.branch_id = b.id
      WHERE c.id = $1`,
-    [commitId]
+    [commitId],
   );
 
   if (!commit) {
@@ -540,7 +596,8 @@ export async function getCommitReplay(commitId: string): Promise<{
   }
 
   // Resolve content
-  commit.content = (await retrieveContent(commit.content_ref)) ?? '[content not found]';
+  commit.content =
+    (await retrieveContent(commit.content_ref)) ?? "[content not found]";
 
   // Build trace data if available
   let trace: TraceData | null = null;
@@ -549,7 +606,7 @@ export async function getCommitReplay(commitId: string): Promise<{
       prompt: commit.trace_prompt,
       context: commit.trace_context || {},
       tools: commit.trace_tools || [],
-      result: commit.trace_result || '',
+      result: commit.trace_result || "",
     };
   }
 
@@ -564,18 +621,19 @@ export async function getCommitReplay(commitId: string): Promise<{
        JOIN agents a ON c.author_agent_id = a.id
        JOIN branches b ON c.branch_id = b.id
        WHERE c.id = $1 AND c.reasoning_type IS NOT NULL`,
-      [currentId]
+      [currentId],
     );
 
     if (parent) {
-      parent.content = (await retrieveContent(parent.content_ref)) ?? '[content not found]';
+      parent.content =
+        (await retrieveContent(parent.content_ref)) ?? "[content not found]";
       reasoningChain.unshift(parent);
       currentId = parent.parent_commit_id;
     } else {
       // Check if there's a non-reasoning parent to continue the chain
       const anyParent = await queryOne<{ parent_commit_id: string | null }>(
-        'SELECT parent_commit_id FROM commits WHERE id = $1',
-        [currentId]
+        "SELECT parent_commit_id FROM commits WHERE id = $1",
+        [currentId],
       );
       currentId = anyParent?.parent_commit_id ?? null;
     }
@@ -626,15 +684,15 @@ export interface ContextChain {
  */
 export async function getContextChain(
   repoId: string,
-  branchName?: string
+  branchName?: string,
 ): Promise<ContextChain> {
-  let branchFilter = '';
+  let branchFilter = "";
   const params: any[] = [repoId];
 
   if (branchName) {
     const branch = await queryOne<Branch>(
-      'SELECT id FROM branches WHERE repo_id = $1 AND name = $2',
-      [repoId, branchName]
+      "SELECT id FROM branches WHERE repo_id = $1 AND name = $2",
+      [repoId, branchName],
     );
     if (branch) {
       params.push(branch.id);
@@ -649,7 +707,7 @@ export async function getContextChain(
      JOIN branches b ON c.branch_id = b.id
      WHERE c.repo_id = $1 ${branchFilter}
      ORDER BY c.created_at ASC`,
-    params
+    params,
   );
 
   // Group consecutive commits by the same agent into handoff segments
@@ -662,7 +720,7 @@ export async function getContextChain(
       currentSegment = {
         agent: {
           id: commit.author_agent_id,
-          ens_name: commit.author_ens || '',
+          ens_name: commit.author_ens || "",
           role: (commit as any).author_role || null,
         },
         commits: [],
@@ -679,7 +737,7 @@ export async function getContextChain(
       reasoning_type: commit.reasoning_type || null,
       tags: commit.tags || [],
       created_at: commit.created_at,
-      branch_name: commit.branch_name || '',
+      branch_name: commit.branch_name || "",
       knowledge_context: commit.knowledge_context || null,
     });
   }
@@ -687,14 +745,14 @@ export async function getContextChain(
   // Build contribution summaries and aggregate knowledge briefs
   for (const segment of handoffs) {
     const summaries = segment.commits
-      .filter(c => c.semantic_summary)
-      .map(c => c.semantic_summary!);
+      .filter((c) => c.semantic_summary)
+      .map((c) => c.semantic_summary!);
     if (summaries.length > 0) {
       segment.contribution_summary = summaries[summaries.length - 1];
     }
 
     // Aggregate knowledge_context from all commits in this segment
-    const knowledgeCommits = segment.commits.filter(c => c.knowledge_context);
+    const knowledgeCommits = segment.commits.filter((c) => c.knowledge_context);
     if (knowledgeCommits.length > 0) {
       const aggregated: KnowledgeContext = {
         decisions: [],
@@ -707,11 +765,14 @@ export async function getContextChain(
         const kctx = kc.knowledge_context!;
         if (kctx.decisions) aggregated.decisions!.push(...kctx.decisions);
         if (kctx.libraries) aggregated.libraries!.push(...kctx.libraries);
-        if (kctx.open_questions) aggregated.open_questions!.push(...kctx.open_questions);
+        if (kctx.open_questions)
+          aggregated.open_questions!.push(...kctx.open_questions);
         if (kctx.next_steps) aggregated.next_steps!.push(...kctx.next_steps);
-        if (kctx.dependencies) aggregated.dependencies!.push(...kctx.dependencies);
+        if (kctx.dependencies)
+          aggregated.dependencies!.push(...kctx.dependencies);
         if (kctx.architecture) aggregated.architecture = kctx.architecture;
-        if (kctx.handoff_summary) aggregated.handoff_summary = kctx.handoff_summary;
+        if (kctx.handoff_summary)
+          aggregated.handoff_summary = kctx.handoff_summary;
       }
       // Deduplicate arrays
       aggregated.decisions = [...new Set(aggregated.decisions)];
@@ -725,7 +786,7 @@ export async function getContextChain(
   }
 
   // Count unique agents
-  const uniqueAgents = new Set(commits.map(c => c.author_agent_id));
+  const uniqueAgents = new Set(commits.map((c) => c.author_agent_id));
 
   return {
     repo_id: repoId,
@@ -742,27 +803,27 @@ export async function openPullRequest(
   sourceBranchName: string,
   targetBranchName: string,
   description: string,
-  authorEns: string
+  authorEns: string,
 ): Promise<PullRequest> {
   const author = await getAgent(authorEns);
   if (!author) throw new Error(`Agent not found: ${authorEns}`);
 
   const source = await queryOne<Branch>(
-    'SELECT * FROM branches WHERE repo_id = $1 AND name = $2',
-    [repoId, sourceBranchName]
+    "SELECT * FROM branches WHERE repo_id = $1 AND name = $2",
+    [repoId, sourceBranchName],
   );
   if (!source) throw new Error(`Branch "${sourceBranchName}" not found`);
 
   const target = await queryOne<Branch>(
-    'SELECT * FROM branches WHERE repo_id = $1 AND name = $2',
-    [repoId, targetBranchName]
+    "SELECT * FROM branches WHERE repo_id = $1 AND name = $2",
+    [repoId, targetBranchName],
   );
   if (!target) throw new Error(`Branch "${targetBranchName}" not found`);
 
   const [pr] = await query<PullRequest>(
     `INSERT INTO pull_requests (repo_id, source_branch_id, target_branch_id, author_agent_id, description)
      VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [repoId, source.id, target.id, author.id, description]
+    [repoId, source.id, target.id, author.id, description],
   );
 
   return pr;
@@ -770,26 +831,29 @@ export async function openPullRequest(
 
 export async function mergePullRequest(
   prId: string,
-  reviewerEns: string
+  reviewerEns: string,
 ): Promise<PullRequest> {
   const reviewer = await getAgent(reviewerEns);
   if (!reviewer) throw new Error(`Reviewer agent not found: ${reviewerEns}`);
 
-  const pr = await queryOne<PullRequest>('SELECT * FROM pull_requests WHERE id = $1', [prId]);
+  const pr = await queryOne<PullRequest>(
+    "SELECT * FROM pull_requests WHERE id = $1",
+    [prId],
+  );
   if (!pr) throw new Error(`Pull request not found: ${prId}`);
-  if (pr.status !== 'open') throw new Error(`PR is already ${pr.status}`);
+  if (pr.status !== "open") throw new Error(`PR is already ${pr.status}`);
 
   const [merged] = await query<PullRequest>(
     `UPDATE pull_requests
      SET status = 'merged', reviewer_agent_id = $1, merged_at = NOW()
      WHERE id = $2 RETURNING *`,
-    [reviewer.id, prId]
+    [reviewer.id, prId],
   );
 
   // Bump reviewer reputation for completing a review
   await query(
     `UPDATE agents SET reputation_score = reputation_score + 5 WHERE id = $1`,
-    [reviewer.id]
+    [reviewer.id],
   );
 
   return merged;

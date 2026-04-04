@@ -6,6 +6,8 @@
 
 import { FastifyInstance } from 'fastify';
 import { query } from '../db/client';
+import { paginationMeta } from '../lib/pagination';
+import { requireAuth } from '../middleware/auth';
 
 interface LeaderboardEntry {
   rank: number;
@@ -120,7 +122,7 @@ export async function leaderboardRoutes(app: FastifyInstance) {
         FROM issue_judgements j
         WHERE j.verdict IS NOT NULL
         GROUP BY j.agent_id
-      ),
+      )
       SELECT 
         ROW_NUMBER() OVER (ORDER BY ${sortColumn} ${sortOrder}, at.reputation_score DESC) as rank,
         at.agent_id,
@@ -147,14 +149,10 @@ export async function leaderboardRoutes(app: FastifyInstance) {
       'SELECT COUNT(*) as count FROM agents'
     );
 
+    const total = parseInt(count, 10);
     return {
-      entries,
-      pagination: {
-        total: parseInt(count),
-        limit: parsedLimit,
-        offset: parsedOffset,
-        hasMore: parsedOffset + entries.length < parseInt(count),
-      },
+      data: entries,
+      pagination: paginationMeta(total, parsedLimit, parsedOffset),
       timeframe,
       sort_by: sortColumn,
       order: sortOrder.toLowerCase(),
@@ -190,10 +188,11 @@ export async function leaderboardRoutes(app: FastifyInstance) {
   });
 
   /**
-   * Get agent profile with detailed stats
+   * Get agent profile with detailed stats (auth: judgements/contributions scoped to your imported repos; capabilities only if you own the agent)
    */
-  app.get('/agents/:ensName', async (req, reply) => {
+  app.get('/agents/:ensName', { preHandler: requireAuth }, async (req, reply) => {
     const { ensName } = req.params as any;
+    const viewerId = req.user!.userId;
 
     type AgentProfileRow = {
       id: string;
@@ -202,13 +201,20 @@ export async function leaderboardRoutes(app: FastifyInstance) {
       capabilities: string[] | null;
       reputation_score: number;
       created_at: string;
+      user_id: string | null;
       total_points: string;
       issues_completed: string;
     };
 
     const agent = await query<AgentProfileRow>(
       `SELECT 
-        a.*,
+        a.id,
+        a.ens_name,
+        a.role,
+        a.capabilities,
+        a.reputation_score,
+        a.created_at,
+        a.user_id,
         COALESCE(SUM(s.points), 0) as total_points,
         COUNT(DISTINCT s.issue_id) as issues_completed
        FROM agents a
@@ -223,6 +229,7 @@ export async function leaderboardRoutes(app: FastifyInstance) {
     }
 
     const profile = agent[0];
+    const viewerOwnsAgent = profile.user_id === viewerId;
 
     // Get rank
     const [rankResult] = await query<{ rank: string }>(
@@ -240,19 +247,19 @@ export async function leaderboardRoutes(app: FastifyInstance) {
       [profile.id]
     );
 
-    // Get recent judgements
+    // Recent judgements only on issues in repos you imported (no other users' issue titles)
     const judgements = await query(
       `SELECT j.*, i.title as issue_title, r.name as repo_name
        FROM issue_judgements j
        JOIN issues i ON j.issue_id = i.id
        JOIN repositories r ON i.repo_id = r.id
-       WHERE j.agent_id = $1
+       WHERE j.agent_id = $1 AND r.imported_by_user_id = $2
        ORDER BY j.judged_at DESC
        LIMIT 10`,
-      [profile.id]
+      [profile.id, viewerId]
     );
 
-    // Get repositories this agent has contributed to (v6: includes repo_type)
+    // Contributions only in repos you imported
     const contributions = await query(
       `SELECT 
         r.id, r.name,
@@ -261,15 +268,17 @@ export async function leaderboardRoutes(app: FastifyInstance) {
        FROM repositories r
        LEFT JOIN commits c ON r.id = c.repo_id AND c.author_agent_id = $1
        LEFT JOIN pull_requests p ON r.id = p.repo_id AND p.author_agent_id = $1
-       WHERE c.id IS NOT NULL OR p.id IS NOT NULL
+       WHERE r.imported_by_user_id = $2
+         AND (c.id IS NOT NULL OR p.id IS NOT NULL)
        GROUP BY r.id, r.name
        ORDER BY commit_count DESC
        LIMIT 10`,
-      [profile.id]
+      [profile.id, viewerId]
     );
 
     return {
       ...profile,
+      capabilities: viewerOwnsAgent ? profile.capabilities : null,
       rank: parseInt(rankResult?.rank || '0'),
       judgements,
       contributions,

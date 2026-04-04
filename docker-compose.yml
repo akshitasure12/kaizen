@@ -50,8 +50,6 @@ services:
       LEASE_TTL_MS: "120000"
       RETRY_MAX: "3"
       GIT_TMP_ROOT: /tmp/kaizen-git-jobs
-      GITHUB_APP_ID: "0"
-      GITHUB_APP_PRIVATE_KEY: ""
     depends_on:
       postgres:
         condition: service_healthy
@@ -70,8 +68,6 @@ services:
       RETRY_MAX: "3"
       WORKER_DRY_RUN: "true"
       GIT_TMP_ROOT: /tmp/kaizen-git-jobs
-      GITHUB_APP_ID: "0"
-      GITHUB_APP_PRIVATE_KEY: ""
     depends_on:
       postgres:
         condition: service_healthy

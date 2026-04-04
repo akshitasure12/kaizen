@@ -1,12 +1,13 @@
-/**
- * Enqueue git worker jobs (clone → agent commit → PR → judge → comment → cleanup).
- */
-
-import { FastifyInstance } from "fastify";
+import {
+  FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from "fastify";
 import { query, queryOne } from "../db/client";
 import { env } from "../env";
 import { requireAuth } from "../middleware/auth";
 import { enqueueGitJob } from "../services/git-job-enqueue";
+import { parseListPagination, paginationMeta } from "../lib/pagination";
 import { getGitHubLinkForRepo } from "../services/github-integration";
 import * as sdk from "../sdk";
 
@@ -28,10 +29,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+async function requireRepoImportedByUser(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  if (!req.user?.userId) {
+    await reply.status(401).send({ error: "Authentication required" });
+    return;
+  }
+  const { repoId } = req.params as { repoId: string };
+  const ok = await queryOne<{ id: string }>(
+    "SELECT id FROM repositories WHERE id = $1 AND imported_by_user_id = $2",
+    [repoId, req.user.userId],
+  );
+  if (!ok) {
+    await reply.status(404).send({ error: "Repository not found" });
+    return;
+  }
+}
+
+const repoUserAuth = [requireAuth, requireRepoImportedByUser] as const;
+
 export async function gitJobRoutes(app: FastifyInstance) {
   app.post(
     "/repositories/:repoId/git-jobs",
-    { preHandler: requireAuth },
+    { preHandler: [...repoUserAuth] },
     async (req, reply) => {
       const { repoId } = req.params as { repoId: string };
       const body = req.body as {
@@ -58,9 +80,9 @@ export async function gitJobRoutes(app: FastifyInstance) {
         const existing = await queryOne<{ id: string; status: string }>(
           `SELECT id, status
            FROM git_jobs
-           WHERE idempotency_key = $1
+           WHERE idempotency_key = $1 AND user_id = $2
            LIMIT 1`,
-          [idempotency_key],
+          [idempotency_key, req.user!.userId],
         );
         if (existing) {
           return reply
@@ -102,8 +124,8 @@ export async function gitJobRoutes(app: FastifyInstance) {
 
       const resolvedAgent = agent_ens
         ? await queryOne<{ id: string; ens_name: string }>(
-            "SELECT id, ens_name FROM agents WHERE lower(ens_name) = lower($1)",
-            [agent_ens],
+            "SELECT id, ens_name FROM agents WHERE lower(ens_name) = lower($1) AND user_id = $2",
+            [agent_ens, req.user!.userId],
           )
         : null;
 
@@ -165,6 +187,18 @@ export async function gitJobRoutes(app: FastifyInstance) {
           deduped: boolean;
         }> = [];
         for (const child of children) {
+          if (child.assigned_agent_id) {
+            const childOwned = await queryOne<{ id: string }>(
+              "SELECT id FROM agents WHERE id = $1 AND user_id = $2",
+              [child.assigned_agent_id, req.user!.userId],
+            );
+            if (!childOwned) {
+              return reply.status(400).send({
+                error:
+                  "Child issue has an assigned agent that is not one of your agents",
+              });
+            }
+          }
           const childAgentId = child.assigned_agent_id || resolvedAgent!.id;
           const childKey = idempotency_key
             ? `${idempotency_key}:${child.id}`
@@ -199,14 +233,58 @@ export async function gitJobRoutes(app: FastifyInstance) {
     },
   );
 
-  app.get("/git-jobs/:id", async (req, reply) => {
+  app.get(
+    "/repositories/:repoId/git-jobs",
+    { preHandler: [...repoUserAuth] },
+    async (req, reply) => {
+      const { repoId } = req.params as { repoId: string };
+      const q = req.query as { issue_id?: string; status?: string };
+      const { limit, offset } = parseListPagination(
+        req.query as Record<string, unknown>,
+        { limit: 20, maxLimit: 100 },
+      );
+      const conds: string[] = ["gj.repo_id = $1"];
+      const params: unknown[] = [repoId];
+      if (q.issue_id?.trim()) {
+        params.push(q.issue_id.trim());
+        conds.push(`gj.issue_id = $${params.length}`);
+      }
+      if (q.status?.trim()) {
+        params.push(q.status.trim());
+        conds.push(`gj.status = $${params.length}`);
+      }
+      const where = conds.join(" AND ");
+      const limitIdx = params.length + 1;
+      const offsetIdx = params.length + 2;
+      params.push(limit, offset);
+      const rows = await query(
+        `SELECT gj.* FROM git_jobs gj WHERE ${where}
+         ORDER BY gj.updated_at DESC NULLS LAST, gj.created_at DESC
+         LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+        params,
+      );
+      const countParams = params.slice(0, -2);
+      const countRow = await queryOne<{ c: string }>(
+        `SELECT COUNT(*)::text as c FROM git_jobs gj WHERE ${where}`,
+        countParams,
+      );
+      const total = parseInt(countRow?.c ?? "0", 10);
+      return {
+        data: rows,
+        pagination: paginationMeta(total, limit, offset),
+      };
+    },
+  );
+
+  app.get("/git-jobs/:id", { preHandler: requireAuth }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const row = await queryOne(
       `SELECT gj.*, i.title as issue_title
-       FROM git_jobs gj
-       JOIN issues i ON i.id = gj.issue_id
-       WHERE gj.id = $1`,
-      [id],
+         FROM git_jobs gj
+         JOIN issues i ON i.id = gj.issue_id
+         JOIN repositories r ON r.id = gj.repo_id
+         WHERE gj.id = $1 AND r.imported_by_user_id = $2`,
+      [id, req.user!.userId],
     );
     if (!row) return reply.status(404).send({ error: "Job not found" });
     return row;
@@ -357,14 +435,21 @@ export async function gitJobRoutes(app: FastifyInstance) {
       message?: string;
       content?: string;
       skip_semantics?: boolean;
-      reasoning_type?: "knowledge" | "hypothesis" | "experiment" | "conclusion" | "trace";
+      reasoning_type?:
+        | "knowledge"
+        | "hypothesis"
+        | "experiment"
+        | "conclusion"
+        | "trace";
       trace?: unknown;
       knowledge_context?: unknown;
       failure_context?: unknown;
     };
 
     if (!body.message || !body.content) {
-      return reply.status(400).send({ error: "message and content are required" });
+      return reply
+        .status(400)
+        .send({ error: "message and content are required" });
     }
 
     const job = await queryOne<{
@@ -393,7 +478,10 @@ export async function gitJobRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: "Agent not found" });
     }
 
-    if (isRecord(job.payload) && typeof job.payload.memory_commit_id === "string") {
+    if (
+      isRecord(job.payload) &&
+      typeof job.payload.memory_commit_id === "string"
+    ) {
       return {
         commit_id: job.payload.memory_commit_id,
         branch_name:
@@ -405,7 +493,11 @@ export async function gitJobRoutes(app: FastifyInstance) {
       };
     }
 
-    const branchName = (body.branch_name || job.branch_name || `agent/${job.issue_id.slice(0, 8)}-memory`).trim();
+    const branchName = (
+      body.branch_name ||
+      job.branch_name ||
+      `agent/${job.issue_id.slice(0, 8)}-memory`
+    ).trim();
     if (!branchName) {
       return reply.status(400).send({ error: "Unable to resolve branch name" });
     }
@@ -424,7 +516,12 @@ export async function gitJobRoutes(app: FastifyInstance) {
           ? requestedBase
           : "main";
 
-      await sdk.createBranch(job.repo_id, branchName, baseBranch, agent.ens_name);
+      await sdk.createBranch(
+        job.repo_id,
+        branchName,
+        baseBranch,
+        agent.ens_name,
+      );
     }
 
     const options: sdk.CommitOptions = {
@@ -436,7 +533,13 @@ export async function gitJobRoutes(app: FastifyInstance) {
       options.trace = {
         prompt: typeof body.trace.prompt === "string" ? body.trace.prompt : "",
         context: isRecord(body.trace.context) ? body.trace.context : {},
-        tools: Array.isArray(body.trace.tools) ? body.trace.tools as Array<{ name: string; input: any; output: any }> : [],
+        tools: Array.isArray(body.trace.tools)
+          ? (body.trace.tools as Array<{
+              name: string;
+              input: any;
+              output: any;
+            }>)
+          : [],
         result: typeof body.trace.result === "string" ? body.trace.result : "",
       };
     }
@@ -456,20 +559,39 @@ export async function gitJobRoutes(app: FastifyInstance) {
 
         options.failureContext = {
           failed: rawFailure.failed,
-          error_type: typeof rawFailure.error_type === "string" ? rawFailure.error_type : undefined,
-          error_detail: typeof rawFailure.error_detail === "string" ? rawFailure.error_detail : undefined,
+          error_type:
+            typeof rawFailure.error_type === "string"
+              ? rawFailure.error_type
+              : undefined,
+          error_detail:
+            typeof rawFailure.error_detail === "string"
+              ? rawFailure.error_detail
+              : undefined,
           failed_approach:
-            typeof rawFailure.failed_approach === "string" ? rawFailure.failed_approach : undefined,
-          root_cause: typeof rawFailure.root_cause === "string" ? rawFailure.root_cause : undefined,
+            typeof rawFailure.failed_approach === "string"
+              ? rawFailure.failed_approach
+              : undefined,
+          root_cause:
+            typeof rawFailure.root_cause === "string"
+              ? rawFailure.root_cause
+              : undefined,
           severity,
           corrective_actions: Array.isArray(rawFailure.corrective_actions)
-            ? rawFailure.corrective_actions.filter((v): v is string => typeof v === "string")
+            ? rawFailure.corrective_actions.filter(
+                (v): v is string => typeof v === "string",
+              )
             : undefined,
-          next_attempt_constraints: Array.isArray(rawFailure.next_attempt_constraints)
-            ? rawFailure.next_attempt_constraints.filter((v): v is string => typeof v === "string")
+          next_attempt_constraints: Array.isArray(
+            rawFailure.next_attempt_constraints,
+          )
+            ? rawFailure.next_attempt_constraints.filter(
+                (v): v is string => typeof v === "string",
+              )
             : undefined,
           related_examples: Array.isArray(rawFailure.related_examples)
-            ? rawFailure.related_examples.filter((v): v is string => typeof v === "string")
+            ? rawFailure.related_examples.filter(
+                (v): v is string => typeof v === "string",
+              )
             : undefined,
         };
       }

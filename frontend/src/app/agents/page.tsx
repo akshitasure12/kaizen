@@ -1,19 +1,19 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import agentsData from "@/data/agents.json";
+import { agentApi, type Agent as ApiAgent } from "@/lib/api";
 
-const PER_PAGE = agentsData.per_page ?? 5;
+const PER_PAGE = 10;
 
 type Agent = {
   id: string;
-  name: string;
+  ens_name: string;
   role: string;
   created_at: string;
   capabilities: string[];
   reputation_score: number;
   wallet_balance: number;
-  max_bounty_spent: number;
+  max_bounty_spend: number;
 };
 
 type AgentsResponse = {
@@ -23,62 +23,38 @@ type AgentsResponse = {
   total: number;
 };
 
-function normalizeAgentsPayload(raw: unknown, page: number): AgentsResponse {
-  let rows: unknown[] = [];
-  if (Array.isArray(raw)) {
-    rows = raw;
-  } else if (raw && typeof raw === "object" && Array.isArray((raw as { agents?: unknown }).agents)) {
-    rows = (raw as { agents: unknown[] }).agents;
-  }
-  const mapped: Agent[] = rows.map((row) => {
-    const r = row as Record<string, unknown>;
-    const id = String(r.id ?? "");
-    const name = String(r.name ?? r.ens_name ?? "");
-    const caps = r.capabilities;
-    const capabilities = Array.isArray(caps) ? caps.map(String) : [];
-    const maxRaw = r.max_bounty_spent ?? r.max_bounty_spend;
-    return {
-      id,
-      name,
-      role: String(r.role ?? ""),
-      created_at: String(r.created_at ?? ""),
-      capabilities,
-      reputation_score: Number(r.reputation_score ?? 0),
-      wallet_balance: Number(r.wallet_balance ?? 0),
-      max_bounty_spent: typeof maxRaw === "number" ? maxRaw : Number(maxRaw ?? 0),
-    };
-  });
-  const start = (page - 1) * PER_PAGE;
-  const agents = mapped.slice(start, start + PER_PAGE);
+function mapAgent(a: ApiAgent): Agent {
+  const maxRaw = a.max_bounty_spend;
   return {
-    agents,
-    page,
-    per_page: PER_PAGE,
-    total: mapped.length,
+    id: a.id,
+    ens_name: a.ens_name,
+    role: a.role ?? "",
+    created_at: a.created_at,
+    capabilities: Array.isArray(a.capabilities) ? a.capabilities : [],
+    reputation_score: a.reputation_score ?? 0,
+    wallet_balance: Number(a.wallet_balance ?? 0),
+    max_bounty_spend:
+      maxRaw === null || maxRaw === undefined
+        ? 0
+        : typeof maxRaw === "number"
+          ? maxRaw
+          : Number(maxRaw),
   };
 }
+
 async function fetchAgents(page: number): Promise<AgentsResponse> {
-  try {
-    const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
-    const token =
-      typeof window !== "undefined" ? localStorage.getItem("ab_token") : null;
-    const res = await fetch(
-      `${BASE}/agents?page=${page}&per_page=${PER_PAGE}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
-    );
-    if (!res.ok) throw new Error(`${res.status}`);
-    const raw: unknown = await res.json();
-    return normalizeAgentsPayload(raw, page);
-  } catch {
-    // Fall back to local fake data
-    const start = (page - 1) * PER_PAGE;
-    return {
-      agents: agentsData.agents.slice(start, start + PER_PAGE) as Agent[],
-      page,
-      per_page: PER_PAGE,
-      total: agentsData.total,
-    };
-  }
+  const offset = (page - 1) * PER_PAGE;
+  const res = await agentApi.list({
+    mine: true,
+    limit: PER_PAGE,
+    offset,
+  });
+  return {
+    agents: res.data.map(mapAgent),
+    page,
+    per_page: PER_PAGE,
+    total: res.pagination.total,
+  };
 }
 
 function formatDate(iso: string) {
@@ -289,31 +265,36 @@ function TagInput({
 // ── Add agent modal ────────────────────────────────────────────────────────
 function AddAgentModal({
   onClose,
-  onAdd,
+  onCreated,
 }: {
   onClose: () => void;
-  onAdd: (agent: Agent) => void;
+  onCreated: () => void;
 }) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [docFile, setDocFile] = useState<File | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const handleAdd = () => {
+  const handleAdd = async () => {
     if (!name.trim()) return;
-    const newAgent: Agent = {
-      id: `agt_${Date.now()}`,
-      name: name.trim(),
-      role: role.trim(),
-      created_at: new Date().toISOString(),
-      capabilities,
-      reputation_score: 0,
-      wallet_balance: 0,
-      max_bounty_spent: 0,
-    };
-    onAdd(newAgent);
-    onClose();
+    setSaving(true);
+    setSaveErr(null);
+    try {
+      await agentApi.create({
+        ens_name: name.trim().toLowerCase(),
+        role: role.trim() || undefined,
+        capabilities,
+      });
+      onCreated();
+      onClose();
+    } catch (e) {
+      setSaveErr(e instanceof Error ? e.message : "Failed to create agent");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const inputStyle: React.CSSProperties = {
@@ -366,15 +347,15 @@ function AddAgentModal({
               className="block mb-1.5 text-sm font-medium"
               style={{ color: "var(--fg-muted)" }}
             >
-              Name
+              ENS name
             </label>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") handleAdd();
+                if (e.key === "Enter") void handleAdd();
               }}
-              placeholder="agent-name"
+              placeholder="myagent.eth"
               style={inputStyle}
             />
           </div>
@@ -390,7 +371,7 @@ function AddAgentModal({
               value={role}
               onChange={(e) => setRole(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") handleAdd();
+                if (e.key === "Enter") void handleAdd();
               }}
               placeholder="e.g. Solidity Developer"
               style={inputStyle}
@@ -450,9 +431,15 @@ function AddAgentModal({
           </div>
         </div>
 
+        {saveErr && (
+          <p className="mt-4 text-sm" style={{ color: "#f87171" }}>
+            {saveErr}
+          </p>
+        )}
+
         <button
-          onClick={handleAdd}
-          disabled={!name.trim()}
+          onClick={() => void handleAdd()}
+          disabled={!name.trim() || saving}
           className="mt-7 w-full py-3 rounded-lg font-semibold text-base transition-all disabled:opacity-40 disabled:cursor-not-allowed"
           style={{
             color: "#000000",
@@ -471,7 +458,7 @@ function AddAgentModal({
             e.currentTarget.style.borderColor = "transparent";
           }}
         >
-          Add agent
+          {saving ? "Creating…" : "Add agent"}
         </button>
       </div>
     </div>
@@ -482,11 +469,12 @@ function AddAgentModal({
 function AgentRow({
   agent,
   onUpdate,
-  onDelete,
 }: {
   agent: Agent;
-  onUpdate: (id: string, patch: Partial<Agent>) => void;
-  onDelete: (id: string) => void;
+  onUpdate: (
+    ensName: string,
+    patch: Partial<Pick<Agent, "role" | "capabilities" | "max_bounty_spend">>,
+  ) => void;
 }) {
   return (
     <tr
@@ -499,18 +487,22 @@ function AgentRow({
         (e.currentTarget.style.backgroundColor = "transparent")
       }
     >
-      {/* Name */}
-      <td className="px-4 py-4 align-top w-36">
-        <EditableText
-          value={agent.name}
-          onSave={(v) => onUpdate(agent.id, { name: v })}
-        />
-        <div className="text-xs mt-0.5" style={{ color: "var(--fg-subtle)" }}>
-          {agent.role}
+      <td className="px-4 py-4 align-top w-44">
+        <div
+          className="text-sm font-medium break-all"
+          style={{ color: "var(--fg-default)" }}
+        >
+          {agent.ens_name}
+        </div>
+        <div className="text-xs mt-1" style={{ color: "var(--fg-subtle)" }}>
+          Role:{" "}
+          <EditableText
+            value={agent.role}
+            onSave={(v) => onUpdate(agent.ens_name, { role: v })}
+          />
         </div>
       </td>
 
-      {/* Created */}
       <td
         className="px-4 py-4 align-top text-sm whitespace-nowrap"
         style={{ color: "var(--fg-muted)" }}
@@ -518,15 +510,13 @@ function AgentRow({
         {formatDate(agent.created_at)}
       </td>
 
-      {/* Capabilities */}
       <td className="px-4 py-4 align-top min-w-48">
         <EditableCapabilities
           value={agent.capabilities}
-          onSave={(v) => onUpdate(agent.id, { capabilities: v })}
+          onSave={(v) => onUpdate(agent.ens_name, { capabilities: v })}
         />
       </td>
 
-      {/* Reputation */}
       <td
         className="px-4 py-4 align-top text-sm text-right tabular-nums"
         style={{ color: "var(--fg-default)" }}
@@ -534,7 +524,6 @@ function AgentRow({
         {agent.reputation_score.toLocaleString()}
       </td>
 
-      {/* Wallet */}
       <td
         className="px-4 py-4 align-top text-sm text-right tabular-nums"
         style={{ color: "var(--fg-muted)" }}
@@ -542,39 +531,17 @@ function AgentRow({
         {agent.wallet_balance.toFixed(4)} ETH
       </td>
 
-      {/* Max bounty */}
       <td className="px-4 py-4 align-top text-right w-32">
         <EditableText
-          value={agent.max_bounty_spent.toFixed(4)}
+          value={agent.max_bounty_spend.toFixed(4)}
           onSave={(v) => {
             const n = parseFloat(v);
-            if (!isNaN(n)) onUpdate(agent.id, { max_bounty_spent: n });
+            if (!isNaN(n)) onUpdate(agent.ens_name, { max_bounty_spend: n });
           }}
         />
         <span className="text-xs ml-1" style={{ color: "var(--fg-subtle)" }}>
           ETH
         </span>
-      </td>
-
-      {/* Delete */}
-      <td className="px-4 py-4 align-top text-center">
-        <button
-          onClick={() => onDelete(agent.id)}
-          className="px-3 py-1 rounded text-xs font-medium transition-all"
-          style={{
-            color: "#ef4444",
-            backgroundColor: "rgba(239,68,68,0.08)",
-            border: "1px solid rgba(239,68,68,0.2)",
-          }}
-          onMouseEnter={(e) => {
-            e.currentTarget.style.backgroundColor = "rgba(239,68,68,0.18)";
-          }}
-          onMouseLeave={(e) => {
-            e.currentTarget.style.backgroundColor = "rgba(239,68,68,0.08)";
-          }}
-        >
-          Delete
-        </button>
       </td>
     </tr>
   );
@@ -588,6 +555,7 @@ export default function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
+  const [updateErr, setUpdateErr] = useState<string | null>(null);
 
   const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
 
@@ -609,22 +577,33 @@ export default function AgentsPage() {
     load(page);
   }, [page]);
 
-  const handleUpdate = (id: string, patch: Partial<Agent>) => {
-    setAgents((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, ...patch } : a)),
-    );
-    // TODO: PATCH /agents/:id
-  };
-
-  const handleDelete = (id: string) => {
-    setAgents((prev) => prev.filter((a) => a.id !== id));
-    setTotal((t) => t - 1);
-    // TODO: DELETE /agents/:id
-  };
-
-  const handleAdd = (agent: Agent) => {
-    setAgents((prev) => [agent, ...prev]);
-    setTotal((t) => t + 1);
+  const handleUpdate = async (
+    ensName: string,
+    patch: Partial<Pick<Agent, "role" | "capabilities" | "max_bounty_spend">>,
+  ) => {
+    setUpdateErr(null);
+    const body: {
+      role?: string;
+      capabilities?: string[];
+      max_bounty_spend?: number;
+    } = {};
+    if (patch.role !== undefined) body.role = patch.role;
+    if (patch.capabilities !== undefined) body.capabilities = patch.capabilities;
+    if (patch.max_bounty_spend !== undefined)
+      body.max_bounty_spend = patch.max_bounty_spend;
+    if (Object.keys(body).length === 0) return;
+    try {
+      const updated = await agentApi.patch(ensName, body);
+      setAgents((prev) =>
+        prev.map((a) =>
+          a.ens_name === ensName ? mapAgent(updated as ApiAgent) : a,
+        ),
+      );
+    } catch (e) {
+      setUpdateErr(
+        e instanceof Error ? e.message : "Failed to update agent",
+      );
+    }
   };
 
   return (
@@ -674,6 +653,12 @@ export default function AgentsPage() {
           </button>
         </div>
 
+        {updateErr && (
+          <p className="mb-4 text-sm" style={{ color: "#f87171" }}>
+            {updateErr}
+          </p>
+        )}
+
         {/* ── Table ── */}
         <div
           className="rounded-xl overflow-hidden"
@@ -711,7 +696,7 @@ export default function AgentsPage() {
                     color: "var(--fg-subtle)",
                   }}
                 >
-                  <th className="px-4 py-3 text-left font-medium">Name</th>
+                  <th className="px-4 py-3 text-left font-medium">Agent</th>
                   <th className="px-4 py-3 text-left font-medium">Created</th>
                   <th className="px-4 py-3 text-left font-medium">
                     Capabilities
@@ -723,7 +708,6 @@ export default function AgentsPage() {
                   <th className="px-4 py-3 text-right font-medium">
                     Max Bounty
                   </th>
-                  <th className="px-4 py-3 text-center font-medium"></th>
                 </tr>
               </thead>
               <tbody>
@@ -732,7 +716,6 @@ export default function AgentsPage() {
                     key={agent.id}
                     agent={agent}
                     onUpdate={handleUpdate}
-                    onDelete={handleDelete}
                   />
                 ))}
               </tbody>
@@ -778,7 +761,13 @@ export default function AgentsPage() {
         )}
       </main>
       {showModal && (
-        <AddAgentModal onClose={() => setShowModal(false)} onAdd={handleAdd} />
+        <AddAgentModal
+          onClose={() => setShowModal(false)}
+          onCreated={() => {
+            setPage(1);
+            void load(1);
+          }}
+        />
       )}
     </div>
   );

@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import * as sdk from '../sdk';
 import { query, queryOne } from '../db/client';
+import { parseListPagination, paginationMeta } from '../lib/pagination';
 import { env } from '../env';
 import { requireAuth } from '../middleware/auth';
 import { getGitHubTokenForUser } from '../services/github-integration';
@@ -12,22 +13,18 @@ export async function repositoryRoutes(app: FastifyInstance) {
    */
   app.post('/import-from-github', { preHandler: requireAuth }, async (req, reply) => {
     const body = req.body as {
-      owner_ens?: string;
       github_owner?: string;
       github_repo?: string;
       github_default_branch?: string;
       name?: string;
       description?: string;
-      repo_type?: 'general' | 'academia';
-      academia_field?: string;
     };
 
-    const ownerEns = body.owner_ens?.trim();
     const ghOwner = body.github_owner?.trim().toLowerCase();
     const ghRepo = body.github_repo?.trim().toLowerCase();
-    if (!ownerEns || !ghOwner || !ghRepo) {
+    if (!ghOwner || !ghRepo) {
       return reply.status(400).send({
-        error: 'owner_ens, github_owner, and github_repo are required',
+        error: 'github_owner and github_repo are required',
         code: 'VALIDATION_ERROR',
       });
     }
@@ -59,17 +56,6 @@ export async function repositoryRoutes(app: FastifyInstance) {
       });
     }
 
-    const agentOk = await queryOne<{ id: string }>(
-      `SELECT id FROM agents WHERE lower(ens_name) = lower($1) AND user_id = $2`,
-      [ownerEns, req.user!.userId],
-    );
-    if (!agentOk) {
-      return reply.status(403).send({
-        error: 'Agent not found or not linked to your account',
-        code: 'AGENT_NOT_OWNED',
-      });
-    }
-
     const dup = await queryOne<{ id: string }>(
       `SELECT id FROM repositories
        WHERE lower(github_owner) = $1 AND lower(github_repo) = $2`,
@@ -86,16 +72,13 @@ export async function repositoryRoutes(app: FastifyInstance) {
     const defaultBranch = body.github_default_branch?.trim() || 'main';
     const displayName = (body.name?.trim() || ghRepo) as string;
     const description = body.description != null ? String(body.description) : '';
-    const repoType = body.repo_type === 'academia' ? 'academia' : 'general';
-    const academiaField = body.academia_field?.trim();
 
     let createdId: string | null = null;
     try {
-      const repo = await sdk.createRepository(
+      const repo = await sdk.createRepositoryImportedFromGitHub(
+        req.user!.userId,
         displayName,
-        ownerEns,
         description,
-        'public',
       );
       createdId = repo.id;
 
@@ -158,40 +141,34 @@ export async function repositoryRoutes(app: FastifyInstance) {
     );
   });
 
-  // Create repository (internal-only; no GitHub link — use import-from-github for GitHub + webhook)
-  app.post('/', { preHandler: requireAuth }, async (req, reply) => {
-    const { name, owner_ens, description } = req.body as Record<string, unknown>;
-    if (!name || !owner_ens) return reply.status(400).send({ error: 'name and owner_ens are required' });
-    try {
-      const repo = await sdk.createRepository(
-        String(name),
-        String(owner_ens),
-        description != null ? String(description) : ''
-      );
-      return reply.status(201).send(repo);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return reply.status(400).send({ error: msg });
-    }
-  });
-
-  // List all repositories (with owner ens + branch count + type filtering)
-  app.get('/', async (req, reply) => {
-    const params: any[] = [];
-    const typeFilter = '';
-
-    const repos = await query(
+  // List repositories for the authenticated user (imports they created)
+  app.get('/', { preHandler: requireAuth }, async (req, reply) => {
+    const { limit, offset } = parseListPagination(req.query as Record<string, unknown>, {
+      limit: 20,
+      maxLimit: 100,
+    });
+    const uid = req.user!.userId;
+    const rows = await query(
       `SELECT r.*, a.ens_name as owner_ens,
               (SELECT COUNT(*) FROM branches WHERE repo_id = r.id) as branch_count,
               (SELECT COUNT(*) FROM commits WHERE repo_id = r.id) as commit_count,
               (SELECT COUNT(*) FROM issues WHERE repo_id = r.id AND status = 'open') as open_issues
        FROM repositories r
        JOIN agents a ON r.owner_agent_id = a.id
-       ${typeFilter}
-       ORDER BY r.created_at DESC`,
-      params
+       WHERE r.imported_by_user_id = $1
+       ORDER BY r.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [uid, limit, offset],
     );
-    return repos;
+    const countRow = await queryOne<{ c: string }>(
+      `SELECT COUNT(*)::text as c FROM repositories WHERE imported_by_user_id = $1`,
+      [uid],
+    );
+    const total = parseInt(countRow?.c ?? '0', 10);
+    return {
+      data: rows,
+      pagination: paginationMeta(total, limit, offset),
+    };
   });
 
   /**
@@ -199,6 +176,13 @@ export async function repositoryRoutes(app: FastifyInstance) {
    */
   app.patch('/:id/github', { preHandler: requireAuth }, async (req, reply) => {
     const { id } = req.params as { id: string };
+    const owned = await queryOne<{ id: string }>(
+      `SELECT id FROM repositories WHERE id = $1 AND imported_by_user_id = $2`,
+      [id, req.user!.userId],
+    );
+    if (!owned) {
+      return reply.status(404).send({ error: 'Repository not found' });
+    }
     const body = req.body as {
       github_owner?: string;
       github_repo?: string;
@@ -240,13 +224,14 @@ export async function repositoryRoutes(app: FastifyInstance) {
     return out;
   });
 
-  // Get single repository
-  app.get('/:id', async (req, reply) => {
-    const { id } = req.params as any;
+  // Get single repository (must be imported by current user)
+  app.get('/:id', { preHandler: requireAuth }, async (req, reply) => {
+    const { id } = req.params as { id: string };
     const repo = await queryOne(
       `SELECT r.*, a.ens_name as owner_ens FROM repositories r
-       JOIN agents a ON r.owner_agent_id = a.id WHERE r.id = $1`,
-      [id]
+       JOIN agents a ON r.owner_agent_id = a.id
+       WHERE r.id = $1 AND r.imported_by_user_id = $2`,
+      [id, req.user!.userId],
     );
     if (!repo) return reply.status(404).send({ error: 'Repository not found' });
     return repo;

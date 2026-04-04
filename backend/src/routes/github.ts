@@ -4,7 +4,6 @@ import { requireAuth } from "../middleware/auth";
 import {
   fetchGitHubUserReposPage,
   getGitHubTokenForUser,
-  upsertGithubInstallation,
 } from "../services/github-integration";
 
 const reposQuerySchema = z.object({
@@ -13,54 +12,6 @@ const reposQuerySchema = z.object({
 });
 
 export async function githubIntegrationRoutes(app: FastifyInstance) {
-  app.post(
-    "/github/app/callback",
-    { preHandler: requireAuth },
-    async (req, reply) => {
-      const body = req.body as {
-        installation_id?: number;
-        account_login?: string;
-        app_id?: number;
-        pem_encrypted?: string;
-        webhook_secret?: string;
-      };
-
-      const installationId = Number(body.installation_id);
-      const accountLogin = body.account_login?.trim();
-      const appId = Number(body.app_id || process.env.GITHUB_APP_ID || 0);
-      const pemEncrypted = body.pem_encrypted?.trim() || "configured-via-env";
-      const webhookSecret =
-        body.webhook_secret?.trim() || process.env.GITHUB_WEBHOOK_SECRET || "";
-
-      if (!Number.isFinite(installationId) || installationId <= 0) {
-        return reply.status(400).send({ error: "installation_id is required" });
-      }
-      if (!accountLogin) {
-        return reply.status(400).send({ error: "account_login is required" });
-      }
-      if (!Number.isFinite(appId) || appId <= 0) {
-        return reply.status(400).send({ error: "app_id is required" });
-      }
-      if (!webhookSecret) {
-        return reply.status(400).send({ error: "webhook_secret is required" });
-      }
-
-      await upsertGithubInstallation({
-        installationId,
-        accountLogin,
-        appId,
-        pemEncrypted,
-        webhookSecret,
-      });
-
-      return {
-        ok: true,
-        installation_id: installationId,
-        account_login: accountLogin,
-      };
-    },
-  );
-
   app.get("/github/repos", { preHandler: requireAuth }, async (req, reply) => {
     const parsed = reposQuerySchema.safeParse(req.query);
     if (!parsed.success) {

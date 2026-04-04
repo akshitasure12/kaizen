@@ -1,95 +1,17 @@
-import crypto from "crypto";
 import { Octokit } from "@octokit/rest";
-import { env } from "../env";
 import { query, queryOne } from "../db/client";
 
+/** GitHub remote for a Kaizen repo (from `repositories.github_*` after PAT import). */
 export interface GitHubLinkRow {
   repo_id: string;
   github_owner: string;
   github_repo: string;
   default_branch: string;
-  installation_id: string;
-}
-
-interface InstallationAccessToken {
-  token: string;
-  expiresAt: Date;
-}
-
-const installationTokenCache = new Map<string, InstallationAccessToken>();
-
-function requireGithubAppConfig(): { appId: string; privateKeyPem: string } {
-  const appId = env.GITHUB_APP_ID?.trim();
-  const privateKeyPem = env.GITHUB_APP_PRIVATE_KEY?.trim();
-  if (!appId || !privateKeyPem) {
-    throw new Error("GitHub App credentials are not configured");
-  }
-  return { appId, privateKeyPem };
-}
-
-function toBase64Url(input: Buffer | string): string {
-  return Buffer.from(input)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-
-function buildGithubAppJwt(appId: string, privateKeyPem: string): string {
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iat: now - 60,
-    exp: now + 9 * 60,
-    iss: appId,
-  };
-
-  const encodedHeader = toBase64Url(JSON.stringify(header));
-  const encodedPayload = toBase64Url(JSON.stringify(payload));
-  const body = `${encodedHeader}.${encodedPayload}`;
-  const signer = crypto.createSign("RSA-SHA256");
-  signer.update(body);
-  signer.end();
-  const signature = signer.sign(privateKeyPem);
-  return `${body}.${toBase64Url(signature)}`;
-}
-
-function isFresh(cached: InstallationAccessToken | undefined): cached is InstallationAccessToken {
-  if (!cached) return false;
-  return cached.expiresAt.getTime() - Date.now() > 30_000;
-}
-
-export async function getGitHubAppInstallationToken(installationId: number | string): Promise<string> {
-  const installationKey = String(installationId);
-  const cached = installationTokenCache.get(installationKey);
-  if (isFresh(cached)) {
-    return cached.token;
-  }
-
-  const { appId, privateKeyPem } = requireGithubAppConfig();
-  const jwt = buildGithubAppJwt(appId, privateKeyPem);
-  const octokit = new Octokit({ auth: jwt });
-  const { data } = await octokit.request("POST /app/installations/{installation_id}/access_tokens", {
-    installation_id: Number(installationKey),
-    headers: {
-      "x-github-api-version": "2022-11-28",
-    },
-  });
-
-  installationTokenCache.set(installationKey, {
-    token: data.token,
-    expiresAt: new Date(data.expires_at),
-  });
-  return data.token;
 }
 
 export async function repositoryHasGitHubLink(repoId: string): Promise<boolean> {
   const row = await queryOne<{ one: number }>(
     `SELECT 1 AS one
-     FROM github_repo_links
-     WHERE repository_id = $1
-     UNION ALL
-     SELECT 1 AS one
      FROM repositories
      WHERE id = $1
        AND github_owner IS NOT NULL
@@ -104,39 +26,28 @@ export async function repositoryHasGitHubLink(repoId: string): Promise<boolean> 
 
 export async function getGitHubLinkForRepo(repoId: string): Promise<GitHubLinkRow | null> {
   const row = await queryOne<{
-    repo_id: string;
-    owner: string;
-    name: string;
-    default_branch: string | null;
-    installation_id: string;
+    id: string;
+    github_owner: string | null;
+    github_repo: string | null;
+    github_default_branch: string | null;
   }>(
-    `SELECT grl.repository_id AS repo_id,
-            grl.owner,
-            grl.name,
-            grl.default_branch,
-            grl.installation_id::text AS installation_id
-     FROM github_repo_links grl
-     WHERE grl.repository_id = $1`,
+    `SELECT id,
+            github_owner,
+            github_repo,
+            github_default_branch
+     FROM repositories
+     WHERE id = $1`,
     [repoId],
   );
-
-  if (!row) {
-    return null;
-  }
-
-  const owner = row.owner.trim();
-  const repo = row.name.trim();
-  const defaultBranch = row.default_branch?.trim() || "main";
-  if (!owner || !repo) {
-    return null;
-  }
-
+  if (!row) return null;
+  const owner = row.github_owner?.trim() ?? "";
+  const name = row.github_repo?.trim() ?? "";
+  if (!owner || !name) return null;
   return {
-    repo_id: row.repo_id,
+    repo_id: row.id,
     github_owner: owner,
-    github_repo: repo,
-    default_branch: defaultBranch,
-    installation_id: row.installation_id,
+    github_repo: name,
+    default_branch: row.github_default_branch?.trim() || "main",
   };
 }
 
@@ -160,67 +71,6 @@ export async function getGitHubTokenForUser(userId: string): Promise<string | nu
   );
   const key = u?.github_api_key?.trim();
   return key || null;
-}
-
-export async function upsertGithubInstallation(input: {
-  installationId: number;
-  accountLogin: string;
-  appId: number;
-  pemEncrypted: string;
-  webhookSecret: string;
-}): Promise<void> {
-  await query(
-    `INSERT INTO github_installations (id, account_login, app_id, pem_encrypted, webhook_secret)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (id)
-     DO UPDATE SET
-       account_login = EXCLUDED.account_login,
-       app_id = EXCLUDED.app_id,
-       pem_encrypted = EXCLUDED.pem_encrypted,
-       webhook_secret = EXCLUDED.webhook_secret`,
-    [
-      input.installationId,
-      input.accountLogin,
-      input.appId,
-      input.pemEncrypted,
-      input.webhookSecret,
-    ],
-  );
-}
-
-export async function upsertGithubRepoLink(input: {
-  repositoryId: string;
-  installationId: number;
-  owner: string;
-  name: string;
-  defaultBranch: string;
-}): Promise<void> {
-  await query(
-    `INSERT INTO github_repo_links (repository_id, installation_id, owner, name, default_branch)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (repository_id)
-     DO UPDATE SET
-       installation_id = EXCLUDED.installation_id,
-       owner = EXCLUDED.owner,
-       name = EXCLUDED.name,
-       default_branch = EXCLUDED.default_branch`,
-    [
-      input.repositoryId,
-      input.installationId,
-      input.owner,
-      input.name,
-      input.defaultBranch,
-    ],
-  );
-
-  await query(
-    `UPDATE repositories
-     SET github_owner = $1,
-         github_repo = $2,
-         github_default_branch = $3
-     WHERE id = $4`,
-    [input.owner, input.name, input.defaultBranch, input.repositoryId],
-  );
 }
 
 const GITHUB_PAT_VALIDATE_TIMEOUT_MS = 15_000;
@@ -416,4 +266,81 @@ export async function fetchGitHubUserReposPage(
       has_prev: Boolean(link.prev),
     },
   };
+}
+
+export type CreateGitHubIssueOutcome =
+  | { status: "created"; number: number }
+  | { status: "skipped" }
+  | { status: "error"; httpStatus: number; message: string };
+
+async function octokitCreateIssue(
+  owner: string,
+  repo: string,
+  title: string,
+  body: string,
+  token: string,
+): Promise<number> {
+  const octokit = new Octokit({ auth: token });
+  const { data } = await octokit.rest.issues.create({
+    owner,
+    repo,
+    title,
+    body: body.trim() ? body : undefined,
+    headers: { "x-github-api-version": "2022-11-28" },
+  });
+  return data.number;
+}
+
+function mapGithubCreateIssueError(err: unknown): { httpStatus: number; message: string } {
+  if (err && typeof err === "object" && "status" in err) {
+    const status = Number((err as { status: number }).status) || 502;
+    let message = "GitHub API error";
+    if ("message" in err && typeof (err as { message: unknown }).message === "string") {
+      message = (err as { message: string }).message;
+    }
+    const httpStatus = status >= 400 && status < 600 ? status : 502;
+    return { httpStatus, message };
+  }
+  if (err instanceof Error) return { httpStatus: 502, message: err.message };
+  return { httpStatus: 502, message: "Failed to create issue on GitHub" };
+}
+
+/**
+ * Create an issue on GitHub for an imported repo (PAT on user + `repositories.github_*`).
+ * Returns `skipped` when the repo has no GitHub remote — caller keeps Kaizen-only issues.
+ */
+export async function createGitHubIssueForImportedRepo(input: {
+  repoId: string;
+  userId: string;
+  title: string;
+  body: string;
+}): Promise<CreateGitHubIssueOutcome> {
+  const link = await getGitHubLinkForRepo(input.repoId);
+  if (!link) {
+    return { status: "skipped" };
+  }
+
+  const pat = await getGitHubTokenForUser(input.userId);
+  if (!pat) {
+    return {
+      status: "error",
+      httpStatus: 403,
+      message:
+        "Repository is linked to GitHub but no personal access token is configured. Set your token with PATCH /auth/github-api-key.",
+    };
+  }
+
+  try {
+    const n = await octokitCreateIssue(
+      link.github_owner,
+      link.github_repo,
+      input.title,
+      input.body,
+      pat,
+    );
+    return { status: "created", number: n };
+  } catch (err) {
+    const m = mapGithubCreateIssueError(err);
+    return { status: "error", httpStatus: m.httpStatus, message: m.message };
+  }
 }

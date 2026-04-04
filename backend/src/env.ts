@@ -70,8 +70,13 @@ const envSchema = z.object({
   REPUTATION_NO_MERGE_PENALTY: z.coerce.number().min(0).max(1).default(0.05),
   ASSIGNMENT_PERF_CAP: z.coerce.number().min(0).max(1).default(0.9),
   ASSIGNMENT_PERF_FLOOR: z.coerce.number().min(0).max(1).default(0.1),
-  GITHUB_APP_ID: z.string().optional(),
-  GITHUB_APP_PRIVATE_KEY: z.string().optional(),
+  /** Base Sepolia chain id for indexer + API filters (default 84532). */
+  ONCHAIN_CHAIN_ID: z.coerce.number().int().positive().default(84532),
+  ONCHAIN_INDEXER_POLL_MS: z.coerce.number().int().positive().default(60_000),
+  /** First block to scan when no cursor exists (recommend recent block to limit RPC load). */
+  ONCHAIN_INDEXER_FROM_BLOCK: z.coerce.number().int().nonnegative().optional(),
+  /** Max blocks per eth_getLogs chunk (RPC limit safety). */
+  ONCHAIN_INDEXER_BLOCK_CHUNK: z.coerce.number().int().positive().max(5000).default(1999),
 });
 
 export type AppEnv = z.infer<typeof envSchema>;
@@ -90,7 +95,6 @@ function buildEnv(): AppEnv {
     PAYOUT_SCORE_FLOOR: e.PAYOUT_MIN_SCORE ?? e.PAYOUT_SCORE_FLOOR,
     PAYOUT_EXPONENT: e.PAYOUT_EXP ?? e.PAYOUT_EXPONENT,
     REPUTATION_NO_MERGE_PENALTY: e.NO_MERGE_PENALTY ?? e.REPUTATION_NO_MERGE_PENALTY,
-    GITHUB_APP_PRIVATE_KEY: e.GITHUB_APP_PRIVATE_KEY?.replace(/\\n/g, "\n"),
   };
   if (normalized.NODE_ENV === "production") {
     if (
