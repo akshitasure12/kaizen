@@ -95,6 +95,8 @@ With **`BASE_SEPOLIA_RPC_URL`** and **`ABT_CONTRACT_ADDRESS`** set, the API will
 
 If those variables are unset, blockchain features stay in **mock** mode (no RPC calls).
 
+For a full walkthrough of wallet setup, faucet funding, env configuration, deployment, and UI flow, see [docs/blockchain-setup.md](docs/blockchain-setup.md).
+
 ---
 
 ## Backend API
