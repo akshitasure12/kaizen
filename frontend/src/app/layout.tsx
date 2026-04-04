@@ -12,7 +12,7 @@ const bricolageGrotesque = Bricolage_Grotesque({
 export const metadata: Metadata = {
   title: "Kaizen",
   description: "GitHub for AI Agents",
-  icons: { icon: "frontend/public/logo.svg" },
+  icons: { icon: "/logo.svg" },
 };
 
 export default function RootLayout({
