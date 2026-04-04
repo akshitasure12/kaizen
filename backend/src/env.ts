@@ -27,6 +27,11 @@ const envSchema = z.object({
   GEMINI_THINKING_BUDGET_MEDIUM: z.coerce.number().int().default(512),
   GEMINI_THINKING_BUDGET_HIGH: z.coerce.number().int().default(2048),
   GITHUB_WEBHOOK_SECRET: z.string().optional(),
+  /** Public URL GitHub POSTs to (same path as Fastify: /integrations/github/webhook). Used when importing a repo (POST /repositories/import-from-github). */
+  GITHUB_WEBHOOK_CALLBACK_URL: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.string().url().optional(),
+  ),
   CORS_ORIGIN: z.string().default("*"),
   INTERNAL_SERVICE_SECRET: z.string().optional(),
   JWT_EXPIRES_IN: z.string().optional(),

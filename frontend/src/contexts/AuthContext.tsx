@@ -10,6 +10,9 @@ import {
 } from "react";
 import { authApi, type Agent } from "@/lib/api";
 
+/** Resolved after login via GET /auth/me; null if /me failed (caller may fall back to PAT onboarding). */
+export type PostAuthGithubFlags = { api_key_configured: boolean } | null;
+
 interface AuthState {
   isAuthenticated: boolean;
   isLoading: boolean;
@@ -17,10 +20,12 @@ interface AuthState {
   agents: Agent[];
   selectedAgent: Agent | null;
   token: string | null;
-  login: (username: string, password: string) => Promise<void>;
+  github: { api_key_configured: boolean } | null;
+  login: (username: string, password: string) => Promise<PostAuthGithubFlags>;
   register: (username: string, password: string) => Promise<void>;
   logout: () => void;
   selectAgent: (agent: Agent) => void;
+  refreshSession: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -32,7 +37,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [github, setGithub] = useState<{ api_key_configured: boolean } | null>(
+    null
+  );
   const [isLoading, setIsLoading] = useState(true);
+
+  const refreshSession = useCallback(async () => {
+    const stored = localStorage.getItem("ab_token");
+    if (!stored) return;
+    const data = await authApi.me();
+    setUser(data.user);
+    setAgents(data.agents ?? []);
+    setGithub(data.github ?? null);
+    if (data.agents?.length) {
+      const savedEns = localStorage.getItem("ab_selected_agent");
+      const found = data.agents.find((a) => a.ens_name === savedEns);
+      setSelectedAgent(found ?? data.agents[0]);
+    } else {
+      setSelectedAgent(null);
+    }
+  }, []);
 
   useEffect(() => {
     const stored = localStorage.getItem("ab_token");
@@ -43,6 +67,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         .then((data) => {
           setUser(data.user);
           setAgents(data.agents ?? []);
+          setGithub(data.github ?? null);
           if (data.agents?.length) {
             const savedEns = localStorage.getItem("ab_selected_agent");
             const found = data.agents.find((a) => a.ens_name === savedEns);
@@ -64,13 +89,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("ab_token", data.token);
     setToken(data.token);
     setUser(data.user);
-    // Fetch agents after login
     try {
       const me = await authApi.me();
       setAgents(me.agents ?? []);
-      if (me.agents?.length) setSelectedAgent(me.agents[0]);
+      setGithub(me.github ?? null);
+      if (me.agents?.length) {
+        const savedEns = localStorage.getItem("ab_selected_agent");
+        const found = me.agents.find((a) => a.ens_name === savedEns);
+        setSelectedAgent(found ?? me.agents[0]);
+      } else {
+        setSelectedAgent(null);
+      }
+      return me.github ?? { api_key_configured: false };
     } catch {
-      /* ignore */
+      return null;
     }
   }, []);
 
@@ -79,6 +111,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("ab_token", data.token);
     setToken(data.token);
     setUser(data.user);
+    try {
+      const me = await authApi.me();
+      setAgents(me.agents ?? []);
+      setGithub(me.github ?? null);
+      if (me.agents?.length) {
+        const savedEns = localStorage.getItem("ab_selected_agent");
+        const found = me.agents.find((a) => a.ens_name === savedEns);
+        setSelectedAgent(found ?? me.agents[0]);
+      } else {
+        setSelectedAgent(null);
+      }
+    } catch {
+      /* session hydrated on next /me */
+    }
   }, []);
 
   const logout = useCallback(() => {
@@ -88,6 +134,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
     setAgents([]);
     setSelectedAgent(null);
+    setGithub(null);
   }, []);
 
   const selectAgent = useCallback((agent: Agent) => {
@@ -104,10 +151,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         agents,
         selectedAgent,
         token,
+        github,
         login,
         register,
         logout,
         selectAgent,
+        refreshSession,
       }}
     >
       {children}

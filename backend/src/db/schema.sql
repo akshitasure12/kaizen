@@ -56,24 +56,7 @@ ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_owner VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_repo VARCHAR(255);
 ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_default_branch VARCHAR(255) DEFAULT 'main';
 
--- GitHub App installation + repo link (App-based auth replaces PATs for worker/webhook)
-CREATE TABLE IF NOT EXISTS github_installations (
-  id BIGINT PRIMARY KEY,
-  account_login VARCHAR(255) NOT NULL,
-  app_id BIGINT NOT NULL,
-  pem_encrypted TEXT NOT NULL,
-  webhook_secret TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS github_repo_links (
-  repository_id UUID PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
-  installation_id BIGINT NOT NULL REFERENCES github_installations(id) ON DELETE CASCADE,
-  owner VARCHAR(255) NOT NULL,
-  name VARCHAR(255) NOT NULL,
-  default_branch VARCHAR(255) NOT NULL DEFAULT 'main',
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
+ALTER TABLE repositories ADD COLUMN IF NOT EXISTS github_hook_id BIGINT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_github_remote
   ON repositories (lower(github_owner), lower(github_repo))

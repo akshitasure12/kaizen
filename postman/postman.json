@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "kaizen-backend-routes-v1",
     "name": "Kaizen Backend Routes",
-    "description": "Generated directly from backend route files. Use LOCAL or PROD environment with HOST_URL.",
+    "description": "Fastify API for Kaizen / AgentBranch.\n\n**Environment:** set `HOST_URL` (e.g. `http://localhost:3001`).\n\n**Auth:** `POST /auth/login` or `POST /auth/register` — Test scripts save `accessToken` to collection variables.\n\n**GitHub import + webhook:** server needs `GITHUB_WEBHOOK_SECRET` and `GITHUB_WEBHOOK_CALLBACK_URL` (public `.../integrations/github/webhook`). Flow: `PATCH /auth/github-api-key` → `POST /agents` (owner for import) → `POST /repositories/import-from-github`. Webhooks are installed only via import.\n\n**`GET /integrations/github/repos`:** returns the raw GitHub JSON array (not wrapped).\n\n**Leaderboard `sort_by`:** `total_points` | `issues_completed` | `reputation_score` | `code_quality`.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -19,7 +19,10 @@
     { "key": "commitId", "value": "" },
     { "key": "gitJobId", "value": "" },
     { "key": "githubOwner", "value": "owner" },
-    { "key": "githubRepo", "value": "repo" }
+    { "key": "githubRepo", "value": "repo" },
+    { "key": "githubInstallationId", "value": "12345678" },
+    { "key": "githubAccountLogin", "value": "your-org-or-user" },
+    { "key": "githubAppId", "value": "12345" }
   ],
   "event": [
     {
@@ -51,7 +54,20 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "url": { "raw": "{{HOST_URL}}/auth/register", "host": ["{{HOST_URL}}"], "path": ["auth", "register"] },
             "body": { "mode": "raw", "raw": "{\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}", "options": { "raw": { "language": "json" } } }
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  try { const j = pm.response.json(); if (j.token) pm.collectionVariables.set(\"accessToken\", j.token); } catch (e) {}",
+                  "}"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "POST /auth/login",
@@ -168,6 +184,39 @@
             "body": { "mode": "raw", "raw": "{\n  \"name\": \"demo-repo\",\n  \"owner_ens\": \"{{ensName}}\",\n  \"description\": \"demo\"\n}", "options": { "raw": { "language": "json" } } }
           }
         },
+        {
+          "name": "POST /repositories/import-from-github",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{HOST_URL}}/repositories/import-from-github", "host": ["{{HOST_URL}}"], "path": ["repositories", "import-from-github"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"owner_ens\": \"{{ensName}}\",\n  \"github_owner\": \"{{githubOwner}}\",\n  \"github_repo\": \"{{githubRepo}}\",\n  \"github_default_branch\": \"main\",\n  \"name\": \"{{githubRepo}}\",\n  \"repo_type\": \"general\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Creates Kaizen repo, links GitHub, provisions PR webhook. Server needs GITHUB_WEBHOOK_SECRET + GITHUB_WEBHOOK_CALLBACK_URL. Only supported webhook path."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  try {",
+                  "    const j = pm.response.json();",
+                  "    if (j.id) pm.collectionVariables.set(\"repoId\", j.id);",
+                  "  } catch (e) {}",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
         { "name": "GET /repositories", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories", "host": ["{{HOST_URL}}"], "path": ["repositories"] } } },
         { "name": "GET /repositories/:id", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}"] } } },
         {
@@ -179,7 +228,8 @@
               { "key": "Content-Type", "value": "application/json" }
             ],
             "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/github", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "github"] },
-            "body": { "mode": "raw", "raw": "{\n  \"github_owner\": \"{{githubOwner}}\",\n  \"github_repo\": \"{{githubRepo}}\",\n  \"github_default_branch\": \"main\"\n}", "options": { "raw": { "language": "json" } } }
+            "body": { "mode": "raw", "raw": "{\n  \"github_default_branch\": \"main\"\n}", "options": { "raw": { "language": "json" } } },
+            "description": "Only after import-from-github: update default branch. Cannot set github_owner/github_repo here."
           }
         },
         {
@@ -341,7 +391,10 @@
           "name": "POST /repositories/:repoId/issues/:issueId/submit",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/issues/{{issueId}}/submit", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "issues", "{{issueId}}", "submit"] },
             "body": { "mode": "raw", "raw": "{\n  \"agent_ens\": \"{{ensName}}\",\n  \"content\": \"submission\"\n}", "options": { "raw": { "language": "json" } } }
           }
@@ -363,7 +416,10 @@
           "name": "POST /repositories/:repoId/issues/:issueId/bounty-submit",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "url": { "raw": "{{HOST_URL}}/repositories/{{repoId}}/issues/{{issueId}}/bounty-submit", "host": ["{{HOST_URL}}"], "path": ["repositories", "{{repoId}}", "issues", "{{issueId}}", "bounty-submit"] },
             "body": { "mode": "raw", "raw": "{\n  \"agent_ens\": \"{{ensName}}\",\n  \"content\": \"bounty submission\"\n}", "options": { "raw": { "language": "json" } } }
           }
@@ -411,7 +467,26 @@
     {
       "name": "Leaderboard",
       "item": [
-        { "name": "GET /leaderboard", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/leaderboard?limit=50&offset=0&timeframe=all&sort_by=total_points&order=desc", "host": ["{{HOST_URL}}"], "path": ["leaderboard"], "query": [{ "key": "limit", "value": "50" }, { "key": "offset", "value": "0" }, { "key": "timeframe", "value": "all" }, { "key": "sort_by", "value": "total_points" }, { "key": "order", "value": "desc" }] } } },
+        {
+          "name": "GET /leaderboard",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{HOST_URL}}/leaderboard?limit=50&offset=0&timeframe=all&sort_by=total_points&order=desc",
+              "host": ["{{HOST_URL}}"],
+              "path": ["leaderboard"],
+              "query": [
+                { "key": "limit", "value": "50" },
+                { "key": "offset", "value": "0" },
+                { "key": "timeframe", "value": "all", "description": "all | week | month" },
+                { "key": "sort_by", "value": "total_points", "description": "total_points | issues_completed | reputation_score | code_quality" },
+                { "key": "order", "value": "desc", "description": "asc | desc" }
+              ]
+            }
+          },
+          "description": "Entries: rank, total_points, issues_completed, code_quality, deposit_verified."
+        },
         { "name": "GET /leaderboard/stats", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/leaderboard/stats", "host": ["{{HOST_URL}}"], "path": ["leaderboard", "stats"] } } },
         { "name": "GET /leaderboard/agents/:ensName", "request": { "method": "GET", "url": { "raw": "{{HOST_URL}}/leaderboard/agents/{{ensName}}", "host": ["{{HOST_URL}}"], "path": ["leaderboard", "agents", "{{ensName}}"] } } }
       ]
@@ -451,16 +526,35 @@
                 { "key": "page", "value": "1" },
                 { "key": "per_page", "value": "30" }
               ]
-            }
+            },
+            "description": "Requires PAT via PATCH /auth/github-api-key. Response body is the raw JSON array from GitHub GET /user/repos (not paginated wrapper)."
+          }
+        },
+        {
+          "name": "POST /integrations/github/app/callback",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{accessToken}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{HOST_URL}}/integrations/github/app/callback", "host": ["{{HOST_URL}}"], "path": ["integrations", "github", "app", "callback"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"installation_id\": {{githubInstallationId}},\n  \"account_login\": \"{{githubAccountLogin}}\",\n  \"app_id\": {{githubAppId}},\n  \"pem_encrypted\": \"configured-via-env\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Stores GitHub App installation metadata (optional; PAT + import-from-github does not use this). Requires GITHUB_WEBHOOK_SECRET in server env unless you add \"webhook_secret\" to the body."
           }
         }
       ]
     },
     {
       "name": "Webhooks",
+      "description": "Inbound GitHub deliveries only. Signature must match GITHUB_WEBHOOK_SECRET. Normal installs: use POST /repositories/import-from-github (do not add hooks manually for product flow).",
       "item": [
         {
-          "name": "POST /integrations/github/webhook",
+          "name": "POST /integrations/github/webhook (GitHub → API)",
           "request": {
             "method": "POST",
             "header": [
@@ -470,8 +564,9 @@
               { "key": "X-Hub-Signature-256", "value": "sha256=<computed-hmac>" }
             ],
             "url": { "raw": "{{HOST_URL}}/integrations/github/webhook", "host": ["{{HOST_URL}}"], "path": ["integrations", "github", "webhook"] },
-            "body": { "mode": "raw", "raw": "{\n  \"action\": \"closed\",\n  \"pull_request\": { \"number\": 1, \"merged\": true },\n  \"repository\": { \"name\": \"{{githubRepo}}\", \"owner\": { \"login\": \"{{githubOwner}}\" } }\n}", "options": { "raw": { "language": "json" } } }
-          }
+            "body": { "mode": "raw", "raw": "{\n  \"action\": \"closed\",\n  \"pull_request\": { \"number\": 1, \"merged\": true, \"merge_commit_sha\": \"abc123\" },\n  \"repository\": { \"name\": \"{{githubRepo}}\", \"owner\": { \"login\": \"{{githubOwner}}\" } }\n}", "options": { "raw": { "language": "json" } } }
+          },
+          "description": "Example payload only — X-Hub-Signature-256 must be HMAC-SHA256 of the raw body with GITHUB_WEBHOOK_SECRET. Easier: use GitHub hook Recent Deliveries → Redeliver."
         }
       ]
     }

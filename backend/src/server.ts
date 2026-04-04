@@ -1,5 +1,5 @@
 import cors from "@fastify/cors";
-import Fastify from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 import fastifyRawBody from "fastify-raw-body";
 import { env } from "./env";
 import { authPlugin } from "./middleware/auth";
@@ -17,7 +17,10 @@ import { githubWebhookRoutes } from "./routes/github-webhook";
 import { gitJobRoutes } from "./routes/git-jobs";
 import { isEmbeddingsEnabled } from "./services/embeddings";
 import { isRealJudge } from "./services/judge";
-import { isBlockchainEnabled, getBlockchainConfig } from "./services/blockchain";
+import {
+  isBlockchainEnabled,
+  getBlockchainConfig,
+} from "./services/blockchain";
 
 function parseCorsOrigin(raw: string): boolean | string | string[] {
   const t = raw.trim();
@@ -30,9 +33,38 @@ function parseCorsOrigin(raw: string): boolean | string | string[] {
   return parts;
 }
 
+function redactHeaders(headers: FastifyRequest["headers"]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (lower === "authorization" || lower === "cookie") {
+      out[k] = "[REDACTED]";
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 async function buildApp() {
   const app = Fastify({
-    logger: env.NODE_ENV === "development",
+    logger:
+      env.NODE_ENV === "development"
+        ? {
+            level: "info",
+            serializers: {
+              req(req: FastifyRequest) {
+                return {
+                  method: req.method,
+                  url: req.url,
+                  remoteAddress: req.ip,
+                  remotePort: req.socket?.remotePort,
+                  headers: redactHeaders(req.headers),
+                };
+              },
+            },
+          }
+        : false,
   });
 
   await app.register(cors, {
@@ -72,8 +104,9 @@ async function buildApp() {
     hasGemini: Boolean(env.GEMINI_API_KEY),
     github: {
       webhook: Boolean(env.GITHUB_WEBHOOK_SECRET),
-      appConfigured: Boolean(env.GITHUB_APP_ID && env.GITHUB_APP_PRIVATE_KEY),
-      legacyUserApiKey: "PATCH /auth/github-api-key",
+      webhookCallbackUrlConfigured: Boolean(env.GITHUB_WEBHOOK_CALLBACK_URL),
+      importRepoAndWebhook: "POST /repositories/import-from-github",
+      userApiKey: "PATCH /auth/github-api-key",
     },
     corsOrigin: env.CORS_ORIGIN === "*" ? "*" : "[set]",
     features: {

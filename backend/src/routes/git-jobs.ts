@@ -10,14 +10,18 @@ import { enqueueGitJob } from "../services/git-job-enqueue";
 import { getGitHubLinkForRepo } from "../services/github-integration";
 import * as sdk from "../sdk";
 
-function hasInternalAccess(headerValue: string | string[] | undefined): boolean {
+function hasInternalAccess(
+  headerValue: string | string[] | undefined,
+): boolean {
   if (!env.INTERNAL_SERVICE_SECRET) return false;
   const value = Array.isArray(headerValue) ? headerValue[0] : headerValue;
   return value === env.INTERNAL_SERVICE_SECRET;
 }
 
 function requireInternal(req: { headers: Record<string, unknown> }): boolean {
-  return hasInternalAccess(req.headers["x-internal-service-secret"] as string | string[] | undefined);
+  return hasInternalAccess(
+    req.headers["x-internal-service-secret"] as string | string[] | undefined,
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -38,7 +42,14 @@ export async function gitJobRoutes(app: FastifyInstance) {
         max_attempts?: number;
         fanout_children?: boolean;
       };
-      const { issue_id, agent_ens, base_branch, idempotency_key, max_attempts, fanout_children } = body;
+      const {
+        issue_id,
+        agent_ens,
+        base_branch,
+        idempotency_key,
+        max_attempts,
+        fanout_children,
+      } = body;
       if (!issue_id) {
         return reply.status(400).send({ error: "issue_id required" });
       }
@@ -52,17 +63,18 @@ export async function gitJobRoutes(app: FastifyInstance) {
           [idempotency_key],
         );
         if (existing) {
-          return reply.status(200).send({ id: existing.id, status: existing.status, deduped: true });
+          return reply
+            .status(200)
+            .send({ id: existing.id, status: existing.status, deduped: true });
         }
       }
 
       const link = await getGitHubLinkForRepo(repoId);
       if (!link) {
-        return reply
-          .status(400)
-          .send({
-            error: "Repository is not linked to a GitHub App installation. Use POST /integrations/github/link first.",
-          });
+        return reply.status(400).send({
+          error:
+            "Import the GitHub repo (POST /repositories/import-from-github) and ensure PAT (PATCH /auth/github-api-key)",
+        });
       }
 
       const issue = await queryOne<{ id: string; repo_id: string }>(
@@ -70,10 +82,15 @@ export async function gitJobRoutes(app: FastifyInstance) {
         [issue_id],
       );
       if (!issue || issue.repo_id !== repoId) {
-        return reply.status(404).send({ error: "Issue not found in this repository" });
+        return reply
+          .status(404)
+          .send({ error: "Issue not found in this repository" });
       }
 
-      const children = await query<{ id: string; assigned_agent_id: string | null }>(
+      const children = await query<{
+        id: string;
+        assigned_agent_id: string | null;
+      }>(
         `SELECT id, assigned_agent_id
          FROM issues
          WHERE parent_issue_id = $1
@@ -91,20 +108,29 @@ export async function gitJobRoutes(app: FastifyInstance) {
         : null;
 
       if (!shouldFanout && !resolvedAgent) {
-        return reply.status(400).send({ error: "agent_ens required for non-fanout job" });
+        return reply
+          .status(400)
+          .send({ error: "agent_ens required for non-fanout job" });
       }
       if (agent_ens && !resolvedAgent) {
         return reply.status(404).send({ error: "Agent not found" });
       }
 
-      const createJob = async (targetIssueId: string, targetAgentId: string, dedupeKey: string | null) => {
+      const createJob = async (
+        targetIssueId: string,
+        targetAgentId: string,
+        dedupeKey: string | null,
+      ) => {
         return enqueueGitJob({
           issue_id: targetIssueId,
           repo_id: repoId,
           user_id: req.user!.userId,
           agent_id: targetAgentId,
           base_branch: base_branch ?? link.default_branch ?? "main",
-          max_attempts: max_attempts && max_attempts > 0 ? Math.floor(max_attempts) : env.WORKER_MAX_ATTEMPTS,
+          max_attempts:
+            max_attempts && max_attempts > 0
+              ? Math.floor(max_attempts)
+              : env.WORKER_MAX_ATTEMPTS,
           idempotency_key: dedupeKey,
           payload: {},
         });
@@ -120,20 +146,29 @@ export async function gitJobRoutes(app: FastifyInstance) {
         );
         if (parentBounty) {
           return reply.status(400).send({
-            error: "Parent issue has direct active bounty; decomposition requires child-only bounty allocation",
+            error:
+              "Parent issue has direct active bounty; decomposition requires child-only bounty allocation",
           });
         }
 
         if (!resolvedAgent && children.some((c) => !c.assigned_agent_id)) {
           return reply.status(400).send({
-            error: "agent_ens required when one or more child issues are unassigned",
+            error:
+              "agent_ens required when one or more child issues are unassigned",
           });
         }
 
-        const jobs: Array<{ child_issue_id: string; id: string; status: string; deduped: boolean }> = [];
+        const jobs: Array<{
+          child_issue_id: string;
+          id: string;
+          status: string;
+          deduped: boolean;
+        }> = [];
         for (const child of children) {
           const childAgentId = child.assigned_agent_id || resolvedAgent!.id;
-          const childKey = idempotency_key ? `${idempotency_key}:${child.id}` : null;
+          const childKey = idempotency_key
+            ? `${idempotency_key}:${child.id}`
+            : null;
           const job = await createJob(child.id, childAgentId, childKey);
           jobs.push({
             child_issue_id: child.id,
@@ -150,7 +185,11 @@ export async function gitJobRoutes(app: FastifyInstance) {
         });
       }
 
-      const single = await createJob(issue_id, resolvedAgent!.id, idempotency_key ?? null);
+      const single = await createJob(
+        issue_id,
+        resolvedAgent!.id,
+        idempotency_key ?? null,
+      );
       const code = single.deduped ? 200 : 201;
       return reply.status(code).send({
         id: single.id,
@@ -202,7 +241,8 @@ export async function gitJobRoutes(app: FastifyInstance) {
     }
     const { id } = req.params as { id: string };
     const body = req.body as { stage?: string; payload?: unknown };
-    if (!body.stage) return reply.status(400).send({ error: "stage is required" });
+    if (!body.stage)
+      return reply.status(400).send({ error: "stage is required" });
     const [row] = await query<{ id: string; stage: string }>(
       `UPDATE git_jobs
        SET stage = $1,
@@ -221,7 +261,10 @@ export async function gitJobRoutes(app: FastifyInstance) {
       return reply.status(401).send({ error: "Unauthorized" });
     }
     const { id } = req.params as { id: string };
-    const body = (req.body as { branch_name?: string; github_pr_number?: number } | undefined) ?? {};
+    const body =
+      (req.body as
+        | { branch_name?: string; github_pr_number?: number }
+        | undefined) ?? {};
     const [row] = await query<{ id: string; status: string; stage: string }>(
       `UPDATE git_jobs
        SET status = 'completed',
@@ -262,7 +305,13 @@ export async function gitJobRoutes(app: FastifyInstance) {
         ? Math.floor(body.retry_after_ms)
         : env.WORKER_BASE_RETRY_MS;
 
-    const [row] = await query<{ id: string; status: string; stage: string; attempt_count: number; max_attempts: number }>(
+    const [row] = await query<{
+      id: string;
+      status: string;
+      stage: string;
+      attempt_count: number;
+      max_attempts: number;
+    }>(
       `UPDATE git_jobs
        SET status = CASE
              WHEN COALESCE($1, false) = true AND attempt_count < max_attempts THEN 'pending'
@@ -285,7 +334,13 @@ export async function gitJobRoutes(app: FastifyInstance) {
            updated_at = NOW()
        WHERE id = $5
        RETURNING id, status, stage, attempt_count, max_attempts`,
-      [body.retryable ?? false, body.classification ?? null, body.error_message ?? null, retryAfterMs, id],
+      [
+        body.retryable ?? false,
+        body.classification ?? null,
+        body.error_message ?? null,
+        retryAfterMs,
+        id,
+      ],
     );
     if (!row) return reply.status(404).send({ error: "Job not found" });
     return row;

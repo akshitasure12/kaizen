@@ -113,6 +113,8 @@ From the repo root `.env`, set at minimum:
 
 For **on-chain** agent deposit verification, also set **`BASE_SEPOLIA_RPC_URL`** and **`ABT_CONTRACT_ADDRESS`** as in the blockchain section.
 
+For **GitHub PR webhooks** (merge/refund), set **`GITHUB_WEBHOOK_SECRET`** and **`GITHUB_WEBHOOK_CALLBACK_URL`**. Linking a GitHub remote and installing the webhook happens only via **`POST /repositories/import-from-github`** (dashboard **Import from GitHub**). See [docs/github-webhook-testing.md](docs/github-webhook-testing.md).
+
 ### 2. Install dependencies
 
 From the **repo root**:
@@ -174,6 +176,10 @@ bun run dev:worker
 - **Postgres only:** `docker compose up -d postgres`
 - **API + worker + web + Postgres:** `docker compose --profile stack up --build`  
   Point `NEXT_PUBLIC_API_URL` at wherever the browser can reach the API (for real demos, rebuild the `web` image with the public API URL).
+- **GitHub webhooks from localhost:** add profile **`tunnel`** and set `NGROK_AUTHTOKEN` + `GITHUB_WEBHOOK_SECRET` in `.env`, then  
+  `docker compose --profile stack --profile tunnel up --build`  
+  Use **http://localhost:4040** for the public HTTPS URL. Step-by-step: [docs/github-webhook-testing.md](docs/github-webhook-testing.md).
+- **API on host + ngrok CLI:** `bun run tunnel:ngrok` (requires `ngrok` on your `PATH`; forwards to port 3001).
 
 ---
 
