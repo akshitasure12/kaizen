@@ -16,6 +16,7 @@ export const KAIZEN_CLI_EXECUTION_INSTRUCTIONS = [
   "Planning structure:",
   "- edit_commands: must include at least one command expected to modify implementation files.",
   "- verify_commands: include strict verification commands when available.",
+  "- Do not rely on grep/rg/sed/cat/find/ls content checks as the only verification gate; pair with executable test/lint/build checks whenever possible.",
   "- fix_commands: include targeted repair commands for likely verification failures.",
   "",
   "Fallback-aware behavior:",

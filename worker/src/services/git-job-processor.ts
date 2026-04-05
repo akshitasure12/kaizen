@@ -134,7 +134,21 @@ function toPositiveInt(value: unknown): number | null {
 
 function commandLooksLikeNonBlockingProbe(command: string): boolean {
   const c = command.toLowerCase();
-  return c.includes("--help") || c.includes("|| true");
+  if (c.includes("--help") || c.includes("|| true")) return true;
+
+  const executable = c.split(/\s+/).filter((token) => token.length > 0)[0] || "";
+  return (
+    executable === "rg" ||
+    executable === "grep" ||
+    executable === "sed" ||
+    executable === "cat" ||
+    executable === "ls" ||
+    executable === "find"
+  );
+}
+
+function isStrictVerificationCommand(command: string): boolean {
+  return !commandLooksLikeNonBlockingProbe(command);
 }
 
 function uniqCommands(commands: string[]): string[] {
@@ -362,7 +376,11 @@ async function runEditVerifyFixLoop(params: {
     }
 
     let cyclePassed = true;
+    let strictChecksExecuted = false;
     for (const command of verifyCommands) {
+      const strictCheck = isStrictVerificationCommand(command);
+      if (strictCheck) strictChecksExecuted = true;
+
       const result = await executeToolCommand({
         command,
         phase: "verify",
@@ -375,11 +393,22 @@ async function runEditVerifyFixLoop(params: {
       });
       commandResults.push(result);
       await recordToolExecution(params.jobId, result);
-      if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
+
+      const failed = result.blockedReason || result.timedOut || result.exitCode !== 0;
+      if (failed && strictCheck) {
         cyclePassed = false;
         break;
       }
     }
+
+    await setStage(
+      params.jobId,
+      "editing",
+      {
+        verify_strict_checks_executed: strictChecksExecuted,
+      },
+      params.leaseToken,
+    );
 
     if (cyclePassed) {
       return {
