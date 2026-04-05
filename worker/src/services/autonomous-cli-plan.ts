@@ -194,8 +194,13 @@ export async function generateAutonomousCliPlan(params: {
   };
 
   const reasoningLevel = getReasoningLevel({
-    difficulty: "medium",
+    issueTitle: params.issueTitle,
+    issueBody: params.issueBody,
     inputChars: JSON.stringify(context).length,
+    checklistCount: context.checklist.length,
+    verifyHintCount: context.verify_hints.length,
+    rankedFileCount: context.ranked_files.length,
+    rankedTestCount: context.ranked_tests.length,
   });
   const model = pickGeminiModel(reasoningLevel);
   const thinkingConfig = buildGeminiThinkingConfig(model, reasoningLevel);

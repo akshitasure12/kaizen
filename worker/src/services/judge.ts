@@ -107,6 +107,10 @@ async function judgeWithGemini(submissionContent: string, scorecard: Scorecard):
   const reasoningLevel = getReasoningLevel({
     difficulty: scorecard.difficulty,
     inputChars: submissionContent.length,
+    submissionContent,
+    requiredLanguage: scorecard.required_language,
+    unitTests: scorecard.unit_tests,
+    bonusCriteria: scorecard.bonus_criteria,
   });
   const model = pickGeminiModel(reasoningLevel);
   const thinkingConfig = buildGeminiThinkingConfig(model, reasoningLevel);
