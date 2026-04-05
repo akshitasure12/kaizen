@@ -5,6 +5,7 @@ import {
   getReasoningLevel,
   pickGeminiModel,
 } from "./gemini-orchestration";
+import { KAIZEN_CLI_EXECUTION_INSTRUCTIONS } from "./cli-execution-instructions";
 
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
@@ -199,15 +200,6 @@ export async function generateAutonomousCliPlan(params: {
   const model = pickGeminiModel(reasoningLevel);
   const thinkingConfig = buildGeminiThinkingConfig(model, reasoningLevel);
 
-  const systemPrompt = [
-    "You generate executable CLI command plans for autonomous coding agents.",
-    "Return strict JSON only.",
-    "Commands must be safe single invocations (no shell chaining).",
-    "Prefer node -e scripts for deterministic file edits.",
-    "Use only executables listed in allowed_commands.",
-    "Edit commands should create implementation diffs, not just analysis output.",
-  ].join("\n");
-
   const response = await gemini.models.generateContent({
     model,
     contents: [
@@ -218,7 +210,7 @@ export async function generateAutonomousCliPlan(params: {
       JSON.stringify(context, null, 2),
     ].join("\n"),
     config: {
-      systemInstruction: systemPrompt,
+      systemInstruction: KAIZEN_CLI_EXECUTION_INSTRUCTIONS,
       thinkingConfig,
       responseMimeType: "application/json",
       responseJsonSchema: {

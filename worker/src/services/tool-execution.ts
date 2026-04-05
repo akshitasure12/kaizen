@@ -79,7 +79,12 @@ function tokenizeCommand(raw: string): string[] | null {
       if (ch === '"') {
         quote = null;
       } else if (ch === "\\") {
-        escaped = true;
+        const next = raw[i + 1];
+        if (next === '"' || next === "\\" || next === "$" || next === "`") {
+          escaped = true;
+        } else {
+          current += ch;
+        }
       } else {
         current += ch;
       }
