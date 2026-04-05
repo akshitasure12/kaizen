@@ -24,6 +24,21 @@ interface ValidationResult {
   reason?: string;
 }
 
+interface SpawnResult {
+  exitCode: number | null;
+  signal: string | null;
+  durationMs: number;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
+  spawnErrorMessage: string | null;
+}
+
+interface ExecutableFallback {
+  executable: string;
+  args: string[];
+}
+
 const SECRET_ENV_KEY_RE = /(TOKEN|SECRET|PASSWORD|PRIVATE_KEY|API_KEY)/i;
 const SAFE_EXECUTABLE_RE = /^[a-zA-Z0-9._-]+$/;
 
@@ -244,6 +259,158 @@ export function validateToolCommand(params: {
   };
 }
 
+function isMissingExecutableError(message: string | null): boolean {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return lower.includes("enoent") || lower.includes("not found");
+}
+
+function parseRgSearchArgs(args: string[]): { pattern: string | null; path: string } {
+  let pattern: string | null = null;
+  let path = ".";
+
+  for (const arg of args) {
+    if (
+      arg === "-n" ||
+      arg === "--line-number" ||
+      arg === "-i" ||
+      arg === "--ignore-case" ||
+      arg === "--color=never" ||
+      arg === "--no-heading"
+    ) {
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      continue;
+    }
+    if (!pattern) {
+      pattern = arg;
+      continue;
+    }
+    path = arg;
+    break;
+  }
+
+  return { pattern, path };
+}
+
+export function buildExecutableFallbackForMissingCommand(params: {
+  executable: string;
+  args: string[];
+  allowedCommands: Set<string>;
+}): ExecutableFallback | null {
+  const executable = params.executable.toLowerCase();
+
+  if (executable === "rg") {
+    if (params.args.includes("--files") && params.allowedCommands.has("find")) {
+      const target = params.args.find((arg) => !arg.startsWith("-")) || ".";
+      return {
+        executable: "find",
+        args: [target, "-type", "f"],
+      };
+    }
+
+    if (params.allowedCommands.has("grep")) {
+      const ignoreCase = params.args.includes("--ignore-case") || params.args.includes("-i");
+      const parsed = parseRgSearchArgs(params.args);
+      if (!parsed.pattern) {
+        return null;
+      }
+
+      return {
+        executable: "grep",
+        args: ["-R", "-n", "-E", ...(ignoreCase ? ["-i"] : []), parsed.pattern, parsed.path],
+      };
+    }
+
+    if (params.allowedCommands.has("find")) {
+      return {
+        executable: "find",
+        args: [".", "-type", "f"],
+      };
+    }
+  }
+
+  return null;
+}
+
+function formatCommand(executable: string, args: string[]): string {
+  const tokens = [executable, ...args.map((arg) => (arg.includes(" ") ? JSON.stringify(arg) : arg))];
+  return tokens.join(" ").trim();
+}
+
+function runSpawnCommand(params: {
+  executable: string;
+  args: string[];
+  cwd: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+}): Promise<SpawnResult> {
+  const started = Date.now();
+
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+
+    const child = spawn(params.executable, params.args, {
+      cwd: params.cwd,
+      env: sanitizeCommandEnv(),
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!settled) {
+          child.kill("SIGKILL");
+        }
+      }, 1500);
+    }, params.timeoutMs);
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout = appendAndTrim(stdout, chunk.toString(), params.maxOutputBytes);
+    });
+
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr = appendAndTrim(stderr, chunk.toString(), params.maxOutputBytes);
+    });
+
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({
+        exitCode: -1,
+        signal: null,
+        durationMs: Date.now() - started,
+        timedOut: false,
+        stdout,
+        stderr: appendAndTrim(stderr, `\n${error.message}`, params.maxOutputBytes).trim(),
+        spawnErrorMessage: error.message,
+      });
+    });
+
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve({
+        exitCode: code,
+        signal: signal ? String(signal) : null,
+        durationMs: Date.now() - started,
+        timedOut,
+        stdout,
+        stderr,
+        spawnErrorMessage: null,
+      });
+    });
+  });
+}
+
 export async function executeToolCommand(params: {
   command: string;
   phase: ToolExecutionPhase;
@@ -278,75 +445,60 @@ export async function executeToolCommand(params: {
     };
   }
 
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timedOut = false;
-
-    const child = spawn(validation.executable!, validation.args!, {
-      cwd: params.cwd,
-      env: sanitizeCommandEnv(),
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => {
-        if (!settled) {
-          child.kill("SIGKILL");
-        }
-      }, 1500);
-    }, params.timeoutMs);
-
-    child.stdout.on("data", (chunk: Buffer | string) => {
-      stdout = appendAndTrim(stdout, chunk.toString(), params.maxOutputBytes);
-    });
-
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      stderr = appendAndTrim(stderr, chunk.toString(), params.maxOutputBytes);
-    });
-
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve({
-        command: params.command,
-        executable: validation.executable!,
-        args: validation.args!,
-        phase: params.phase,
-        cycle: params.cycle,
-        exitCode: -1,
-        signal: null,
-        durationMs: Date.now() - started,
-        timedOut: false,
-        stdout,
-        stderr: appendAndTrim(stderr, `\n${error.message}`, params.maxOutputBytes).trim(),
-        blockedReason: null,
-      });
-    });
-
-    child.on("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve({
-        command: params.command,
-        executable: validation.executable!,
-        args: validation.args!,
-        phase: params.phase,
-        cycle: params.cycle,
-        exitCode: code,
-        signal: signal ? String(signal) : null,
-        durationMs: Date.now() - started,
-        timedOut,
-        stdout,
-        stderr,
-        blockedReason: null,
-      });
-    });
+  const primaryResult = await runSpawnCommand({
+    executable: validation.executable!,
+    args: validation.args!,
+    cwd: params.cwd,
+    timeoutMs: params.timeoutMs,
+    maxOutputBytes: params.maxOutputBytes,
   });
+
+  if (isMissingExecutableError(primaryResult.spawnErrorMessage)) {
+    const fallback = buildExecutableFallbackForMissingCommand({
+      executable: validation.executable!,
+      args: validation.args!,
+      allowedCommands: params.allowedCommands,
+    });
+
+    if (fallback) {
+      const fallbackResult = await runSpawnCommand({
+        executable: fallback.executable,
+        args: fallback.args,
+        cwd: params.cwd,
+        timeoutMs: params.timeoutMs,
+        maxOutputBytes: params.maxOutputBytes,
+      });
+
+      const fallbackNote = `\n[fallback executed: ${formatCommand(fallback.executable, fallback.args)}]`;
+      return {
+        command: params.command,
+        executable: fallback.executable,
+        args: fallback.args,
+        phase: params.phase,
+        cycle: params.cycle,
+        exitCode: fallbackResult.exitCode,
+        signal: fallbackResult.signal,
+        durationMs: Date.now() - started,
+        timedOut: fallbackResult.timedOut,
+        stdout: fallbackResult.stdout,
+        stderr: appendAndTrim(fallbackResult.stderr, fallbackNote, params.maxOutputBytes).trim(),
+        blockedReason: null,
+      };
+    }
+  }
+
+  return {
+    command: params.command,
+    executable: validation.executable!,
+    args: validation.args!,
+    phase: params.phase,
+    cycle: params.cycle,
+    exitCode: primaryResult.exitCode,
+    signal: primaryResult.signal,
+    durationMs: Date.now() - started,
+    timedOut: primaryResult.timedOut,
+    stdout: primaryResult.stdout,
+    stderr: primaryResult.stderr,
+    blockedReason: null,
+  };
 }

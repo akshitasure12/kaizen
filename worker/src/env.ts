@@ -24,9 +24,13 @@ const envSchema = z.object({
   WORKER_COMMAND_MAX_LENGTH: z.coerce.number().int().min(20).max(1000).default(400),
   WORKER_COMMAND_MAX_OUTPUT_BYTES: z.coerce.number().int().min(1024).max(256000).default(60000),
   WORKER_TOOL_MAX_COMMANDS: z.coerce.number().int().min(1).max(20).default(6),
+  WORKER_AUTONOMOUS_EDITING_ENABLED: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
   WORKER_ALLOWED_COMMANDS: z
     .string()
-    .default("rg,sed,find,cat,ls,npm,bun,pnpm,yarn,pytest,vitest,node,python,python3,go,cargo")
+    .default("rg,grep,sed,find,cat,ls,npm,bun,pnpm,yarn,pytest,vitest,node,python,python3,go,cargo")
     .transform((value) =>
       value
         .split(",")

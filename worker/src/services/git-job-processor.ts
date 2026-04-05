@@ -12,8 +12,13 @@ import {
   refineCliHintsForWorkspace,
   renderKaizenAgentNote,
 } from "./cli-context-hints";
+import { generateAutonomousCliPlan, type AutonomousCliPlan } from "./autonomous-cli-plan";
 import { judgeGitDiffContext, storeJudgement, type Scorecard } from "./judge";
-import { executeToolCommand, type ToolExecutionResult as CommandExecutionResult } from "./tool-execution";
+import {
+  executeToolCommand,
+  validateToolCommand,
+  type ToolExecutionResult as CommandExecutionResult,
+} from "./tool-execution";
 
 interface GitJobRow {
   id: string;
@@ -42,6 +47,16 @@ interface EditLoopSummary {
   verifyCommands: string[];
   fixCommands: string[];
   commandResults: CommandExecutionResult[];
+}
+
+interface ResolvedAutonomousPlan {
+  source: "llm" | "heuristic";
+  summary: string;
+  model?: string;
+  error?: string;
+  editCommands: string[];
+  verifyCommands: string[];
+  fixCommands: string[];
 }
 
 type ErrorClass = "transient" | "permanent";
@@ -147,6 +162,25 @@ function uniqStrings(values: string[]): string[] {
   return ordered;
 }
 
+function isBooleanFalse(value: unknown): boolean {
+  return value === false || value === "false" || value === "0";
+}
+
+function filterExecutableCommands(commands: string[]): string[] {
+  const valid: string[] = [];
+  for (const command of commands) {
+    const check = validateToolCommand({
+      command,
+      allowedCommands: allowedToolCommands,
+      maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+    });
+    if (check.ok) {
+      valid.push(command);
+    }
+  }
+  return valid;
+}
+
 function compactCommandResult(result: CommandExecutionResult): Record<string, unknown> {
   return {
     phase: result.phase,
@@ -213,19 +247,34 @@ async function recordToolExecution(jobId: string, result: CommandExecutionResult
 export function resolveVerificationCommands(params: {
   payload: Record<string, unknown> | null;
   hintedVerifyCommands: string[];
+  autonomousVerifyCommands?: string[];
 }): string[] {
   const payloadCommands = toStringArray(params.payload?.verify_commands);
-  const merged = uniqCommands([...payloadCommands, ...params.hintedVerifyCommands]);
+  const merged = uniqCommands([
+    ...payloadCommands,
+    ...(params.autonomousVerifyCommands || []),
+    ...params.hintedVerifyCommands,
+  ]);
   const strict = merged.filter((command) => !commandLooksLikeNonBlockingProbe(command));
   return (strict.length > 0 ? strict : merged).slice(0, env.WORKER_TOOL_MAX_COMMANDS);
 }
 
-export function resolveFixCommands(payload: Record<string, unknown> | null): string[] {
-  return uniqCommands(toStringArray(payload?.fix_commands)).slice(0, env.WORKER_TOOL_MAX_COMMANDS);
+export function resolveFixCommands(
+  payload: Record<string, unknown> | null,
+  autonomousFixCommands: string[] = [],
+): string[] {
+  const payloadCommands = uniqCommands(toStringArray(payload?.fix_commands));
+  const merged = payloadCommands.length > 0 ? payloadCommands : uniqCommands(autonomousFixCommands);
+  return merged.slice(0, env.WORKER_TOOL_MAX_COMMANDS);
 }
 
-export function resolveEditCommands(payload: Record<string, unknown> | null): string[] {
-  return uniqCommands(toStringArray(payload?.edit_commands)).slice(0, env.WORKER_TOOL_MAX_COMMANDS);
+export function resolveEditCommands(
+  payload: Record<string, unknown> | null,
+  autonomousEditCommands: string[] = [],
+): string[] {
+  const payloadCommands = uniqCommands(toStringArray(payload?.edit_commands));
+  const merged = payloadCommands.length > 0 ? payloadCommands : uniqCommands(autonomousEditCommands);
+  return merged.slice(0, env.WORKER_TOOL_MAX_COMMANDS);
 }
 
 async function runEditVerifyFixLoop(params: {
@@ -233,14 +282,22 @@ async function runEditVerifyFixLoop(params: {
   workDir: string;
   payload: Record<string, unknown> | null;
   hintedVerifyCommands: string[];
+  autonomousPlan?: ResolvedAutonomousPlan | null;
   leaseToken: string | null;
 }): Promise<EditLoopSummary> {
-  const editCommands = resolveEditCommands(params.payload);
+  const editCommands = resolveEditCommands(
+    params.payload,
+    params.autonomousPlan ? params.autonomousPlan.editCommands : [],
+  );
   const verifyCommands = resolveVerificationCommands({
     payload: params.payload,
     hintedVerifyCommands: params.hintedVerifyCommands,
+    autonomousVerifyCommands: params.autonomousPlan ? params.autonomousPlan.verifyCommands : [],
   });
-  const fixCommands = resolveFixCommands(params.payload);
+  const fixCommands = resolveFixCommands(
+    params.payload,
+    params.autonomousPlan ? params.autonomousPlan.fixCommands : [],
+  );
 
   if (editCommands.length === 0 && verifyCommands.length === 0) {
     return {
@@ -538,7 +595,15 @@ export async function processGitJobById(jobId: string): Promise<void> {
     return;
   }
 
-  const token = await getGitHubTokenForUser(job.user_id);
+  let token: string | null;
+  try {
+    token = await getGitHubTokenForUser(job.user_id);
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    await failJob(job, msg, classifyError(msg));
+    return;
+  }
+
   if (!token) {
     await failJob(
       job,
@@ -648,11 +713,54 @@ export async function processGitJobById(jobId: string): Promise<void> {
       ...toStringArray(contextHints?.command_suggestions.verify),
     ]);
 
+    let autonomousPlan: ResolvedAutonomousPlan | null = null;
+    const payloadEditCommands = resolveEditCommands(job.payload);
+    const autonomousEditingAllowed =
+      env.WORKER_AUTONOMOUS_EDITING_ENABLED && !isBooleanFalse(job.payload?.autonomous_editing);
+    if (autonomousEditingAllowed && payloadEditCommands.length === 0) {
+      try {
+        const planned: AutonomousCliPlan = await generateAutonomousCliPlan({
+          issueTitle: issue.title,
+          issueBody: issue.body || "",
+          contextHints,
+          verificationHints: parsedHints.verificationHints,
+          allowedCommands: Array.from(allowedToolCommands.values()).sort(),
+          maxCommands: env.WORKER_TOOL_MAX_COMMANDS,
+          maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+        });
+
+        autonomousPlan = {
+          ...planned,
+          editCommands: filterExecutableCommands(planned.editCommands),
+          verifyCommands: filterExecutableCommands(planned.verifyCommands),
+          fixCommands: filterExecutableCommands(planned.fixCommands),
+        };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        autonomousPlan = {
+          source: "heuristic",
+          summary: "autonomous plan failed before execution",
+          error: truncateText(message, 500),
+          editCommands: [],
+          verifyCommands: [],
+          fixCommands: [],
+        };
+      }
+    }
+
     await setStage(job.id, "editing", {
       context_hint_count: contextHints?.ranked_files.length ?? 0,
       test_hint_count: contextHints?.ranked_tests.length ?? 0,
       search_term_count: contextHints?.search_terms.length ?? 0,
       suggested_verify_count: hintedVerifyCommands.length,
+      autonomous_editing_enabled: autonomousEditingAllowed,
+      autonomous_editing_source: autonomousPlan?.source ?? null,
+      autonomous_editing_summary: autonomousPlan?.summary ?? null,
+      autonomous_editing_model: autonomousPlan?.model ?? null,
+      autonomous_editing_error: autonomousPlan?.error ?? null,
+      autonomous_edit_command_count: autonomousPlan?.editCommands.length ?? 0,
+      autonomous_verify_command_count: autonomousPlan?.verifyCommands.length ?? 0,
+      autonomous_fix_command_count: autonomousPlan?.fixCommands.length ?? 0,
     }, job.lease_token);
 
     const agentNote = path.join(workDir, "KAIZEN_AGENT.md");
@@ -673,6 +781,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
       workDir,
       payload: job.payload,
       hintedVerifyCommands,
+      autonomousPlan,
       leaseToken: job.lease_token,
     });
 
