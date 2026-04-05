@@ -12,7 +12,12 @@ import {
   refineCliHintsForWorkspace,
   renderKaizenAgentNote,
 } from "./cli-context-hints";
-import { generateAutonomousCliPlan, type AutonomousCliPlan } from "./autonomous-cli-plan";
+import {
+  generateAutonomousCliPlan,
+  generateAutonomousCliRecoveryPlan,
+  type AutonomousCliPlan,
+  type AutonomousCliRecoveryPlan,
+} from "./autonomous-cli-plan";
 import { judgeGitDiffContext, storeJudgement, type Scorecard } from "./judge";
 import {
   executeToolCommand,
@@ -47,6 +52,18 @@ interface EditLoopSummary {
   verifyCommands: string[];
   fixCommands: string[];
   commandResults: CommandExecutionResult[];
+  recoveryPlans: EditLoopRecoverySummary[];
+}
+
+interface EditLoopRecoverySummary {
+  cycle: number;
+  source: "llm" | "heuristic";
+  summary: string;
+  model?: string;
+  error?: string;
+  failedCommand: string;
+  replacementEditCommands: string[];
+  recoveryFixCommands: string[];
 }
 
 interface ResolvedAutonomousPlan {
@@ -212,6 +229,21 @@ function compactCommandResult(result: CommandExecutionResult): Record<string, un
   };
 }
 
+export function commandFailureSignature(result: CommandExecutionResult): string {
+  const stderrTail = truncateText(result.stderr, 240).replace(/\s+/g, " ").trim();
+  const stdoutTail = truncateText(result.stdout, 120).replace(/\s+/g, " ").trim();
+  const blocked = result.blockedReason || "";
+  return [
+    result.phase,
+    result.command,
+    String(result.exitCode),
+    String(result.timedOut),
+    blocked,
+    stderrTail,
+    stdoutTail,
+  ].join("|");
+}
+
 async function recordToolExecution(jobId: string, result: CommandExecutionResult): Promise<void> {
   try {
     await query(
@@ -294,12 +326,15 @@ export function resolveEditCommands(
 async function runEditVerifyFixLoop(params: {
   jobId: string;
   workDir: string;
+  issueTitle: string;
+  issueBody: string;
   payload: Record<string, unknown> | null;
   hintedVerifyCommands: string[];
   autonomousPlan?: ResolvedAutonomousPlan | null;
+  enableAutonomousRecovery: boolean;
   leaseToken: string | null;
 }): Promise<EditLoopSummary> {
-  const editCommands = resolveEditCommands(
+  const initialEditCommands = resolveEditCommands(
     params.payload,
     params.autonomousPlan ? params.autonomousPlan.editCommands : [],
   );
@@ -308,37 +343,47 @@ async function runEditVerifyFixLoop(params: {
     hintedVerifyCommands: params.hintedVerifyCommands,
     autonomousVerifyCommands: params.autonomousPlan ? params.autonomousPlan.verifyCommands : [],
   });
-  const fixCommands = resolveFixCommands(
+  let activeFixCommands = resolveFixCommands(
     params.payload,
     params.autonomousPlan ? params.autonomousPlan.fixCommands : [],
   );
+  let pendingEditCommands = [...initialEditCommands];
+  let plannedEditCommands = [...initialEditCommands];
+  const recoveryPlans: EditLoopRecoverySummary[] = [];
 
-  if (editCommands.length === 0 && verifyCommands.length === 0) {
+  if (pendingEditCommands.length === 0 && verifyCommands.length === 0) {
     return {
       passed: true,
       cycles: 0,
-      editCommands,
+      editCommands: plannedEditCommands,
       verifyCommands,
-      fixCommands,
+      fixCommands: activeFixCommands,
       commandResults: [],
+      recoveryPlans,
     };
   }
 
   const requestedCycles = toPositiveInt(params.payload?.loop_max_cycles);
   const maxCycles = Math.max(1, Math.min(6, requestedCycles ?? env.WORKER_LOOP_MAX_CYCLES));
   const commandResults: CommandExecutionResult[] = [];
+  const editFailureSignatures = new Map<string, number>();
+  let recoveryContinuationCount = 0;
+  const maxRecoveryContinuations = Math.max(1, Math.min(4, maxCycles));
 
   for (let cycle = 1; cycle <= maxCycles; cycle += 1) {
     await setStage(params.jobId, "editing", {
       edit_loop_cycle: cycle,
       edit_loop_max_cycles: maxCycles,
-      edit_command_count: editCommands.length,
+      edit_command_count: plannedEditCommands.length,
       verify_command_count: verifyCommands.length,
-      fix_command_count: fixCommands.length,
+      fix_command_count: activeFixCommands.length,
     }, params.leaseToken);
 
-    if (cycle === 1 && editCommands.length > 0) {
-      for (const command of editCommands) {
+    if (pendingEditCommands.length > 0) {
+      const commandsForCycle = [...pendingEditCommands];
+      let failedEditResult: CommandExecutionResult | null = null;
+
+      for (const command of commandsForCycle) {
         const result = await executeToolCommand({
           command,
           phase: "edit",
@@ -352,26 +397,188 @@ async function runEditVerifyFixLoop(params: {
         commandResults.push(result);
         await recordToolExecution(params.jobId, result);
         if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
+          failedEditResult = result;
+          break;
+        }
+      }
+
+      if (failedEditResult) {
+        const failureSignature = commandFailureSignature(failedEditResult);
+        const failureCount = (editFailureSignatures.get(failureSignature) ?? 0) + 1;
+        editFailureSignatures.set(failureSignature, failureCount);
+
+        if (cycle >= maxCycles) {
           return {
             passed: false,
             cycles: cycle,
-            editCommands,
+            editCommands: plannedEditCommands,
             verifyCommands,
-            fixCommands,
+            fixCommands: activeFixCommands,
             commandResults,
+            recoveryPlans,
           };
         }
+
+        let recoveryPlan: AutonomousCliRecoveryPlan | null = null;
+        if (params.enableAutonomousRecovery) {
+          try {
+            recoveryPlan = await generateAutonomousCliRecoveryPlan({
+              issueTitle: params.issueTitle,
+              issueBody: params.issueBody,
+              failedPhase: failedEditResult.phase,
+              failedCommand: failedEditResult.command,
+              failedExitCode: failedEditResult.exitCode,
+              failedTimedOut: failedEditResult.timedOut,
+              failedBlockedReason: failedEditResult.blockedReason,
+              failedStdout: failedEditResult.stdout,
+              failedStderr: failedEditResult.stderr,
+              previousEditCommands: plannedEditCommands,
+              previousFixCommands: activeFixCommands,
+              allowedCommands: Array.from(allowedToolCommands.values()).sort(),
+              maxCommands: env.WORKER_TOOL_MAX_COMMANDS,
+              maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+            });
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            recoveryPlan = {
+              source: "heuristic",
+              summary: "autonomous recovery planning failed",
+              error: truncateText(message, 500),
+              editCommands: [],
+              fixCommands: [],
+            };
+          }
+        }
+
+        const recoveryEditCommands = recoveryPlan
+          ? filterExecutableCommands(recoveryPlan.editCommands).slice(0, env.WORKER_TOOL_MAX_COMMANDS)
+          : [];
+        const recoveryFixCommands = recoveryPlan
+          ? filterExecutableCommands(recoveryPlan.fixCommands).slice(0, env.WORKER_TOOL_MAX_COMMANDS)
+          : [];
+
+        if (recoveryPlan) {
+          recoveryPlans.push({
+            cycle,
+            source: recoveryPlan.source,
+            summary: recoveryPlan.summary,
+            ...(recoveryPlan.model ? { model: recoveryPlan.model } : {}),
+            ...(recoveryPlan.error ? { error: recoveryPlan.error } : {}),
+            failedCommand: failedEditResult.command,
+            replacementEditCommands: recoveryEditCommands,
+            recoveryFixCommands,
+          });
+        }
+
+        const repairCommands =
+          recoveryFixCommands.length > 0
+            ? recoveryFixCommands
+            : activeFixCommands;
+
+        const hasNovelRecoveryEdits = recoveryEditCommands.some(
+          (command) => !plannedEditCommands.includes(command),
+        );
+        const recoveryPathExists = recoveryEditCommands.length > 0 || repairCommands.length > 0;
+        const repeatedFailureStall =
+          failureCount >= 2 && !hasNovelRecoveryEdits && recoveryFixCommands.length === 0;
+        const continuationBudgetExhausted = recoveryContinuationCount >= maxRecoveryContinuations;
+
+        if (!recoveryPathExists || repeatedFailureStall || continuationBudgetExhausted) {
+          recoveryPlans.push({
+            cycle,
+            source: "heuristic",
+            summary: !recoveryPathExists
+              ? "Recovery circuit breaker: no executable recovery commands were available"
+              : repeatedFailureStall
+                ? "Recovery circuit breaker: repeated identical edit failure without novel recovery actions"
+                : "Recovery circuit breaker: recovery continuation budget exhausted",
+            failedCommand: failedEditResult.command,
+            replacementEditCommands: recoveryEditCommands,
+            recoveryFixCommands,
+          });
+          return {
+            passed: false,
+            cycles: cycle,
+            editCommands: plannedEditCommands,
+            verifyCommands,
+            fixCommands: activeFixCommands,
+            commandResults,
+            recoveryPlans,
+          };
+        }
+
+        if (repairCommands.length > 0) {
+          for (const command of repairCommands) {
+            const fixResult = await executeToolCommand({
+              command,
+              phase: "fix",
+              cycle,
+              cwd: params.workDir,
+              timeoutMs: env.WORKER_COMMAND_TIMEOUT_MS,
+              maxOutputBytes: env.WORKER_COMMAND_MAX_OUTPUT_BYTES,
+              maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+              allowedCommands: allowedToolCommands,
+            });
+            commandResults.push(fixResult);
+            await recordToolExecution(params.jobId, fixResult);
+            if (fixResult.blockedReason || fixResult.timedOut || fixResult.exitCode !== 0) {
+              return {
+                passed: false,
+                cycles: cycle,
+                editCommands: plannedEditCommands,
+                verifyCommands,
+                fixCommands: activeFixCommands,
+                commandResults,
+                recoveryPlans,
+              };
+            }
+          }
+        }
+
+        activeFixCommands = uniqCommands([...activeFixCommands, ...recoveryFixCommands]).slice(
+          0,
+          env.WORKER_TOOL_MAX_COMMANDS,
+        );
+
+        if (recoveryEditCommands.length > 0) {
+          plannedEditCommands = uniqCommands([
+            ...plannedEditCommands,
+            ...recoveryEditCommands,
+          ]).slice(0, env.WORKER_TOOL_MAX_COMMANDS * 2);
+          pendingEditCommands = recoveryEditCommands;
+          recoveryContinuationCount += 1;
+          continue;
+        }
+
+        if (repairCommands.length > 0) {
+          pendingEditCommands = commandsForCycle;
+          recoveryContinuationCount += 1;
+          continue;
+        }
+
+        return {
+          passed: false,
+          cycles: cycle,
+          editCommands: plannedEditCommands,
+          verifyCommands,
+          fixCommands: activeFixCommands,
+          commandResults,
+          recoveryPlans,
+        };
       }
+
+      pendingEditCommands = [];
     }
 
     if (verifyCommands.length === 0) {
       return {
         passed: true,
         cycles: cycle,
-        editCommands,
+        editCommands: plannedEditCommands,
         verifyCommands,
-        fixCommands,
+        fixCommands: activeFixCommands,
         commandResults,
+        recoveryPlans,
       };
     }
 
@@ -414,18 +621,19 @@ async function runEditVerifyFixLoop(params: {
       return {
         passed: true,
         cycles: cycle,
-        editCommands,
+        editCommands: plannedEditCommands,
         verifyCommands,
-        fixCommands,
+        fixCommands: activeFixCommands,
         commandResults,
+        recoveryPlans,
       };
     }
 
-    if (cycle >= maxCycles || fixCommands.length === 0) {
+    if (cycle >= maxCycles || activeFixCommands.length === 0) {
       break;
     }
 
-    for (const command of fixCommands) {
+    for (const command of activeFixCommands) {
       const result = await executeToolCommand({
         command,
         phase: "fix",
@@ -439,7 +647,15 @@ async function runEditVerifyFixLoop(params: {
       commandResults.push(result);
       await recordToolExecution(params.jobId, result);
       if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
-        break;
+        return {
+          passed: false,
+          cycles: cycle,
+          editCommands: plannedEditCommands,
+          verifyCommands,
+          fixCommands: activeFixCommands,
+          commandResults,
+          recoveryPlans,
+        };
       }
     }
   }
@@ -447,10 +663,11 @@ async function runEditVerifyFixLoop(params: {
   return {
     passed: false,
     cycles: maxCycles,
-    editCommands,
+    editCommands: plannedEditCommands,
     verifyCommands,
-    fixCommands,
+    fixCommands: activeFixCommands,
     commandResults,
+    recoveryPlans,
   };
 }
 
@@ -746,6 +963,8 @@ export async function processGitJobById(jobId: string): Promise<void> {
     const payloadEditCommands = resolveEditCommands(job.payload);
     const autonomousEditingAllowed =
       env.WORKER_AUTONOMOUS_EDITING_ENABLED && !isBooleanFalse(job.payload?.autonomous_editing);
+    const autonomousRecoveryAllowed =
+      env.WORKER_AUTONOMOUS_EDITING_ENABLED && !isBooleanFalse(job.payload?.autonomous_recovery);
     if (autonomousEditingAllowed && payloadEditCommands.length === 0) {
       try {
         const planned: AutonomousCliPlan = await generateAutonomousCliPlan({
@@ -783,6 +1002,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
       search_term_count: contextHints?.search_terms.length ?? 0,
       suggested_verify_count: hintedVerifyCommands.length,
       autonomous_editing_enabled: autonomousEditingAllowed,
+      autonomous_recovery_enabled: autonomousRecoveryAllowed,
       autonomous_editing_source: autonomousPlan?.source ?? null,
       autonomous_editing_summary: autonomousPlan?.summary ?? null,
       autonomous_editing_model: autonomousPlan?.model ?? null,
@@ -808,9 +1028,12 @@ export async function processGitJobById(jobId: string): Promise<void> {
     const editLoop = await runEditVerifyFixLoop({
       jobId: job.id,
       workDir,
+      issueTitle: issue.title,
+      issueBody: issue.body || "",
       payload: job.payload,
       hintedVerifyCommands,
       autonomousPlan,
+      enableAutonomousRecovery: autonomousRecoveryAllowed,
       leaseToken: job.lease_token,
     });
 
@@ -820,6 +1043,8 @@ export async function processGitJobById(jobId: string): Promise<void> {
       edit_loop_edit_commands: editLoop.editCommands,
       edit_loop_verify_commands: editLoop.verifyCommands,
       edit_loop_fix_commands: editLoop.fixCommands,
+      edit_loop_recovery_count: editLoop.recoveryPlans.length,
+      edit_loop_recovery_plans: editLoop.recoveryPlans,
       edit_loop_results: editLoop.commandResults.map(compactCommandResult),
     }, job.lease_token);
 

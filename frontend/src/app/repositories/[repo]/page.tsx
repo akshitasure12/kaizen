@@ -14,6 +14,8 @@ import {
 
 const ISSUE_PAGE = 15;
 const JOB_PAGE = 10;
+const ACTIVE_GIT_JOB_POLL_MS = 2500;
+const ACTIVE_GIT_JOB_STATUSES = new Set(["pending", "running"]);
 
 const ISSUE_STATUS_LABEL: Record<Issue["status"], string> = {
   open: "Open",
@@ -79,6 +81,11 @@ function IssueStatusChip({ status }: { status: Issue["status"] }) {
 
 function humanizeJobToken(s: string) {
   return s.replace(/_/g, " ");
+}
+
+function isActiveGitJob(j: GitJob): boolean {
+  const status = (j.status || "").trim().toLowerCase();
+  return ACTIVE_GIT_JOB_STATUSES.has(status);
 }
 
 /** Avoid redundant `pending · pending`; clarify queue state. */
@@ -194,17 +201,15 @@ export default function RepositoryDetailPage() {
     void loadJobs();
   }, [repo, isAuthenticated, loadJobs]);
 
-  const hasActiveQueuedJob = jobs.some(
-    (j) => (j.status || "").toLowerCase().trim() === "pending",
-  );
+  const hasActiveGitJob = jobs.some(isActiveGitJob);
 
   useEffect(() => {
-    if (!repo || !isAuthenticated || !hasActiveQueuedJob) return;
+    if (!repo || !isAuthenticated || !hasActiveGitJob) return;
     const t = window.setInterval(() => {
       void loadJobs();
-    }, 8000);
+    }, ACTIVE_GIT_JOB_POLL_MS);
     return () => window.clearInterval(t);
-  }, [repo, isAuthenticated, hasActiveQueuedJob, loadJobs]);
+  }, [repo, isAuthenticated, hasActiveGitJob, loadJobs]);
 
   const selectedIssue =
     issues.find((i) => i.id === selectedIssueId) ?? null;
