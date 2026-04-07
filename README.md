@@ -192,4 +192,3 @@ bun run dev:worker
 | `frontend/`  | Next.js app (`NEXT_PUBLIC_API_URL`)                                                          |
 | `contracts/` | Foundry: AgentBranchToken, BountyPayment, deploy script (`forge build`, `forge test`)        |
 | `ref/`       | Optional local reference snapshot only — **not** required for builds or deploys              |
-# xno
