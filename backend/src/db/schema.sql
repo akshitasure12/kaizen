@@ -24,6 +24,8 @@ DROP TABLE IF EXISTS issue_bounties CASCADE;
 DROP TABLE IF EXISTS wallet_transactions CASCADE;
 DROP TABLE IF EXISTS workflow_runs CASCADE;
 DROP TABLE IF EXISTS git_jobs CASCADE;
+DROP TABLE IF EXISTS kb_chunks CASCADE;
+DROP TABLE IF EXISTS kb_documents CASCADE;
 DROP TABLE IF EXISTS judge_results CASCADE;
 DROP TABLE IF EXISTS issue_judgements CASCADE;
 DROP TABLE IF EXISTS agent_scores CASCADE;
@@ -37,6 +39,7 @@ DROP TABLE IF EXISTS agents CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
 
 DROP FUNCTION IF EXISTS update_commit_search_vector() CASCADE;
+DROP FUNCTION IF EXISTS update_kb_chunk_search_vector() CASCADE;
 
 -- ─── users ─────────────────────────────────────────────────────────────────
 CREATE TABLE users (
@@ -88,6 +91,60 @@ CREATE UNIQUE INDEX idx_repositories_github_remote
 CREATE INDEX idx_repositories_imported_by ON repositories(imported_by_user_id);
 
 -- GitHub: fine-grained PAT on `users.github_api_key` + `repositories.github_*` (import-from-github) + repo webhooks.
+
+-- ─── knowledge base (repository-scoped RAG) ────────────────────────────────
+CREATE TABLE kb_documents (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  repo_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(255) NOT NULL,
+  source_filename VARCHAR(255),
+  source_mime_type VARCHAR(100),
+  content_ref TEXT NOT NULL,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  status VARCHAR(16) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'deleted')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_kb_documents_repo_owner_created
+  ON kb_documents(repo_id, owner_user_id, created_at DESC);
+CREATE INDEX idx_kb_documents_status
+  ON kb_documents(status);
+
+CREATE TABLE kb_chunks (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  document_id UUID NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+  repo_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+  owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  token_estimate INTEGER NOT NULL DEFAULT 0,
+  embedding vector(1536),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  search_vector tsvector,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX idx_kb_chunks_document ON kb_chunks(document_id, chunk_index);
+CREATE INDEX idx_kb_chunks_repo_owner ON kb_chunks(repo_id, owner_user_id);
+
+CREATE OR REPLACE FUNCTION update_kb_chunk_search_vector()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.search_vector := to_tsvector('english', COALESCE(NEW.content, ''));
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER kb_chunk_search_vector_trigger
+  BEFORE INSERT OR UPDATE ON kb_chunks
+  FOR EACH ROW
+  EXECUTE FUNCTION update_kb_chunk_search_vector();
+
+CREATE INDEX idx_kb_chunks_search ON kb_chunks USING gin(search_vector);
 
 -- ─── branches ───────────────────────────────────────────────────────────────
 CREATE TABLE branches (

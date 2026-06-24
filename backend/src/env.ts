@@ -60,6 +60,20 @@ const envSchema = z.object({
   CLI_CONTEXT_HINTS_TOP_FILES: z.coerce.number().int().min(1).max(50).default(8),
   CLI_CONTEXT_HINTS_TOP_TESTS: z.coerce.number().int().min(1).max(30).default(5),
   CLI_CONTEXT_HINTS_HISTORY_LIMIT: z.coerce.number().int().min(5).max(500).default(80),
+  KB_RAG_ENABLED: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  KB_MAX_DOCUMENT_BYTES: z.coerce.number().int().min(1024).max(20 * 1024 * 1024).default(5 * 1024 * 1024),
+  KB_CHUNK_SIZE_CHARS: z.coerce.number().int().min(200).max(6000).default(1200),
+  KB_CHUNK_OVERLAP_CHARS: z.coerce.number().int().min(0).max(800).default(180),
+  KB_RETRIEVAL_TOP_K: z.coerce.number().int().min(1).max(30).default(6),
+  KB_HINT_MAX_SNIPPETS: z.coerce.number().int().min(1).max(20).default(4),
+  KB_HINT_SNIPPET_MAX_CHARS: z.coerce.number().int().min(80).max(2000).default(420),
+  KB_ASSIGNMENT_TOP_K: z.coerce.number().int().min(1).max(20).default(6),
+  KB_JUDGE_TOP_K: z.coerce.number().int().min(1).max(20).default(3),
+  KB_JUDGE_SNIPPET_MAX_CHARS: z.coerce.number().int().min(80).max(2000).default(420),
+  KB_JUDGE_CONTEXT_MAX_CHARS: z.coerce.number().int().min(400).max(12000).default(2200),
   PAYOUT_MIN_SCORE: z.coerce.number().min(0).max(1).optional(),
   PAYOUT_SCORE_FLOOR: z.coerce.number().min(0).max(1).default(0.4),
   PAYOUT_MIN_ABOVE_FLOOR: z.coerce.number().min(0).max(1).default(0.25),

@@ -7,11 +7,16 @@
 
 import { GoogleGenAI } from '@google/genai';
 import { query, queryOne } from '../db/client';
+import { env } from '../env';
 import {
   buildGeminiThinkingConfig,
   getReasoningLevel,
   pickGeminiModel,
 } from './gemini-orchestration';
+import {
+  buildKnowledgeSnippetsForIssue,
+  formatKnowledgeSnippetsForPrompt,
+} from './knowledge-base';
 
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
@@ -63,6 +68,50 @@ function deterministicRatio(seed: string): number {
   return (hash % 1000) / 1000;
 }
 
+function appendKnowledgeContext(baseContent: string, knowledgeContext: string): string {
+  if (!knowledgeContext.trim()) return baseContent;
+  return `${baseContent}\n\n${knowledgeContext}`;
+}
+
+async function getKnowledgeContextForIssue(issueId: string): Promise<string> {
+  if (!env.KB_RAG_ENABLED || !issueId) return '';
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(issueId)) {
+    return '';
+  }
+
+  try {
+    const issue = await queryOne<{
+      repo_id: string;
+      created_by: string;
+      title: string;
+      body: string | null;
+    }>(
+      `SELECT repo_id, created_by, title, body
+       FROM issues
+       WHERE id = $1
+       LIMIT 1`,
+      [issueId],
+    );
+
+    if (!issue) return '';
+    const snippets = await buildKnowledgeSnippetsForIssue({
+      repoId: issue.repo_id,
+      userId: issue.created_by,
+      issueTitle: issue.title,
+      issueBody: issue.body || '',
+      limit: env.KB_JUDGE_TOP_K,
+      maxSnippetChars: env.KB_JUDGE_SNIPPET_MAX_CHARS,
+    });
+
+    return formatKnowledgeSnippetsForPrompt({
+      snippets,
+      maxChars: env.KB_JUDGE_CONTEXT_MAX_CHARS,
+    });
+  } catch {
+    return '';
+  }
+}
+
 // ─── Main Judge Function ──────────────────────────────────────────────────────
 
 /**
@@ -76,9 +125,33 @@ export async function judgeGitDiffContext(params: {
   issueBody: string;
   diffText: string;
   scorecard: Scorecard;
+  repoId?: string;
+  userId?: string;
 }): Promise<JudgeResult> {
   const blob = `## Issue\n${params.issueTitle}\n\n${params.issueBody || ""}\n\n## Proposed changes (git diff)\n\`\`\`diff\n${params.diffText.slice(0, 12000)}\n\`\`\``;
-  return judgeSubmission("", "", blob, params.scorecard);
+
+  let enriched = blob;
+  if (env.KB_RAG_ENABLED && params.repoId && params.userId) {
+    try {
+      const snippets = await buildKnowledgeSnippetsForIssue({
+        repoId: params.repoId,
+        userId: params.userId,
+        issueTitle: params.issueTitle,
+        issueBody: params.issueBody || '',
+        limit: env.KB_JUDGE_TOP_K,
+        maxSnippetChars: env.KB_JUDGE_SNIPPET_MAX_CHARS,
+      });
+      const knowledgeContext = formatKnowledgeSnippetsForPrompt({
+        snippets,
+        maxChars: env.KB_JUDGE_CONTEXT_MAX_CHARS,
+      });
+      enriched = appendKnowledgeContext(blob, knowledgeContext);
+    } catch (error) {
+      console.warn('[judge] failed to enrich git diff context with KB snippets', error);
+    }
+  }
+
+  return judgeSubmission("", "", enriched, params.scorecard);
 }
 
 export async function judgeSubmission(
@@ -87,16 +160,26 @@ export async function judgeSubmission(
   submissionContent: string,
   scorecard: Scorecard
 ): Promise<JudgeResult> {
+  let enrichedSubmission = submissionContent;
+  if (env.KB_RAG_ENABLED && issueId) {
+    try {
+      const knowledgeContext = await getKnowledgeContextForIssue(issueId);
+      enrichedSubmission = appendKnowledgeContext(submissionContent, knowledgeContext);
+    } catch (error) {
+      console.warn('[judge] failed to enrich submission with KB snippets', error);
+    }
+  }
+
   // Try Gemini judge first, fall back to mock.
   if (gemini) {
     try {
-      return await judgeWithGemini(submissionContent, scorecard);
+      return await judgeWithGemini(enrichedSubmission, scorecard);
     } catch (error: any) {
       console.error('Gemini judge failed, falling back to mock:', error.message);
     }
   }
 
-  return mockJudge(submissionContent, scorecard);
+  return mockJudge(enrichedSubmission, scorecard);
 }
 
 /**

@@ -24,6 +24,33 @@ const envSchema = z.object({
   WORKER_COMMAND_MAX_LENGTH: z.coerce.number().int().min(20).max(1000).default(400),
   WORKER_COMMAND_MAX_OUTPUT_BYTES: z.coerce.number().int().min(1024).max(256000).default(60000),
   WORKER_TOOL_MAX_COMMANDS: z.coerce.number().int().min(1).max(20).default(6),
+  WORKER_REQUIRE_STRICT_VERIFY: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  WORKER_VERIFY_GATE_MODE: z.enum(["log", "warn", "strict"]).default("strict"),
+  WORKER_ALLOW_PROBE_ONLY_WHEN_NO_STRICT_CANDIDATES: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  WORKER_PROBE_ONLY_MIN_ARTIFACT_SUBSTANCE: z.coerce.number().int().min(24).max(20000).default(200),
+  WORKER_MIN_STRICT_VERIFY_COMMANDS: z.coerce.number().int().min(0).max(10).default(1),
+  WORKER_MIN_IMPLEMENTATION_FILES_CHANGED: z.coerce.number().int().min(0).max(50).default(1),
+  WORKER_MIN_SUBSTANTIVE_ADDED_CHARS: z.coerce.number().int().min(0).max(20000).default(120),
+  WORKER_MIN_SUBSTANTIVE_HUNKS: z.coerce.number().int().min(0).max(200).default(1),
+  WORKER_REJECT_PLACEHOLDER_DIFFS: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  WORKER_PLACEHOLDER_PATTERNS: z
+    .string()
+    .default("initial,todo,placeholder,stub,fixme")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((entry) => entry.trim().toLowerCase())
+        .filter((entry) => entry.length > 0),
+    ),
   WORKER_AUTONOMOUS_EDITING_ENABLED: z
     .string()
     .default("true")
@@ -53,6 +80,13 @@ const envSchema = z.object({
   CLI_CONTEXT_HINTS_MAX_FILES: z.coerce.number().int().min(1).max(50).default(8),
   CLI_CONTEXT_HINTS_MAX_TESTS: z.coerce.number().int().min(1).max(30).default(5),
   CLI_CONTEXT_HINTS_SCAN_LIMIT: z.coerce.number().int().min(100).max(20000).default(4000),
+  KB_RAG_ENABLED: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  KB_JUDGE_TOP_K: z.coerce.number().int().min(1).max(20).default(3),
+  KB_JUDGE_SNIPPET_MAX_CHARS: z.coerce.number().int().min(80).max(2000).default(420),
+  KB_JUDGE_CONTEXT_MAX_CHARS: z.coerce.number().int().min(400).max(12000).default(2200),
 
   GEMINI_API_KEY: z.string().optional(),
   GEMINI_MODEL_FAST: z.string().default("gemini-3.1-flash-lite-preview"),
@@ -61,6 +95,8 @@ const envSchema = z.object({
   GEMINI_THINKING_BUDGET_LOW: z.coerce.number().int().default(0),
   GEMINI_THINKING_BUDGET_MEDIUM: z.coerce.number().int().default(512),
   GEMINI_THINKING_BUDGET_HIGH: z.coerce.number().int().default(2048),
+
+  WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE: z.coerce.number().min(0).max(10).default(0),
 
   PAYOUT_MIN_SCORE: z.coerce.number().min(0).max(1).optional(),
   PAYOUT_SCORE_FLOOR: z.coerce.number().min(0).max(1).default(0.4),
@@ -79,6 +115,11 @@ if (!parsed.success) {
 
 if (parsed.data.WORKER_ALLOWED_COMMANDS.length === 0) {
   console.error("Invalid worker environment: WORKER_ALLOWED_COMMANDS must include at least one command");
+  process.exit(1);
+}
+
+if (parsed.data.WORKER_PLACEHOLDER_PATTERNS.length === 0) {
+  console.error("Invalid worker environment: WORKER_PLACEHOLDER_PATTERNS must include at least one pattern");
   process.exit(1);
 }
 

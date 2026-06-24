@@ -125,6 +125,8 @@ export interface Issue {
   repo_id: string;
   title: string;
   body?: string;
+  parent_issue_id?: string | null;
+  root_issue_id?: string | null;
   status: "open" | "in_progress" | "closed" | "cancelled";
   scorecard?: Scorecard;
   assigned_agent_id?: string;
@@ -258,6 +260,29 @@ export interface BountySubmission {
   submitted_at: string;
 }
 
+export interface KnowledgeDocument {
+  id: string;
+  repo_id: string;
+  owner_user_id: string;
+  title: string;
+  source_filename?: string | null;
+  source_mime_type?: string | null;
+  content_ref: string;
+  byte_size: number;
+  chunk_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KnowledgeSnippet {
+  chunk_id: string;
+  document_id: string;
+  title: string;
+  source_filename?: string | null;
+  content: string;
+  score: number;
+}
+
 // ── API Functions ──────────────────────────────────────────────
 
 export const api = {
@@ -300,8 +325,86 @@ export interface GitJob {
   branch_name?: string | null;
   github_pr_number?: number | null;
   error_message?: string | null;
+  payload?: {
+    orchestration?: {
+      mode?: string;
+      parent_issue_id?: string;
+      plan_complexity_score?: number;
+      decomposition?: {
+        used?: boolean;
+        reasons?: string[];
+        children?: Array<{
+          issue_id?: string;
+          title?: string;
+          body?: string;
+          agent_ens?: string;
+          assignment_reason?: string;
+        }>;
+      };
+    };
+  };
   created_at: string;
   updated_at: string;
+}
+
+export interface IssueChildrenResponse {
+  parent_issue_id: string;
+  parent_status: Issue["status"];
+  counts: {
+    total: number;
+    open: number;
+    in_progress: number;
+    closed: number;
+    cancelled: number;
+  };
+  children: Issue[];
+}
+
+export interface ResolvePlanChild {
+  title: string;
+  body: string;
+  estimated_effort: number;
+  scorecard: Scorecard;
+  agent_ens?: string;
+}
+
+export interface ResolvePlan {
+  path: "single_agent" | "reuse_children" | "new_children";
+  decision: "single_agent" | "decompose";
+  complexity_score: number;
+  complexity_reasons: string[];
+  suggested_agent_ens: string | null;
+  children: ResolvePlanChild[];
+}
+
+export interface ResolveJobResult {
+  issue_id: string;
+  job_id: string;
+  status: string;
+  deduped: boolean;
+  agent_ens: string;
+}
+
+export interface ResolveCreatedChildResult {
+  issue_id: string;
+  title: string;
+  agent_ens?: string;
+  bounty_amount: number;
+  job_id: string | null;
+  deduped: boolean;
+  status: string | null;
+}
+
+export interface ResolveResponse {
+  mode: "plan_only" | "execute";
+  issue_id: string;
+  plan: ResolvePlan;
+  jobs?: ResolveJobResult[];
+  created_children?: ResolveCreatedChildResult[];
+  bounty_allocation?: {
+    strategy: string;
+    total_bounty_amount: number;
+  } | null;
 }
 
 export const repoApi = {
@@ -336,6 +439,42 @@ export const repoApi = {
   },
 };
 
+export const knowledgeBaseApi = {
+  list: (repoId: string, opts?: { limit?: number; offset?: number }) => {
+    const p = new URLSearchParams();
+    if (opts?.limit != null) p.set("limit", String(opts.limit));
+    if (opts?.offset != null) p.set("offset", String(opts.offset));
+    const qs = p.toString();
+    return api.get<Paginated<KnowledgeDocument>>(
+      `/repositories/${repoId}/knowledge-base/documents${qs ? `?${qs}` : ""}`,
+    );
+  },
+  ingest: (
+    repoId: string,
+    body: {
+      title?: string;
+      filename?: string;
+      mime_type?: string;
+      content?: string;
+      file_base64?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ) =>
+    api.post<KnowledgeDocument>(
+      `/repositories/${repoId}/knowledge-base/documents`,
+      body,
+    ),
+  search: (repoId: string, body: { query: string; limit?: number }) =>
+    api.post<{ query: string; results: KnowledgeSnippet[] }>(
+      `/repositories/${repoId}/knowledge-base/search`,
+      body,
+    ),
+  remove: (repoId: string, documentId: string) =>
+    api.del<{ ok: boolean }>(
+      `/repositories/${repoId}/knowledge-base/documents/${documentId}`,
+    ),
+};
+
 export const issueApi = {
   list: (
     repoId: string,
@@ -353,6 +492,10 @@ export const issueApi = {
   get: (repoId: string, issueId: string) =>
     api.get<Issue & { judgements?: Judgement[] }>(
       `/repositories/${repoId}/issues/${issueId}`,
+    ),
+  children: (repoId: string, issueId: string) =>
+    api.get<IssueChildrenResponse>(
+      `/repositories/${repoId}/issues/${issueId}/children`,
     ),
   create: (
     repoId: string,
@@ -381,12 +524,11 @@ export const issueApi = {
       mode?: "plan_only" | "execute";
       agent_ens?: string;
       base_branch?: string;
-      fanout_children?: boolean;
       idempotency_key?: string;
       max_attempts?: number;
     },
   ) =>
-    api.post<unknown>(
+    api.post<ResolveResponse>(
       `/repositories/${repoId}/issues/${issueId}/resolve`,
       body ?? {},
     ),

@@ -16,6 +16,12 @@
 
 import { query, queryOne } from '../db/client';
 import { env } from '../env';
+import {
+  allocateChildBounties,
+  normalizeDecompositionAllocationStrategy,
+  type DecompositionAllocationStrategy,
+} from './decomposition';
+import type { Scorecard } from './judge';
 
 export type WalletTxType = 'deposit' | 'bounty_post' | 'bounty_win' | 'bounty_refund' | 'earning';
 
@@ -57,8 +63,289 @@ export interface WalletTransaction {
   created_at: string;
 }
 
+interface HistoricalBountyStatsRow {
+  sample_size: string;
+  median_amount: string | null;
+  p75_amount: string | null;
+  avg_payout_fraction: string | null;
+}
+
+interface ChildIssueForRecommendationRow {
+  id: string;
+  title: string;
+  scorecard: unknown;
+}
+
+export interface ChildBountyRecommendation {
+  issue_id: string;
+  title: string;
+  amount: number;
+  difficulty: Scorecard['difficulty'];
+}
+
+export interface IssueBountyRecommendation {
+  currency: 'tokens';
+  min_amount: number;
+  target_amount: number;
+  max_amount: number;
+  confidence: number;
+  allocation_total_amount: number;
+  recommended_allocation_strategy: DecompositionAllocationStrategy;
+  historical: {
+    sample_size: number;
+    median_amount: number;
+    p75_amount: number;
+    avg_payout_fraction: number;
+  };
+  factors: {
+    difficulty_multiplier: number;
+    effort_multiplier: number;
+    risk_multiplier: number;
+    deadline_pressure_multiplier: number;
+    historical_multiplier: number;
+  };
+  signals: {
+    difficulty: Scorecard['difficulty'];
+    checklist_count: number;
+    keyword_hits: number;
+    unit_test_count: number;
+    time_limit_hours: number | null;
+  };
+  child_recommendations: ChildBountyRecommendation[];
+}
+
 interface DbClientLike {
   query<T = unknown>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
+}
+
+const CROSS_CUTTING_KEYWORDS = [
+  'backend',
+  'frontend',
+  'database',
+  'migration',
+  'security',
+  'auth',
+  'api',
+  'worker',
+  'ci',
+  'test',
+  'integration',
+  'webhook',
+];
+
+const BASE_BOUNTY_BY_DIFFICULTY: Record<Scorecard['difficulty'], number> = {
+  easy: 40,
+  medium: 100,
+  hard: 240,
+  expert: 480,
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function clamp01(value: number): number {
+  return clamp(value, 0, 1);
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function round4(value: number): number {
+  return Math.round(value * 10000) / 10000;
+}
+
+function checklistCount(text: string): number {
+  if (!text) return 0;
+  const bulletMatches = text.match(/(^|\n)\s*(-|\*|\d+\.)\s+/g);
+  return bulletMatches ? bulletMatches.length : 0;
+}
+
+function keywordHits(text: string): number {
+  const lower = text.toLowerCase();
+  return CROSS_CUTTING_KEYWORDS.filter((keyword) => lower.includes(keyword)).length;
+}
+
+function parseIssueDifficulty(scorecard: Partial<Scorecard>): Scorecard['difficulty'] {
+  const difficulty = scorecard.difficulty;
+  if (difficulty === 'easy' || difficulty === 'medium' || difficulty === 'hard' || difficulty === 'expert') {
+    return difficulty;
+  }
+  return 'medium';
+}
+
+function toScorecard(scorecard: unknown): Partial<Scorecard> {
+  if (!scorecard || typeof scorecard !== 'object') return {};
+  return scorecard as Partial<Scorecard>;
+}
+
+function toPositiveNumber(value: unknown): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, numeric);
+}
+
+function deadlinePressureMultiplier(timeLimitHours: number | null): number {
+  if (timeLimitHours == null || !Number.isFinite(timeLimitHours) || timeLimitHours <= 0) {
+    return 1;
+  }
+  if (timeLimitHours <= 8) return 1.25;
+  if (timeLimitHours <= 24) return 1.12;
+  if (timeLimitHours <= 72) return 1.05;
+  return 1;
+}
+
+function normalizeHistoricalValue(value: string | null): number {
+  if (!value) return 0;
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return parsed;
+}
+
+function confidenceScore(params: {
+  sampleSize: number;
+  checklistCount: number;
+  unitTestCount: number;
+  keywordHitCount: number;
+}): number {
+  const sampleComponent = Math.min(0.45, (params.sampleSize / 20) * 0.45);
+  const checklistComponent = params.checklistCount > 0 ? 0.08 : 0;
+  const testsComponent = params.unitTestCount > 0 ? 0.07 : 0;
+  const keywordComponent = params.keywordHitCount > 0 ? 0.05 : 0;
+  return round2(clamp01(0.3 + sampleComponent + checklistComponent + testsComponent + keywordComponent));
+}
+
+export async function recommendIssueBounty(params: {
+  issueId: string;
+  repoId: string;
+  issueTitle: string;
+  issueBody: string;
+  scorecard: unknown;
+  allocationStrategy?: DecompositionAllocationStrategy;
+  totalBountyOverride?: number;
+}): Promise<IssueBountyRecommendation> {
+  const scorecard = toScorecard(params.scorecard);
+  const difficulty = parseIssueDifficulty(scorecard);
+  const baseAmount = BASE_BOUNTY_BY_DIFFICULTY[difficulty];
+  const checklist = checklistCount(params.issueBody || '');
+  const unitTests = Array.isArray(scorecard.unit_tests) ? scorecard.unit_tests.length : 0;
+  const keywordHitCount = keywordHits(`${params.issueTitle} ${params.issueBody || ''}`);
+  const timeLimitHours = scorecard.time_limit_hours != null ? Number(scorecard.time_limit_hours) : null;
+
+  const bodyLengthScore = clamp01((params.issueBody || '').length / 3200);
+  const checklistScore = clamp01(checklist / 8);
+  const unitTestScore = clamp01(unitTests / 8);
+  const effortSignal = 0.45 * bodyLengthScore + 0.35 * checklistScore + 0.2 * unitTestScore;
+  const effortMultiplier = round4(clamp(1 + effortSignal * 0.8, 0.85, 1.8));
+  const riskMultiplier = round4(1 + clamp01(keywordHitCount / 6) * 0.35);
+  const deadlineMultiplier = round4(deadlinePressureMultiplier(timeLimitHours));
+
+  const historical = await queryOne<HistoricalBountyStatsRow>(
+    `SELECT
+       COUNT(*)::text AS sample_size,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY ib.amount)::text AS median_amount,
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY ib.amount)::text AS p75_amount,
+       AVG(COALESCE(ib.judge_payout_fraction, 0))::text AS avg_payout_fraction
+     FROM issue_bounties ib
+     JOIN issues i ON i.id = ib.issue_id
+     WHERE i.repo_id = $1
+       AND COALESCE(i.scorecard->>'difficulty', 'medium') = $2
+       AND ib.created_at >= NOW() - INTERVAL '180 days'`,
+    [params.repoId, difficulty],
+  );
+
+  const sampleSize = Number.parseInt(historical?.sample_size || '0', 10);
+  const medianAmount = normalizeHistoricalValue(historical?.median_amount || null);
+  const p75Amount = normalizeHistoricalValue(historical?.p75_amount || null);
+  const avgPayoutFraction = normalizeHistoricalValue(historical?.avg_payout_fraction || null);
+  const historicalMultiplier = round4(
+    sampleSize >= 4 && medianAmount > 0 ? clamp(medianAmount / baseAmount, 0.75, 1.35) : 1,
+  );
+
+  const rawTarget =
+    baseAmount *
+    effortMultiplier *
+    riskMultiplier *
+    deadlineMultiplier *
+    historicalMultiplier;
+  const targetAmount = round2(Math.max(10, rawTarget));
+  const minAmount = round2(Math.max(5, targetAmount * (sampleSize >= 8 ? 0.82 : 0.72)));
+  const maxAmount = round2(Math.max(minAmount, targetAmount * (sampleSize >= 8 ? 1.22 : 1.45)));
+
+  const strategy = normalizeDecompositionAllocationStrategy(params.allocationStrategy);
+  const children = await query<ChildIssueForRecommendationRow>(
+    `SELECT id, title, scorecard
+     FROM issues
+     WHERE parent_issue_id = $1
+     ORDER BY created_at ASC`,
+    [params.issueId],
+  );
+
+  const allocationTotal = round2(
+    params.totalBountyOverride && params.totalBountyOverride > 0
+      ? params.totalBountyOverride
+      : targetAmount,
+  );
+  const childAllocations = children.length
+    ? allocateChildBounties({
+        total: allocationTotal,
+        strategy,
+        children: children.map((child) => ({
+          estimated_effort: 1,
+          scorecard: toScorecard(child.scorecard),
+        })),
+      })
+    : [];
+
+  const childRecommendations = children.map((child, index) => {
+    const childScorecard = toScorecard(child.scorecard);
+    return {
+      issue_id: child.id,
+      title: child.title,
+      amount: round2(toPositiveNumber(childAllocations[index])),
+      difficulty: parseIssueDifficulty(childScorecard),
+    };
+  });
+
+  return {
+    currency: 'tokens',
+    min_amount: minAmount,
+    target_amount: targetAmount,
+    max_amount: maxAmount,
+    confidence: confidenceScore({
+      sampleSize,
+      checklistCount: checklist,
+      unitTestCount: unitTests,
+      keywordHitCount,
+    }),
+    allocation_total_amount: allocationTotal,
+    recommended_allocation_strategy: strategy,
+    historical: {
+      sample_size: sampleSize,
+      median_amount: round2(medianAmount),
+      p75_amount: round2(p75Amount),
+      avg_payout_fraction: round4(avgPayoutFraction),
+    },
+    factors: {
+      difficulty_multiplier: round4(baseAmount / BASE_BOUNTY_BY_DIFFICULTY.medium),
+      effort_multiplier: effortMultiplier,
+      risk_multiplier: riskMultiplier,
+      deadline_pressure_multiplier: deadlineMultiplier,
+      historical_multiplier: historicalMultiplier,
+    },
+    signals: {
+      difficulty,
+      checklist_count: checklist,
+      keyword_hits: keywordHitCount,
+      unit_test_count: unitTests,
+      time_limit_hours:
+        timeLimitHours != null && Number.isFinite(timeLimitHours)
+          ? timeLimitHours
+          : null,
+    },
+    child_recommendations: childRecommendations,
+  };
 }
 
 export async function getAgentEarnings(agentId: string): Promise<number> {

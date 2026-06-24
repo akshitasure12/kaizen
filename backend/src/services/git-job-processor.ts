@@ -123,6 +123,8 @@ async function processGitJobByIdLegacy(jobId: string): Promise<void> {
       issueBody: issue.body || "",
       diffText,
       scorecard,
+      repoId: job.repo_id,
+      userId: job.user_id,
     });
 
     await storeJudgement(job.issue_id, job.agent_id, judgeResult);

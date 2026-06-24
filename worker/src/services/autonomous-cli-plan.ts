@@ -6,16 +6,27 @@ import {
   pickGeminiModel,
 } from "./gemini-orchestration";
 import { KAIZEN_CLI_EXECUTION_INSTRUCTIONS } from "./cli-execution-instructions";
+import { validateToolCommand } from "./tool-execution";
+import {
+  editActionsToCommands,
+  sanitizeEditActions,
+  type EditAction,
+} from "./edit-actions";
 
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+const REQUIRED_ARTIFACT_PATH_RE =
+  /(?:^|[\s`'"(])([A-Za-z0-9][A-Za-z0-9._/-]*\.[A-Za-z0-9]{1,12})(?=$|[\s`'"),.:;!?])/g;
 
 export interface AutonomousCliPlan {
   source: "llm" | "heuristic";
   summary: string;
   editCommands: string[];
+  editActionsV1?: EditAction[];
   verifyCommands: string[];
   fixCommands: string[];
+  strictCandidatesAvailable?: boolean;
+  probeOnlyVerificationJustification?: string;
   model?: string;
   error?: string;
 }
@@ -24,6 +35,7 @@ export interface AutonomousCliRecoveryPlan {
   source: "llm" | "heuristic";
   summary: string;
   editCommands: string[];
+  editActionsV1?: EditAction[];
   fixCommands: string[];
   model?: string;
   error?: string;
@@ -225,6 +237,7 @@ function buildRecoveryPlanWithCommands(params: {
   fixCommands?: string[];
   maxCommands: number;
   maxCommandLength: number;
+  allowedCommands?: string[];
   error?: string;
 }): AutonomousCliRecoveryPlan {
   return {
@@ -234,11 +247,13 @@ function buildRecoveryPlanWithCommands(params: {
       commands: params.editCommands || [],
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
     }),
     fixCommands: sanitizeCommands({
       commands: params.fixCommands || [],
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
     }),
     ...(params.error ? { error: params.error } : {}),
   };
@@ -253,6 +268,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
   failedStderr: string;
   maxCommands: number;
   maxCommandLength: number;
+  allowedCommands?: string[];
   reason?: string;
 }): AutonomousCliRecoveryPlan {
   const command = params.failedCommand.trim();
@@ -263,6 +279,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
       summary,
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       ...(params.reason ? { error: params.reason } : {}),
     });
 
@@ -290,6 +307,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
       editCommands: splitCommands,
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       ...(params.reason ? { error: params.reason } : {}),
     });
   }
@@ -304,6 +322,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
       editCommands: [appendFlag(command, "--legacy-peer-deps")],
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       ...(params.reason ? { error: params.reason } : {}),
     });
   }
@@ -318,6 +337,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
       editCommands: [appendFlag(command, "--no-strict-peer-dependencies")],
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       ...(params.reason ? { error: params.reason } : {}),
     });
   }
@@ -329,6 +349,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
         editCommands: splitCommands,
         maxCommands: params.maxCommands,
         maxCommandLength: params.maxCommandLength,
+        allowedCommands: params.allowedCommands,
         ...(params.reason ? { error: params.reason } : {}),
       });
     }
@@ -345,6 +366,7 @@ export function buildHeuristicAutonomousCliRecoveryPlan(params: {
       editCommands: cargoPackages.map((pkg) => `cargo add ${pkg}`),
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       ...(params.reason ? { error: params.reason } : {}),
     });
   }
@@ -356,11 +378,101 @@ function sanitizeCommands(params: {
   commands: unknown;
   maxCommands: number;
   maxCommandLength: number;
+  allowedCommands?: string[];
 }): string[] {
+  const allowedSet = Array.isArray(params.allowedCommands)
+    ? new Set(
+        params.allowedCommands
+          .map((entry) => entry.trim().toLowerCase())
+          .filter((entry) => entry.length > 0),
+      )
+    : null;
+
   return uniqCommands(toStringArray(params.commands))
     .filter((command) => !command.includes("<path-to-file>"))
     .filter((command) => command.length <= params.maxCommandLength)
+    .filter((command) => {
+      if (!allowedSet) return true;
+      const check = validateToolCommand({
+        command,
+        allowedCommands: allowedSet,
+        maxCommandLength: params.maxCommandLength,
+      });
+      return check.ok;
+    })
     .slice(0, params.maxCommands);
+}
+
+function normalizeArtifactPath(raw: string): string | null {
+  const stripped = raw
+    .trim()
+    .replace(/^[`'"(]+/, "")
+    .replace(/[`'"),.:;!?]+$/, "")
+    .replace(/\\/g, "/");
+
+  const normalized = stripped.startsWith("./") ? stripped.slice(2) : stripped;
+  if (!normalized) return null;
+  if (normalized.startsWith("/") || normalized.startsWith("-")) return null;
+  if (normalized.includes("..") || normalized.includes("://")) return null;
+  if (!/^[A-Za-z0-9._/-]+$/.test(normalized)) return null;
+  return normalized;
+}
+
+export function extractRequiredArtifactPaths(issueTitle: string, issueBody: string): string[] {
+  const blob = `${issueTitle}\n${issueBody}`;
+  const matches: string[] = [];
+
+  REQUIRED_ARTIFACT_PATH_RE.lastIndex = 0;
+  let match = REQUIRED_ARTIFACT_PATH_RE.exec(blob);
+  while (match) {
+    const candidate = normalizeArtifactPath(match[1] || "");
+    if (candidate) {
+      matches.push(candidate);
+    }
+    match = REQUIRED_ARTIFACT_PATH_RE.exec(blob);
+  }
+
+  return uniqCommands(matches).slice(0, 6);
+}
+
+function buildRequiredArtifactVerifyCommands(params: {
+  issueTitle: string;
+  issueBody: string;
+  requiredArtifacts?: string[];
+  maxCommandLength: number;
+}): string[] {
+  const artifacts =
+    params.requiredArtifacts && params.requiredArtifacts.length > 0
+      ? uniqCommands(params.requiredArtifacts)
+      : extractRequiredArtifactPaths(params.issueTitle, params.issueBody);
+
+  return artifacts
+    .map((path) => `ls ${path}`)
+    .filter((command) => command.length <= params.maxCommandLength);
+}
+
+export function mergeRequiredArtifactVerifyCommands(params: {
+  verifyCommands: string[];
+  issueTitle: string;
+  issueBody: string;
+  requiredArtifacts?: string[];
+  maxCommands: number;
+  maxCommandLength: number;
+  allowedCommands?: string[];
+}): string[] {
+  const requiredArtifactChecks = buildRequiredArtifactVerifyCommands({
+    issueTitle: params.issueTitle,
+    issueBody: params.issueBody,
+    requiredArtifacts: params.requiredArtifacts,
+    maxCommandLength: params.maxCommandLength,
+  });
+
+  return sanitizeCommands({
+    commands: [...requiredArtifactChecks, ...params.verifyCommands],
+    maxCommands: params.maxCommands,
+    maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
+  });
 }
 
 function extractFirstUrl(text: string): string | null {
@@ -387,55 +499,43 @@ function pickDocumentationTarget(contextHints: CliContextHints | null): string |
   );
 }
 
-function buildNodeAppendCommand(params: {
-  path: string;
-  note: string;
-  maxCommandLength: number;
-}): string | null {
-  const baseNote = params.note.replace(/\s+/g, " ").trim();
-  if (!baseNote) return null;
-
-  const lengths = [Math.min(180, baseNote.length), 120, 96, 72, 56, 40]
-    .filter((value, index, array) => value > 0 && array.indexOf(value) === index);
-
-  for (const maxNoteLength of lengths) {
-    const note = baseNote.slice(0, maxNoteLength);
-    const script = [
-      "const fs=require('fs')",
-      `const p=${JSON.stringify(params.path)}`,
-      "if(fs.existsSync(p)){",
-      "const t=fs.readFileSync(p,'utf8')",
-      `const n=${JSON.stringify(note)}`,
-      "if(!t.includes(n))fs.writeFileSync(p,t.replace(/\\s*$/,'')+'\\n\\n'+n+'\\n')",
-      "}",
-    ].join(";");
-
-    const command = `node -e ${JSON.stringify(script)}`;
-    if (command.length <= params.maxCommandLength) {
-      return command;
-    }
-  }
-
-  return null;
-}
-
 function buildHeuristicPlan(params: {
   issueTitle: string;
   issueBody: string;
   contextHints: CliContextHints | null;
   verificationHints: VerificationHints | null;
+  requiredArtifacts?: string[];
   maxCommands: number;
   maxCommandLength: number;
+  allowedCommands?: string[];
   reason?: string;
 }): AutonomousCliPlan {
-  const verifyCommands = uniqCommands([
+  const strictCandidates = sanitizeCommands({
+    commands: params.contextHints?.command_suggestions.strict || [],
+    maxCommands: params.maxCommands,
+    maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
+  });
+
+  const baseVerifyCommands = uniqCommands([
+    ...strictCandidates,
     ...toStringArray(params.verificationHints?.suggested_test_commands),
     ...toStringArray(params.contextHints?.command_suggestions.verify),
   ])
     .filter((command) => command.length <= params.maxCommandLength)
     .slice(0, params.maxCommands);
 
-  const editCommands: string[] = [];
+  const verifyCommands = mergeRequiredArtifactVerifyCommands({
+    verifyCommands: baseVerifyCommands,
+    issueTitle: params.issueTitle,
+    issueBody: params.issueBody,
+    requiredArtifacts: params.requiredArtifacts,
+    maxCommands: params.maxCommands,
+    maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
+  });
+
+  const editActionsV1: EditAction[] = [];
   if (isDocsIssue(params.issueTitle, params.issueBody)) {
     const target = pickDocumentationTarget(params.contextHints);
     if (target) {
@@ -443,27 +543,38 @@ function buildHeuristicPlan(params: {
       const note = issueUrl
         ? `Issue context: ${issueUrl}`
         : `Issue context: ${params.issueTitle}`;
-      const command = buildNodeAppendCommand({
-        path: target,
-        note,
-        maxCommandLength: params.maxCommandLength,
+      editActionsV1.push({
+        type: "append_text",
+        file_path: target,
+        content: note,
       });
-      if (command) {
-        editCommands.push(command);
-      }
     }
   }
+
+  const editCommands =
+    editActionsV1.length > 0
+      ? editActionsToCommands({
+          actions: editActionsV1,
+          maxCommands: params.maxCommands,
+          maxCommandLength: params.maxCommandLength,
+        })
+      : [];
 
   return {
     source: "heuristic",
     summary:
       params.reason ||
-      (editCommands.length > 0
+      (editActionsV1.length > 0
         ? "Generated heuristic docs-safe edit command"
         : "No safe heuristic edit command available"),
     editCommands: editCommands.slice(0, params.maxCommands),
+    ...(editActionsV1.length > 0 ? { editActionsV1 } : {}),
     verifyCommands,
     fixCommands: [],
+    strictCandidatesAvailable: strictCandidates.length > 0,
+    ...(strictCandidates.length === 0
+      ? { probeOnlyVerificationJustification: "no strict verification candidates were discovered in context hints" }
+      : {}),
     ...(params.reason ? { error: params.reason } : {}),
   };
 }
@@ -473,6 +584,7 @@ export async function generateAutonomousCliPlan(params: {
   issueBody: string;
   contextHints: CliContextHints | null;
   verificationHints: VerificationHints | null;
+  requiredArtifacts?: string[];
   allowedCommands: string[];
   maxCommands: number;
   maxCommandLength: number;
@@ -483,10 +595,20 @@ export async function generateAutonomousCliPlan(params: {
       issueBody: params.issueBody,
       contextHints: params.contextHints,
       verificationHints: params.verificationHints,
+      requiredArtifacts: params.requiredArtifacts,
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       reason,
     });
+
+  const requiredArtifacts =
+    params.requiredArtifacts && params.requiredArtifacts.length > 0
+      ? uniqCommands(params.requiredArtifacts)
+      : extractRequiredArtifactPaths(
+          params.issueTitle,
+          params.issueBody,
+        );
 
   if (!gemini) {
     return heuristicFallback("gemini_unavailable");
@@ -498,7 +620,9 @@ export async function generateAutonomousCliPlan(params: {
     ranked_files: (params.contextHints?.ranked_files || []).slice(0, 8),
     ranked_tests: (params.contextHints?.ranked_tests || []).slice(0, 5),
     verify_hints: params.verificationHints?.suggested_test_commands || [],
+    strict_verify_hints: params.contextHints?.command_suggestions.strict || [],
     checklist: params.verificationHints?.checklist || [],
+    required_artifacts: requiredArtifacts,
     allowed_commands: params.allowedCommands,
   };
 
@@ -532,10 +656,26 @@ export async function generateAutonomousCliPlan(params: {
         properties: {
           summary: { type: "string" },
           edit_commands: { type: "array", items: { type: "string" } },
+          edit_actions_v1: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                type: { type: "string" },
+                file_path: { type: "string" },
+                old_string: { type: "string" },
+                new_string: { type: "string" },
+                replace_all: { type: "boolean" },
+                content: { type: "string" },
+                create_if_missing: { type: "boolean" },
+              },
+              required: ["type", "file_path"],
+            },
+          },
           verify_commands: { type: "array", items: { type: "string" } },
           fix_commands: { type: "array", items: { type: "string" } },
         },
-        required: ["summary", "edit_commands", "verify_commands", "fix_commands"],
+        required: ["summary", "verify_commands", "fix_commands"],
       },
     },
   });
@@ -549,19 +689,50 @@ export async function generateAutonomousCliPlan(params: {
     commands: parsed.edit_commands,
     maxCommands: params.maxCommands,
     maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
   });
-  const verifyCommands = sanitizeCommands({
+  const editActionsV1 = sanitizeEditActions({
+    value: parsed.edit_actions_v1,
+    maxActions: params.maxCommands,
+    maxStringLength: Math.min(8000, params.maxCommandLength * 8),
+  });
+  const actionDerivedEditCommands = sanitizeCommands({
+    commands: editActionsToCommands({
+      actions: editActionsV1,
+      maxCommands: params.maxCommands,
+      maxCommandLength: params.maxCommandLength,
+    }),
+    maxCommands: params.maxCommands,
+    maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
+  });
+  const mergedEditCommands = uniqCommands([...editCommands, ...actionDerivedEditCommands]).slice(
+    0,
+    params.maxCommands,
+  );
+  const parsedVerifyCommands = sanitizeCommands({
     commands: parsed.verify_commands,
     maxCommands: params.maxCommands,
     maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
+  });
+  const verifyCommands = mergeRequiredArtifactVerifyCommands({
+    verifyCommands: parsedVerifyCommands,
+    issueTitle: params.issueTitle,
+    issueBody: params.issueBody,
+    requiredArtifacts,
+    maxCommands: params.maxCommands,
+    maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
   });
   const fixCommands = sanitizeCommands({
     commands: parsed.fix_commands,
     maxCommands: params.maxCommands,
     maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
   });
 
-  if (editCommands.length === 0) {
+  if (mergedEditCommands.length === 0 && editActionsV1.length === 0) {
     return heuristicFallback("autonomous_plan_missing_edit_commands");
   }
 
@@ -571,9 +742,20 @@ export async function generateAutonomousCliPlan(params: {
       typeof parsed.summary === "string" && parsed.summary.trim().length > 0
         ? parsed.summary.trim()
         : "Generated autonomous CLI plan",
-    editCommands,
+    editCommands: mergedEditCommands,
+    ...(editActionsV1.length > 0 ? { editActionsV1 } : {}),
     verifyCommands,
     fixCommands,
+    strictCandidatesAvailable:
+      sanitizeCommands({
+        commands: params.contextHints?.command_suggestions.strict || [],
+        maxCommands: params.maxCommands,
+        maxCommandLength: params.maxCommandLength,
+        allowedCommands: params.allowedCommands,
+      }).length > 0,
+    ...(verifyCommands.every((command) => command.startsWith("ls "))
+      ? { probeOnlyVerificationJustification: "planner returned artifact probes without strict checks" }
+      : {}),
     model,
   };
 }
@@ -604,6 +786,7 @@ export async function generateAutonomousCliRecoveryPlan(params: {
       failedStderr: params.failedStderr,
       maxCommands: params.maxCommands,
       maxCommandLength: params.maxCommandLength,
+      allowedCommands: params.allowedCommands,
       reason,
     });
 
@@ -656,9 +839,25 @@ export async function generateAutonomousCliRecoveryPlan(params: {
         properties: {
           summary: { type: "string" },
           edit_commands: { type: "array", items: { type: "string" } },
+          edit_actions_v1: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                type: { type: "string" },
+                file_path: { type: "string" },
+                old_string: { type: "string" },
+                new_string: { type: "string" },
+                replace_all: { type: "boolean" },
+                content: { type: "string" },
+                create_if_missing: { type: "boolean" },
+              },
+              required: ["type", "file_path"],
+            },
+          },
           fix_commands: { type: "array", items: { type: "string" } },
         },
-        required: ["summary", "edit_commands", "fix_commands"],
+        required: ["summary", "fix_commands"],
       },
     },
   });
@@ -672,14 +871,35 @@ export async function generateAutonomousCliRecoveryPlan(params: {
     commands: parsed.edit_commands,
     maxCommands: params.maxCommands,
     maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
   });
+  const editActionsV1 = sanitizeEditActions({
+    value: parsed.edit_actions_v1,
+    maxActions: params.maxCommands,
+    maxStringLength: Math.min(8000, params.maxCommandLength * 8),
+  });
+  const actionDerivedEditCommands = sanitizeCommands({
+    commands: editActionsToCommands({
+      actions: editActionsV1,
+      maxCommands: params.maxCommands,
+      maxCommandLength: params.maxCommandLength,
+    }),
+    maxCommands: params.maxCommands,
+    maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
+  });
+  const mergedEditCommands = uniqCommands([...editCommands, ...actionDerivedEditCommands]).slice(
+    0,
+    params.maxCommands,
+  );
   const fixCommands = sanitizeCommands({
     commands: parsed.fix_commands,
     maxCommands: params.maxCommands,
     maxCommandLength: params.maxCommandLength,
+    allowedCommands: params.allowedCommands,
   });
 
-  if (editCommands.length === 0 && fixCommands.length === 0) {
+  if (mergedEditCommands.length === 0 && editActionsV1.length === 0 && fixCommands.length === 0) {
     return heuristicFallback("autonomous_recovery_missing_commands");
   }
 
@@ -689,7 +909,8 @@ export async function generateAutonomousCliRecoveryPlan(params: {
       typeof parsed.summary === "string" && parsed.summary.trim().length > 0
         ? parsed.summary.trim()
         : "Generated autonomous recovery plan",
-    editCommands,
+    editCommands: mergedEditCommands,
+    ...(editActionsV1.length > 0 ? { editActionsV1 } : {}),
     fixCommands,
     model,
   };

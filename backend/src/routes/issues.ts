@@ -26,6 +26,12 @@ import {
   PlannedChildWork,
 } from "../services/resolve-orchestration";
 import { rollupParentIssueStatus } from "../services/issue-lifecycle";
+import {
+  allocateChildBounties,
+  normalizeDecompositionAllocationStrategy,
+  type DecompositionAllocationStrategy,
+  withIssueHierarchyPrefix,
+} from "../services/decomposition";
 import { parseListPagination, paginationMeta } from "../lib/pagination";
 
 interface Issue {
@@ -220,11 +226,13 @@ export async function issueRoutes(app: FastifyInstance) {
           agent_ens?: string;
           bounty_amount?: number;
         }>;
-        allocation_strategy?: "effort" | "equal";
+        allocation_strategy?: DecompositionAllocationStrategy;
         total_bounty_amount?: number;
         poster_agent_ens?: string;
         deadline_hours?: number;
         max_submissions?: number;
+        max_depth?: number;
+        max_total_children?: number;
       };
 
       const parent = await queryOne<Issue>(
@@ -238,11 +246,6 @@ export async function issueRoutes(app: FastifyInstance) {
         return reply
           .status(400)
           .send({ error: "Cannot decompose a closed/cancelled issue" });
-      }
-      if (parent.parent_issue_id) {
-        return reply
-          .status(400)
-          .send({ error: "Only top-level parent issues can be decomposed" });
       }
 
       const existingChildren = await queryOne<{ cnt: string }>(
@@ -279,6 +282,25 @@ export async function issueRoutes(app: FastifyInstance) {
           .send({ error: "Each child issue requires a title" });
       }
 
+      const maxDepth = resolveDecompositionDepthLimit(body.max_depth);
+      const maxTotalChildren = resolveDecompositionMaxChildrenLimit(
+        body.max_total_children,
+      );
+      const parentDepth = await getIssueDepth(issueId);
+      if (parentDepth >= maxDepth) {
+        return reply.status(400).send({
+          error: `Cannot decompose issue at depth ${parentDepth}; max_depth ${maxDepth} reached`,
+        });
+      }
+
+      const rootIssueId = parent.root_issue_id || parent.id;
+      const existingDescendants = await countIssueDescendants(rootIssueId);
+      if (existingDescendants + childSpecs.length > maxTotalChildren) {
+        return reply.status(400).send({
+          error: `Decomposition would exceed max_total_children (${maxTotalChildren}) for root issue`,
+        });
+      }
+
       const totalBounty = Number(body.total_bounty_amount || 0);
       const hasPerChildBounty = childSpecs.some(
         (c) => Number(c.bounty_amount || 0) > 0,
@@ -309,11 +331,19 @@ export async function issueRoutes(app: FastifyInstance) {
         posterAgentId = poster.id;
       }
 
-      const strategy =
-        body.allocation_strategy === "equal" ? "equal" : "effort";
+      const strategy = normalizeDecompositionAllocationStrategy(
+        body.allocation_strategy,
+      );
       const bountyAllocations =
         totalBounty > 0
-          ? allocateChildBounties(totalBounty, childSpecs, strategy)
+          ? allocateChildBounties({
+              total: totalBounty,
+              strategy,
+              children: childSpecs.map((child) => ({
+                estimated_effort: child.estimated_effort,
+                scorecard: validateScorecard(child.scorecard),
+              })),
+            })
           : childSpecs.map((c) => Math.max(0, Number(c.bounty_amount || 0)));
 
       const requestedTotalBounty = bountyAllocations.reduce(
@@ -394,7 +424,7 @@ export async function issueRoutes(app: FastifyInstance) {
            RETURNING *`,
             [
               repoId,
-              spec.title.trim(),
+              withIssueHierarchyPrefix(spec.title.trim(), parentDepth, i + 1),
               spec.body || "",
               validateScorecard(spec.scorecard),
               req.user!.userId,
@@ -689,6 +719,7 @@ export async function issueRoutes(app: FastifyInstance) {
       } else {
         const ranked = await rankAgentsForIssue({
           ownerUserId: req.user!.userId,
+          repoId,
           issueTitle: issueForAssignment.title,
           issueBody: issueForAssignment.body || "",
           limit: 3,
@@ -742,11 +773,55 @@ export async function issueRoutes(app: FastifyInstance) {
 
       const suggestions = await rankAgentsForIssue({
         ownerUserId: req.user!.userId,
+        repoId,
         issueTitle: issue.title,
         issueBody: issue.body || "",
         limit: 5,
       });
       return { issue_id: issue.id, suggestions };
+    },
+  );
+
+  app.get(
+    "/:repoId/issues/:issueId/bounty-recommendation",
+    { preHandler: [...repoUserAuth] },
+    async (req, reply) => {
+      const { repoId, issueId } = req.params as any;
+      const queryParams = (req.query || {}) as {
+        total_bounty_amount?: number | string;
+        allocation_strategy?: DecompositionAllocationStrategy;
+      };
+
+      const issue = await queryOne<Issue>(
+        "SELECT * FROM issues WHERE id = $1 AND repo_id = $2",
+        [issueId, repoId],
+      );
+      if (!issue) {
+        return reply.status(404).send({ error: "Issue not found" });
+      }
+
+      const overrideRaw =
+        typeof queryParams.total_bounty_amount === "string"
+          ? Number.parseFloat(queryParams.total_bounty_amount)
+          : Number(queryParams.total_bounty_amount);
+
+      const recommendation = await bountyService.recommendIssueBounty({
+        issueId: issue.id,
+        repoId,
+        issueTitle: issue.title,
+        issueBody: issue.body || "",
+        scorecard: issue.scorecard,
+        allocationStrategy: queryParams.allocation_strategy,
+        totalBountyOverride:
+          Number.isFinite(overrideRaw) && overrideRaw > 0
+            ? overrideRaw
+            : undefined,
+      });
+
+      return {
+        issue_id: issue.id,
+        recommendation,
+      };
     },
   );
 
@@ -759,7 +834,6 @@ export async function issueRoutes(app: FastifyInstance) {
         mode?: "plan_only" | "execute";
         agent_ens?: string;
         base_branch?: string;
-        fanout_children?: boolean;
         idempotency_key?: string;
         max_attempts?: number;
         /** Merged into each enqueued git_jobs.payload (e.g. edit_commands). */
@@ -772,6 +846,13 @@ export async function issueRoutes(app: FastifyInstance) {
             estimated_effort?: number;
             agent_ens?: string;
           }>;
+          total_bounty_amount?: number;
+          allocation_strategy?: DecompositionAllocationStrategy;
+          poster_agent_ens?: string;
+          deadline_hours?: number;
+          max_submissions?: number;
+          max_depth?: number;
+          max_total_children?: number;
         };
       };
 
@@ -861,6 +942,7 @@ export async function issueRoutes(app: FastifyInstance) {
             issue.title,
             issue.body || "",
             ownerUserId,
+            repoId,
           );
           if (selectedAgent) {
             agentCache.set(
@@ -874,13 +956,14 @@ export async function issueRoutes(app: FastifyInstance) {
           issue.title,
           issue.body || "",
           ownerUserId,
+          repoId,
         );
         if (selectedAgent) {
           agentCache.set(selectedAgent.ens_name.toLowerCase(), selectedAgent);
         }
       }
 
-      const plan = buildResolvePlan(
+      const plan = await buildResolvePlan(
         {
           title: issue.title,
           body: issue.body || "",
@@ -889,7 +972,6 @@ export async function issueRoutes(app: FastifyInstance) {
         },
         {
           requested_children: requestedChildren,
-          fanout_children: body.fanout_children,
         },
       );
       const resolvedPlan = {
@@ -919,6 +1001,39 @@ export async function issueRoutes(app: FastifyInstance) {
         body.max_attempts && body.max_attempts > 0
           ? body.max_attempts
           : undefined;
+
+      const maxDepth = resolveDecompositionDepthLimit(
+        body.decomposition?.max_depth,
+      );
+      const maxTotalChildren = resolveDecompositionMaxChildrenLimit(
+        body.decomposition?.max_total_children,
+      );
+      const issueDepth = await getIssueDepth(issue.id);
+      if (resolvedPlan.path === "new_children" && issueDepth >= maxDepth) {
+        return reply.status(400).send({
+          error: `Cannot decompose issue at depth ${issueDepth}; max_depth ${maxDepth} reached`,
+        });
+      }
+
+      if (resolvedPlan.path === "new_children") {
+        const rootIssueId = issue.root_issue_id || issue.id;
+        const existingDescendants = await countIssueDescendants(rootIssueId);
+        if (existingDescendants + resolvedPlan.children.length > maxTotalChildren) {
+          return reply.status(400).send({
+            error: `Decomposition would exceed max_total_children (${maxTotalChildren}) for root issue`,
+          });
+        }
+      }
+
+      const requestedChildBountyTotal = Number(
+        body.decomposition?.total_bounty_amount || 0,
+      );
+      if (requestedChildBountyTotal > 0) {
+        return reply.status(400).send({
+          error:
+            "Child bounty allocation during resolve is disabled. Use parent issue bounty only.",
+        });
+      }
 
       if (resolvedPlan.path === "single_agent") {
         if (!selectedAgent) {
@@ -962,57 +1077,42 @@ export async function issueRoutes(app: FastifyInstance) {
       }
 
       if (resolvedPlan.path === "reuse_children") {
-        const jobs: Array<{
-          issue_id: string;
-          job_id: string;
-          status: string;
-          deduped: boolean;
-          agent_ens: string;
-        }> = [];
-
-        for (const child of children) {
-          const assigned = await pickAgentForChildIssue(
-            child,
-            selectedAgent,
-            agentCache,
-            ownerUserId,
-          );
-          if (!assigned) {
-            return reply.status(400).send({
-              error: `No available agent found for child issue ${child.id}`,
-            });
-          }
-
-          await assignIssueToAgent(child.id, assigned.id);
-          const childKey = body.idempotency_key
-            ? `${body.idempotency_key}:${child.id}`
-            : null;
-          const job = await enqueueGitJob({
-            issue_id: child.id,
-            repo_id: repoId,
-            user_id: req.user!.userId,
-            agent_id: assigned.id,
-            base_branch: baseBranch,
-            max_attempts: maxAttempts,
-            idempotency_key: childKey,
-            payload: {
-              orchestration: {
-                mode: "reuse_children",
-                parent_issue_id: issue.id,
-                plan_complexity_score: resolvedPlan.complexity_score,
-              },
-              ...jobPayloadExtra,
-            },
-          });
-
-          jobs.push({
-            issue_id: child.id,
-            job_id: job.id,
-            status: job.status,
-            deduped: job.deduped,
-            agent_ens: assigned.ens_name,
-          });
+        if (!selectedAgent) {
+          return reply
+            .status(400)
+            .send({ error: "No available agent found for parent assignment" });
         }
+
+        const childAssignments = children.map((child) => ({
+          issue_id: child.id,
+          title: child.title,
+          body: child.body || "",
+        }));
+
+        await assignIssueToAgent(issue.id, selectedAgent.id);
+        const parentJob = await enqueueGitJob({
+          issue_id: issue.id,
+          repo_id: repoId,
+          user_id: req.user!.userId,
+          agent_id: selectedAgent.id,
+          base_branch: baseBranch,
+          max_attempts: maxAttempts,
+          idempotency_key: body.idempotency_key ?? null,
+          payload: {
+            orchestration: {
+              mode: "reuse_children_single_pr",
+              parent_issue_id: issue.id,
+              child_assignments: childAssignments,
+              plan_complexity_score: resolvedPlan.complexity_score,
+              decomposition: {
+                used: true,
+                reasons: resolvedPlan.complexity_reasons,
+                children: childAssignments,
+              },
+            },
+            ...jobPayloadExtra,
+          },
+        });
 
         await query(
           `UPDATE issues
@@ -1025,89 +1125,105 @@ export async function issueRoutes(app: FastifyInstance) {
           mode,
           issue_id: issue.id,
           plan: resolvedPlan,
-          jobs,
+          jobs: [
+            {
+              issue_id: issue.id,
+              job_id: parentJob.id,
+              status: parentJob.status,
+              deduped: parentJob.deduped,
+              agent_ens: selectedAgent.ens_name,
+            },
+          ],
         });
       }
 
       const createdChildren: Array<{
         issue_id: string;
         title: string;
-        agent_ens: string;
+        bounty_amount: number;
         job_id: string | null;
         deduped: boolean;
         status: string | null;
       }> = [];
+      const decompositionChildren: Array<{
+        issue_id: string;
+        title: string;
+        body: string;
+      }> = [];
+      const createdChildIssueIds: string[] = [];
 
-      for (let i = 0; i < resolvedPlan.children.length; i += 1) {
-        const childPlan = resolvedPlan.children[i]!;
-        const [created] = await query<Issue>(
-          `INSERT INTO issues (repo_id, title, body, scorecard, created_by, parent_issue_id, root_issue_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *`,
-          [
-            repoId,
-            childPlan.title,
-            childPlan.body,
-            validateScorecard(childPlan.scorecard),
-            req.user!.userId,
-            issue.id,
-            issue.root_issue_id || issue.id,
-          ],
-        );
+      try {
+        for (let i = 0; i < resolvedPlan.children.length; i += 1) {
+          const childPlan = resolvedPlan.children[i]!;
+          const [created] = await query<Issue>(
+            `INSERT INTO issues (repo_id, title, body, scorecard, created_by, parent_issue_id, root_issue_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *`,
+            [
+              repoId,
+              withIssueHierarchyPrefix(childPlan.title, issueDepth, i + 1),
+              childPlan.body,
+              validateScorecard(childPlan.scorecard),
+              req.user!.userId,
+              issue.id,
+              issue.root_issue_id || issue.id,
+            ],
+          );
+          createdChildIssueIds.push(created.id);
 
-        const assigned = await pickAgentForPlannedChild(
-          childPlan,
-          selectedAgent,
-          agentCache,
-          ownerUserId,
-        );
-        if (!assigned) {
-          return reply.status(400).send({
-            error: `No available agent found for child issue plan: ${childPlan.title}`,
-          });
-        }
-
-        await assignIssueToAgent(created.id, assigned.id);
-
-        let jobId: string | null = null;
-        let deduped = false;
-        let jobStatus: string | null = null;
-        if (resolvedPlan.fanout_children) {
-          const childKey = body.idempotency_key
-            ? `${body.idempotency_key}:${created.id}`
-            : null;
-          const job = await enqueueGitJob({
+          createdChildren.push({
             issue_id: created.id,
-            repo_id: repoId,
-            user_id: req.user!.userId,
-            agent_id: assigned.id,
-            base_branch: baseBranch,
-            max_attempts: maxAttempts,
-            idempotency_key: childKey,
-            payload: {
-              orchestration: {
-                mode: "new_children",
-                parent_issue_id: issue.id,
-                child_index: i,
-                plan_complexity_score: resolvedPlan.complexity_score,
-              },
-              ...jobPayloadExtra,
-            },
+            title: created.title,
+            bounty_amount: 0,
+            job_id: null,
+            deduped: false,
+            status: null,
           });
-          jobId = job.id;
-          deduped = job.deduped;
-          jobStatus = job.status;
+          decompositionChildren.push({
+            issue_id: created.id,
+            title: created.title,
+            body: childPlan.body || "",
+          });
         }
-
-        createdChildren.push({
-          issue_id: created.id,
-          title: created.title,
-          agent_ens: assigned.ens_name,
-          job_id: jobId,
-          deduped,
-          status: jobStatus,
-        });
+      } catch (err) {
+        if (createdChildIssueIds.length > 0) {
+          await query("DELETE FROM issues WHERE id = ANY($1::uuid[])", [
+            createdChildIssueIds,
+          ]);
+        }
+        throw err;
       }
+
+      if (!selectedAgent) {
+        return reply
+          .status(400)
+          .send({ error: "No available agent found for parent assignment" });
+      }
+
+      await assignIssueToAgent(issue.id, selectedAgent.id);
+      const parentJob = await enqueueGitJob({
+        issue_id: issue.id,
+        repo_id: repoId,
+        user_id: req.user!.userId,
+        agent_id: selectedAgent.id,
+        base_branch: baseBranch,
+        max_attempts: maxAttempts,
+        idempotency_key: body.idempotency_key ?? null,
+        payload: {
+          orchestration: {
+            mode: "new_children_single_pr",
+            parent_issue_id: issue.id,
+            child_assignments: decompositionChildren,
+            plan_complexity_score: resolvedPlan.complexity_score,
+            decomposition: {
+              used: true,
+              reasons: resolvedPlan.complexity_reasons,
+              children: decompositionChildren,
+            },
+          },
+          ...jobPayloadExtra,
+        },
+      });
 
       await query(
         `UPDATE issues
@@ -1120,6 +1236,15 @@ export async function issueRoutes(app: FastifyInstance) {
         mode,
         issue_id: issue.id,
         plan: resolvedPlan,
+        jobs: [
+          {
+            issue_id: issue.id,
+            job_id: parentJob.id,
+            status: parentJob.status,
+            deduped: parentJob.deduped,
+            agent_ens: selectedAgent.ens_name,
+          },
+        ],
         created_children: createdChildren,
       });
     },
@@ -1729,33 +1854,70 @@ function validateScorecard(input: any): Scorecard {
   };
 }
 
-function allocateChildBounties(
-  total: number,
-  children: Array<{ estimated_effort?: number }>,
-  strategy: "effort" | "equal",
-): number[] {
-  const roundedTotal = Math.max(0, Math.round(total * 10000) / 10000);
-  if (roundedTotal <= 0 || children.length === 0) return children.map(() => 0);
+const DEFAULT_DECOMPOSITION_MAX_DEPTH = 2;
+const MAX_DECOMPOSITION_MAX_DEPTH = 6;
+const DEFAULT_DECOMPOSITION_MAX_TOTAL_CHILDREN = 12;
+const MAX_DECOMPOSITION_MAX_TOTAL_CHILDREN = 50;
 
-  const effortWeights = children.map((c) =>
-    Math.max(0, Number(c.estimated_effort || 0)),
-  );
-  const sumEffort = effortWeights.reduce((acc, v) => acc + v, 0);
-  const useEffort = strategy === "effort" && sumEffort > 0;
-  const baseWeights = useEffort ? effortWeights : children.map(() => 1);
-  const weightSum = baseWeights.reduce((acc, v) => acc + v, 0);
+function parsePositiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
 
-  const allocations = baseWeights.map(
-    (w) => Math.round(roundedTotal * (w / weightSum) * 10000) / 10000,
-  );
-  const current = allocations.reduce((a, b) => a + b, 0);
-  const delta = Math.round((roundedTotal - current) * 10000) / 10000;
-  allocations[allocations.length - 1] = Math.max(
-    0,
-    Math.round((allocations[allocations.length - 1] + delta) * 10000) / 10000,
-  );
+function resolveDecompositionDepthLimit(value: unknown): number {
+  const parsed = parsePositiveInt(value);
+  if (!parsed) return DEFAULT_DECOMPOSITION_MAX_DEPTH;
+  return Math.max(1, Math.min(MAX_DECOMPOSITION_MAX_DEPTH, parsed));
+}
 
-  return allocations;
+function resolveDecompositionMaxChildrenLimit(value: unknown): number {
+  const parsed = parsePositiveInt(value);
+  if (!parsed) return DEFAULT_DECOMPOSITION_MAX_TOTAL_CHILDREN;
+  return Math.max(2, Math.min(MAX_DECOMPOSITION_MAX_TOTAL_CHILDREN, parsed));
+}
+
+async function getIssueDepth(issueId: string): Promise<number> {
+  const row = await queryOne<{ depth: string | number | null }>(
+    `WITH RECURSIVE lineage AS (
+       SELECT id, parent_issue_id, 0::int AS depth
+       FROM issues
+       WHERE id = $1
+       UNION ALL
+       SELECT i.id, i.parent_issue_id, lineage.depth + 1
+       FROM issues i
+       JOIN lineage ON i.id = lineage.parent_issue_id
+     )
+     SELECT COALESCE(MAX(depth), 0)::text AS depth
+     FROM lineage`,
+    [issueId],
+  );
+  return Number(row?.depth || 0);
+}
+
+async function countIssueDescendants(rootIssueId: string): Promise<number> {
+  const row = await queryOne<{ cnt: string | number | null }>(
+    `WITH RECURSIVE descendants AS (
+       SELECT id
+       FROM issues
+       WHERE parent_issue_id = $1
+       UNION ALL
+       SELECT i.id
+       FROM issues i
+       JOIN descendants d ON i.parent_issue_id = d.id
+     )
+     SELECT COUNT(*)::text AS cnt
+     FROM descendants`,
+    [rootIssueId],
+  );
+  return Number(row?.cnt || 0);
 }
 
 function normalizeRequestedChildren(
@@ -1814,9 +1976,11 @@ async function pickTopAgentForIssue(
   issueTitle: string,
   issueBody: string,
   ownerUserId: string,
+  repoId: string,
 ): Promise<ResolvedAgent | null> {
   const ranked = await rankAgentsForIssue({
     ownerUserId,
+    repoId,
     issueTitle,
     issueBody,
     limit: 1,
@@ -1833,6 +1997,7 @@ async function pickAgentForChildIssue(
   fallback: ResolvedAgent | null,
   cache: Map<string, ResolvedAgent>,
   ownerUserId: string,
+  repoId: string,
 ): Promise<ResolvedAgent | null> {
   if (child.assigned_agent_id && child.assigned_agent_ens) {
     const owned = await queryOne<{ id: string; ens_name: string }>(
@@ -1850,7 +2015,7 @@ async function pickAgentForChildIssue(
   }
 
   if (fallback) return fallback;
-  return pickTopAgentForIssue(child.title, child.body || "", ownerUserId);
+  return pickTopAgentForIssue(child.title, child.body || "", ownerUserId, repoId);
 }
 
 async function pickAgentForPlannedChild(
@@ -1858,6 +2023,7 @@ async function pickAgentForPlannedChild(
   fallback: ResolvedAgent | null,
   cache: Map<string, ResolvedAgent>,
   ownerUserId: string,
+  repoId: string,
 ): Promise<ResolvedAgent | null> {
   if (childPlan.agent_ens) {
     const explicit = await resolveAgentByEns(
@@ -1872,6 +2038,7 @@ async function pickAgentForPlannedChild(
     childPlan.title,
     childPlan.body || "",
     ownerUserId,
+    repoId,
   );
 }
 

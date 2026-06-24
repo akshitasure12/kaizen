@@ -1,6 +1,7 @@
 import { query, queryOne } from '../db/client';
 import { env } from '../env';
 import { buildCliContextHints, buildVerificationChecklist } from './cli-context-hints';
+import { buildKnowledgeSnippetsForIssue } from './knowledge-base';
 import type { Scorecard } from './judge';
 
 export interface EnqueueGitJobParams {
@@ -85,12 +86,27 @@ async function buildPayloadWithCliHints(params: EnqueueGitJobParams): Promise<Re
 
   const historicalPaths = historyRows.flatMap((row) => extractHistoricalPaths(row.diff_summary_json));
   const scorecard = asPartialScorecard(issue.scorecard);
+  let knowledgeSnippets: Awaited<ReturnType<typeof buildKnowledgeSnippetsForIssue>> = [];
+
+  try {
+    knowledgeSnippets = await buildKnowledgeSnippetsForIssue({
+      repoId: params.repo_id,
+      userId: params.user_id,
+      issueTitle: issue.title,
+      issueBody: issue.body || '',
+      limit: env.KB_HINT_MAX_SNIPPETS,
+      maxSnippetChars: env.KB_HINT_SNIPPET_MAX_CHARS,
+    });
+  } catch (error) {
+    console.warn('[git-job-enqueue] KB retrieval failed, proceeding without snippets', error);
+  }
 
   const contextHints = buildCliContextHints({
     issueTitle: issue.title,
     issueBody: issue.body || '',
     scorecard,
     historicalPaths,
+    knowledgeSnippets,
     topFileCount: env.CLI_CONTEXT_HINTS_TOP_FILES,
     topTestCount: env.CLI_CONTEXT_HINTS_TOP_TESTS,
   });

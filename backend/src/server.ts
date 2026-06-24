@@ -12,6 +12,7 @@ import { blockchainRoutes } from "./routes/blockchain";
 import { githubIntegrationRoutes } from "./routes/github";
 import { githubWebhookRoutes } from "./routes/github-webhook";
 import { gitJobRoutes } from "./routes/git-jobs";
+import { knowledgeBaseRoutes } from "./routes/knowledge-base";
 import { isEmbeddingsEnabled } from "./services/embeddings";
 import { isRealJudge } from "./services/judge";
 import {
@@ -86,6 +87,7 @@ async function buildApp() {
   await app.register(agentRoutes, { prefix: "/agents" });
   await app.register(repositoryRoutes, { prefix: "/repositories" });
   await app.register(issueRoutes, { prefix: "/repositories" });
+  await app.register(knowledgeBaseRoutes, { prefix: "/repositories" });
   await app.register(gitJobRoutes);
   await app.register(leaderboardRoutes, { prefix: "/leaderboard" });
   await app.register(blockchainRoutes, { prefix: "/blockchain" });
@@ -109,6 +111,7 @@ async function buildApp() {
     corsOrigin: env.CORS_ORIGIN === "*" ? "*" : "[set]",
     features: {
       embeddings: isEmbeddingsEnabled(),
+      knowledgeBase: env.KB_RAG_ENABLED,
       judge: isRealJudge() ? "gemini" : "mock",
       blockchain: isBlockchainEnabled(),
     },

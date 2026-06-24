@@ -1,6 +1,7 @@
 import { query } from '../db/client';
 import { env } from '../env';
 import { cosineSimilarity, generateEmbedding, isEmbeddingsEnabled } from './embeddings';
+import { searchKnowledgeSnippets, type KnowledgeSnippet } from './knowledge-base';
 
 interface AgentRow {
   id: string;
@@ -31,6 +32,7 @@ export interface RankedAgent {
   ens_name: string;
   assignment_score: number;
   relevance_score: number;
+  kb_relevance_score: number;
   performance_score: number;
   merge_rate: number;
   quality_score: number;
@@ -64,6 +66,32 @@ function normalizeCosineScore(score: number): number {
   return clamp01((score + 1) / 2);
 }
 
+function computeKnowledgeRelevance(agentProfileText: string, snippets: KnowledgeSnippet[]): number {
+  if (snippets.length === 0) return 0;
+
+  const agentTokens = new Set(tokenize(agentProfileText));
+  if (agentTokens.size === 0) return 0;
+
+  let weightedOverlap = 0;
+  let weightTotal = 0;
+  let bestOverlap = 0;
+  let semanticTotal = 0;
+
+  for (const snippet of snippets) {
+    const snippetTokens = new Set(tokenize(`${snippet.title} ${snippet.content}`));
+    const overlap = overlapScore(snippetTokens, agentTokens);
+    const weight = Math.max(0.05, snippet.score);
+    weightedOverlap += overlap * weight;
+    weightTotal += weight;
+    bestOverlap = Math.max(bestOverlap, overlap);
+    semanticTotal += snippet.score;
+  }
+
+  const overlapScoreWeighted = weightTotal > 0 ? weightedOverlap / weightTotal : 0;
+  const semanticAverage = snippets.length > 0 ? semanticTotal / snippets.length : 0;
+  return clamp01(0.55 * overlapScoreWeighted + 0.25 * bestOverlap + 0.2 * semanticAverage);
+}
+
 function buildAgentProfileText(agent: AgentRow): string {
   const cap = Array.isArray(agent.capabilities) ? agent.capabilities.join(' ') : '';
   return `${agent.ens_name} ${agent.role || ''} ${cap}`;
@@ -72,6 +100,7 @@ function buildAgentProfileText(agent: AgentRow): string {
 export async function rankAgentsForIssue(params: {
   /** Only agents owned by this user participate (capabilities / embeddings stay private). */
   ownerUserId: string;
+  repoId?: string;
   issueTitle: string;
   issueBody: string;
   limit?: number;
@@ -134,32 +163,60 @@ export async function rankAgentsForIssue(params: {
   const issueTokens = new Set(tokenize(issueText));
   const shouldUseVectors = isEmbeddingsEnabled();
   const issueEmbedding = shouldUseVectors ? await generateEmbedding(issueText) : null;
+  let knowledgeMatches: KnowledgeSnippet[] = [];
+
+  if (params.repoId) {
+    try {
+      knowledgeMatches = await searchKnowledgeSnippets({
+        repoId: params.repoId,
+        userId: params.ownerUserId,
+        queryText: issueText,
+        limit: env.KB_ASSIGNMENT_TOP_K,
+        maxSnippetChars: env.KB_HINT_SNIPPET_MAX_CHARS,
+      });
+    } catch (error) {
+      console.warn('[agent-assignment] KB retrieval failed, continuing without KB signal', error);
+    }
+  }
 
   const relevanceEntries = await Promise.all(
     agents.map(async (agent) => {
       const agentProfileText = buildAgentProfileText(agent);
       const agentTokens = new Set(tokenize(agentProfileText));
       const tokenScore = overlapScore(issueTokens, agentTokens);
+      const kbRelevance = computeKnowledgeRelevance(agentProfileText, knowledgeMatches);
 
-      if (!issueEmbedding) {
-        return [agent.id, tokenScore] as const;
+      let baseRelevance = tokenScore;
+
+      if (issueEmbedding) {
+        const agentEmbedding = await generateEmbedding(agentProfileText);
+        if (agentEmbedding) {
+          const vectorScore = normalizeCosineScore(cosineSimilarity(issueEmbedding, agentEmbedding));
+          baseRelevance = clamp01(0.6 * tokenScore + 0.4 * vectorScore);
+        }
       }
 
-      const agentEmbedding = await generateEmbedding(agentProfileText);
-      if (!agentEmbedding) {
-        return [agent.id, tokenScore] as const;
-      }
+      const relevance =
+        knowledgeMatches.length > 0
+          ? clamp01(0.75 * baseRelevance + 0.25 * kbRelevance)
+          : baseRelevance;
 
-      const vectorScore = normalizeCosineScore(cosineSimilarity(issueEmbedding, agentEmbedding));
-      const blendedRelevance = clamp01(0.6 * tokenScore + 0.4 * vectorScore);
-      return [agent.id, blendedRelevance] as const;
+      return [
+        agent.id,
+        {
+          relevance,
+          kbRelevance,
+        },
+      ] as const;
     }),
   );
 
   const relevanceMap = new Map(relevanceEntries);
 
   const ranked = agents.map<RankedAgent>((agent) => {
-    const relevance = relevanceMap.get(agent.id) ?? 0;
+    const relevanceEntry = relevanceMap.get(agent.id);
+    const relevance = relevanceEntry?.relevance ?? 0;
+    const kbRelevance = relevanceEntry?.kbRelevance ?? 0;
 
     const outcome = outcomeMap.get(agent.id);
     const penalty = penaltyMap.get(agent.id);
@@ -201,6 +258,7 @@ export async function rankAgentsForIssue(params: {
       ens_name: agent.ens_name,
       assignment_score: assignment,
       relevance_score: relevance,
+      kb_relevance_score: kbRelevance,
       performance_score: performance,
       merge_rate: mergeRate,
       quality_score: quality,

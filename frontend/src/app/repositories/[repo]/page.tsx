@@ -1,19 +1,24 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { useAuth } from "@/contexts/AuthContext";
 import {
   issueApi,
+  knowledgeBaseApi,
   repoApi,
   type GitJob,
   type Issue,
+  type KnowledgeDocument,
+  type KnowledgeSnippet,
+  type ResolveResponse,
   type Repository,
 } from "@/lib/api";
 
 const ISSUE_PAGE = 15;
 const JOB_PAGE = 10;
+const KB_PAGE = 20;
 const ACTIVE_GIT_JOB_POLL_MS = 2500;
 const ACTIVE_GIT_JOB_STATUSES = new Set(["pending", "running"]);
 
@@ -88,6 +93,25 @@ function isActiveGitJob(j: GitJob): boolean {
   return ACTIVE_GIT_JOB_STATUSES.has(status);
 }
 
+function stripExtension(filename: string): string {
+  return filename.replace(/\.[a-z0-9]+$/i, "").trim();
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("Invalid file read result"));
+        return;
+      }
+      resolve(reader.result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 /** Avoid redundant `pending · pending`; clarify queue state. */
 function gitJobStateLines(j: GitJob): { title: string; subtitle?: string } {
   const st = (j.status || "").trim() || "unknown";
@@ -106,6 +130,59 @@ function gitJobStateLines(j: GitJob): { title: string; subtitle?: string } {
   return {
     title: `${humanizeJobToken(st)} · ${humanizeJobToken(sg)}`,
   };
+}
+
+function decompositionLogForJob(job: GitJob): {
+  reasons: string[];
+  children: Array<{
+    issueId: string;
+    title: string;
+    body: string;
+    agentEns: string;
+    assignmentReason: string;
+  }>;
+} | null {
+  const decomposition = job.payload?.orchestration?.decomposition;
+  if (!decomposition || decomposition.used !== true) return null;
+
+  const reasons = Array.isArray(decomposition.reasons)
+    ? decomposition.reasons
+        .filter((reason): reason is string =>
+          typeof reason === "string" && reason.trim().length > 0,
+        )
+        .slice(0, 8)
+    : [];
+
+  const children = Array.isArray(decomposition.children)
+    ? decomposition.children
+        .map((child) => ({
+          issueId: (child?.issue_id || "").trim(),
+          title: (child?.title || "").trim(),
+          body: (child?.body || "").trim(),
+          agentEns: (child?.agent_ens || "").trim(),
+          assignmentReason: (child?.assignment_reason || "").trim(),
+        }))
+        .filter((child) => child.issueId || child.title || child.agentEns)
+        .slice(0, 20)
+    : [];
+
+  return { reasons, children };
+}
+
+function summarizeResolve(response: ResolveResponse): string {
+  const createdCount = response.created_children?.length ?? 0;
+  const assignedCount =
+    response.jobs?.filter((job) => Boolean(job.agent_ens?.trim())).length ?? 0;
+
+  if (response.plan.path === "single_agent") {
+    return "Single-agent resolve enqueued.";
+  }
+
+  if (response.plan.path === "reuse_children") {
+    return `Reused existing subagents; parent orchestration enqueued as one PR with ${assignedCount} assigned subagents.`;
+  }
+
+  return `Generated ${createdCount} subagents; assigned ${assignedCount}; execution enqueued as one PR.`;
 }
 
 export default function RepositoryDetailPage() {
@@ -127,6 +204,20 @@ export default function RepositoryDetailPage() {
   const [jobPage, setJobPage] = useState(0);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsErr, setJobsErr] = useState<string | null>(null);
+  const [expandedJobLogId, setExpandedJobLogId] = useState<string | null>(null);
+
+  const [kbDocs, setKbDocs] = useState<KnowledgeDocument[]>([]);
+  const [kbTotal, setKbTotal] = useState(0);
+  const [kbLoading, setKbLoading] = useState(false);
+  const [kbErr, setKbErr] = useState<string | null>(null);
+  const [kbUploading, setKbUploading] = useState(false);
+  const [kbUploadErr, setKbUploadErr] = useState<string | null>(null);
+  const [kbDeletingId, setKbDeletingId] = useState<string | null>(null);
+  const [kbQuery, setKbQuery] = useState("");
+  const [kbSearching, setKbSearching] = useState(false);
+  const [kbSearchErr, setKbSearchErr] = useState<string | null>(null);
+  const [kbSearchResults, setKbSearchResults] = useState<KnowledgeSnippet[]>([]);
+  const kbFileRef = useRef<HTMLInputElement>(null);
 
   const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -138,6 +229,7 @@ export default function RepositoryDetailPage() {
   const [resolveBusy, setResolveBusy] = useState(false);
   const [resolveErr, setResolveErr] = useState<string | null>(null);
   const [resolveOk, setResolveOk] = useState<string | null>(null);
+  const [resolveMeta, setResolveMeta] = useState<ResolveResponse | null>(null);
 
   const loadRepo = useCallback(async () => {
     if (!repoId) return;
@@ -187,6 +279,26 @@ export default function RepositoryDetailPage() {
     }
   }, [repoId, jobPage]);
 
+  const loadKnowledgeBase = useCallback(async () => {
+    if (!repoId) return;
+    setKbLoading(true);
+    setKbErr(null);
+    try {
+      const res = await knowledgeBaseApi.list(repoId, {
+        limit: KB_PAGE,
+        offset: 0,
+      });
+      setKbDocs(res.data);
+      setKbTotal(res.pagination.total);
+    } catch (e) {
+      setKbErr(
+        e instanceof Error ? e.message : "Failed to load knowledge documents",
+      );
+    } finally {
+      setKbLoading(false);
+    }
+  }, [repoId]);
+
   useEffect(() => {
     void loadRepo();
   }, [loadRepo]);
@@ -200,6 +312,11 @@ export default function RepositoryDetailPage() {
     if (!repo || !isAuthenticated) return;
     void loadJobs();
   }, [repo, isAuthenticated, loadJobs]);
+
+  useEffect(() => {
+    if (!repo || !isAuthenticated) return;
+    void loadKnowledgeBase();
+  }, [repo, isAuthenticated, loadKnowledgeBase]);
 
   const hasActiveGitJob = jobs.some(isActiveGitJob);
 
@@ -241,13 +358,14 @@ export default function RepositoryDetailPage() {
     setResolveErr(null);
     setResolveOk(null);
     try {
-      await issueApi.resolve(repoId, selectedIssue.id, {
+      const response = await issueApi.resolve(repoId, selectedIssue.id, {
         mode: "execute",
         ...(selectedAgent?.ens_name
           ? { agent_ens: selectedAgent.ens_name }
           : {}),
       });
-      setResolveOk("Resolve enqueued — check git jobs below.");
+      setResolveMeta(response);
+      setResolveOk(summarizeResolve(response));
       await loadJobs();
       await loadIssues();
     } catch (e) {
@@ -257,8 +375,106 @@ export default function RepositoryDetailPage() {
     }
   };
 
+  const runKbUpload = async (file: File) => {
+    if (!repoId) return;
+    setKbUploading(true);
+    setKbUploadErr(null);
+    try {
+      const lower = file.name.toLowerCase();
+      const mime =
+        file.type ||
+        (lower.endsWith(".pdf")
+          ? "application/pdf"
+          : lower.endsWith(".md")
+            ? "text/markdown"
+            : lower.endsWith(".json")
+              ? "application/json"
+              : "text/plain");
+
+      const title = stripExtension(file.name) || "Knowledge document";
+      if (mime === "application/pdf" || lower.endsWith(".pdf")) {
+        const dataUrl = await readFileAsDataUrl(file);
+        const base64 = dataUrl.includes(",") ? dataUrl.split(",").pop() || "" : dataUrl;
+        await knowledgeBaseApi.ingest(repoId, {
+          title,
+          filename: file.name,
+          mime_type: "application/pdf",
+          file_base64: base64,
+        });
+      } else {
+        const content = await file.text();
+        await knowledgeBaseApi.ingest(repoId, {
+          title,
+          filename: file.name,
+          mime_type: mime,
+          content,
+        });
+      }
+
+      await loadKnowledgeBase();
+      setKbSearchResults([]);
+    } catch (e) {
+      setKbUploadErr(
+        e instanceof Error ? e.message : "Failed to upload knowledge document",
+      );
+    } finally {
+      setKbUploading(false);
+      if (kbFileRef.current) {
+        kbFileRef.current.value = "";
+      }
+    }
+  };
+
+  const runKbDelete = async (documentId: string) => {
+    if (!repoId) return;
+    setKbDeletingId(documentId);
+    setKbErr(null);
+    try {
+      await knowledgeBaseApi.remove(repoId, documentId);
+      await loadKnowledgeBase();
+      setKbSearchResults((prev) =>
+        prev.filter((snippet) => snippet.document_id !== documentId),
+      );
+    } catch (e) {
+      setKbErr(
+        e instanceof Error ? e.message : "Failed to delete knowledge document",
+      );
+    } finally {
+      setKbDeletingId(null);
+    }
+  };
+
+  const runKbSearch = async () => {
+    if (!repoId) return;
+    const queryText = kbQuery.trim();
+    if (!queryText) {
+      setKbSearchErr("Enter a search query");
+      return;
+    }
+
+    setKbSearching(true);
+    setKbSearchErr(null);
+    try {
+      const result = await knowledgeBaseApi.search(repoId, {
+        query: queryText,
+        limit: 8,
+      });
+      setKbSearchResults(result.results || []);
+    } catch (e) {
+      setKbSearchErr(e instanceof Error ? e.message : "KB search failed");
+      setKbSearchResults([]);
+    } finally {
+      setKbSearching(false);
+    }
+  };
+
   const issuePages = Math.max(1, Math.ceil(issueTotal / ISSUE_PAGE));
   const jobPages = Math.max(1, Math.ceil(jobTotal / JOB_PAGE));
+  const issuesById = new Map(issues.map((issue) => [issue.id, issue]));
+  const visibleIssues = issues.filter((issue) => !issue.parent_issue_id);
+  const visibleJobs = jobs.filter(
+    (job) => !issuesById.get(job.issue_id)?.parent_issue_id,
+  );
 
   if (!repoId) {
     return (
@@ -429,6 +645,173 @@ export default function RepositoryDetailPage() {
         </div>
       </section>
 
+      <section
+        className="card p-4"
+        style={{
+          backgroundColor: "rgba(255, 255, 255, 0.08)",
+          border: "1px solid rgba(255, 255, 255, 0.1)",
+        }}
+      >
+        <div className="flex items-center justify-between gap-2 flex-wrap mb-3">
+          <div>
+            <h2
+              className="text-lg font-semibold"
+              style={{ color: "var(--fg-default)" }}
+            >
+              Knowledge base
+            </h2>
+            <p className="text-xs" style={{ color: "var(--fg-subtle)" }}>
+              Upload repository knowledge for retrieval-augmented agent execution.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              ref={kbFileRef}
+              type="file"
+              accept=".pdf,.md,.txt,.json"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                void runKbUpload(file);
+              }}
+            />
+            <button
+              type="button"
+              className="btn-secondary text-sm"
+              onClick={() => kbFileRef.current?.click()}
+              disabled={kbUploading}
+            >
+              {kbUploading ? "Uploading…" : "Upload document"}
+            </button>
+          </div>
+        </div>
+
+        {kbUploadErr && (
+          <p className="text-sm mb-2" style={{ color: "#f87171" }}>
+            {kbUploadErr}
+          </p>
+        )}
+        {kbErr && (
+          <p className="text-sm mb-2" style={{ color: "#f87171" }}>
+            {kbErr}
+          </p>
+        )}
+
+        <div className="flex flex-col md:flex-row gap-2 mb-3">
+          <input
+            value={kbQuery}
+            onChange={(e) => setKbQuery(e.target.value)}
+            placeholder="Search repository knowledge"
+            className="w-full rounded px-3 py-2 text-sm bg-transparent border"
+            style={{
+              borderColor: "rgba(255,255,255,0.15)",
+              color: "var(--fg-default)",
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void runKbSearch();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="btn-secondary text-sm"
+            disabled={kbSearching}
+            onClick={() => void runKbSearch()}
+          >
+            {kbSearching ? "Searching…" : "Search"}
+          </button>
+        </div>
+
+        {kbSearchErr && (
+          <p className="text-sm mb-2" style={{ color: "#f87171" }}>
+            {kbSearchErr}
+          </p>
+        )}
+
+        {kbSearchResults.length > 0 && (
+          <div className="mb-4 rounded-lg border p-3" style={{ borderColor: "rgba(255,255,255,0.12)" }}>
+            <p className="text-xs uppercase mb-2" style={{ color: "var(--fg-subtle)" }}>
+              Search results
+            </p>
+            <ul className="space-y-2">
+              {kbSearchResults.map((result) => (
+                <li key={result.chunk_id} className="text-sm" style={{ color: "var(--fg-muted)" }}>
+                  <p style={{ color: "var(--fg-default)" }}>
+                    {result.title}
+                    <span className="ml-2 text-xs" style={{ color: "var(--fg-subtle)" }}>
+                      score {result.score.toFixed(2)}
+                    </span>
+                  </p>
+                  <p className="text-xs" style={{ color: "var(--fg-subtle)" }}>
+                    {result.content}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs" style={{ color: "var(--fg-subtle)" }}>
+            Documents: {kbTotal}
+          </p>
+          <button
+            type="button"
+            className="btn-secondary text-xs"
+            onClick={() => void loadKnowledgeBase()}
+          >
+            Refresh
+          </button>
+        </div>
+
+        {kbLoading ? (
+          <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
+            Loading knowledge documents…
+          </p>
+        ) : kbDocs.length === 0 ? (
+          <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
+            No knowledge documents uploaded yet.
+          </p>
+        ) : (
+          <ul className="space-y-2">
+            {kbDocs.map((doc) => (
+              <li
+                key={doc.id}
+                className="rounded-lg px-3 py-2"
+                style={{
+                  backgroundColor: "rgba(0,0,0,0.25)",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                }}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium truncate" style={{ color: "var(--fg-default)" }}>
+                      {doc.title}
+                    </p>
+                    <p className="text-xs truncate" style={{ color: "var(--fg-muted)" }}>
+                      {doc.source_filename || doc.source_mime_type || "document"}
+                      {typeof doc.chunk_count === "number" ? ` · ${doc.chunk_count} chunks` : ""}
+                      {` · ${Math.round((doc.byte_size || 0) / 1024)} KB`}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs"
+                    disabled={kbDeletingId === doc.id}
+                    onClick={() => void runKbDelete(doc.id)}
+                  >
+                    {kbDeletingId === doc.id ? "Deleting…" : "Delete"}
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div
           className="card p-4"
@@ -507,13 +890,13 @@ export default function RepositoryDetailPage() {
             <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
               Loading issues…
             </p>
-          ) : issues.length === 0 ? (
+          ) : visibleIssues.length === 0 ? (
             <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
               No issues yet.
             </p>
           ) : (
             <ul className="flex flex-col gap-2">
-              {issues.map((issue) => {
+              {visibleIssues.map((issue) => {
                 const sel = selectedIssueId === issue.id;
                 return (
                   <li key={issue.id}>
@@ -588,12 +971,14 @@ export default function RepositoryDetailPage() {
             border: "1px solid rgba(255, 255, 255, 0.1)",
           }}
         >
-          <h2
-            className="text-lg font-semibold mb-3"
-            style={{ color: "var(--fg-default)" }}
-          >
-            Git jobs
-          </h2>
+          <div className="flex items-center justify-between gap-2 flex-wrap mb-3">
+            <h2
+              className="text-lg font-semibold"
+              style={{ color: "var(--fg-default)" }}
+            >
+              Git jobs
+            </h2>
+          </div>
           {jobsErr && (
             <p className="text-sm mb-2" style={{ color: "#f87171" }}>
               {jobsErr}
@@ -603,14 +988,16 @@ export default function RepositoryDetailPage() {
             <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
               Loading jobs…
             </p>
-          ) : jobs.length === 0 ? (
+          ) : visibleJobs.length === 0 ? (
             <p className="text-sm" style={{ color: "var(--fg-muted)" }}>
               No git jobs yet.
             </p>
           ) : (
             <ul className="space-y-2 text-sm">
-              {jobs.map((j) => {
+              {visibleJobs.map((j) => {
                 const jobLines = gitJobStateLines(j);
+                const decompositionLog = decompositionLogForJob(j);
+                const showDecompositionLog = expandedJobLogId === j.id;
                 return (
                 <li
                   key={j.id}
@@ -658,6 +1045,60 @@ export default function RepositoryDetailPage() {
                       {j.error_message}
                     </div>
                   )}
+                  {decompositionLog ? (
+                    <div className="mt-2">
+                      <button
+                        type="button"
+                        className="btn-secondary text-xs"
+                        onClick={() =>
+                          setExpandedJobLogId((prev) =>
+                            prev === j.id ? null : j.id,
+                          )
+                        }
+                      >
+                        {showDecompositionLog
+                          ? "Hide decomposition log"
+                          : "Show decomposition log"}
+                      </button>
+                      {showDecompositionLog ? (
+                        <div
+                          className="mt-2 rounded-md px-2 py-2"
+                          style={{
+                            border: "1px solid rgba(255,255,255,0.08)",
+                            backgroundColor: "rgba(255,255,255,0.04)",
+                          }}
+                        >
+                          {decompositionLog.reasons.length > 0 ? (
+                            <p
+                              className="text-xs"
+                              style={{ color: "var(--fg-subtle)" }}
+                            >
+                              Why decomposed: {decompositionLog.reasons.join(", ")}
+                            </p>
+                          ) : null}
+                          {decompositionLog.children.length > 0 ? (
+                            <ul className="mt-2 space-y-1">
+                              {decompositionLog.children.map((child, index) => (
+                                <li
+                                  key={`${child.issueId || child.title || "child"}-${index}`}
+                                  className="text-xs"
+                                  style={{ color: "var(--fg-muted)" }}
+                                >
+                                  {child.title || child.issueId || "Child issue"}
+                                  {child.agentEns
+                                    ? ` · ${child.agentEns}`
+                                    : ""}
+                                  {child.assignmentReason
+                                    ? ` · ${child.assignmentReason}`
+                                    : ""}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </li>
               );
               })}
@@ -748,6 +1189,12 @@ export default function RepositoryDetailPage() {
                 ? `Resolve as ${selectedAgent.ens_name}`
                 : "Pick an agent in the navbar to pass agent_ens"}
             </p>
+
+            {resolveMeta ? (
+              <p className="text-xs mt-3" style={{ color: "var(--fg-muted)" }}>
+                Workflow: {resolveMeta.plan.decision} · {resolveMeta.plan.path}. Decomposition details are recorded in the PR workflow report.
+              </p>
+            ) : null}
 
             {resolveErr && (
               <p className="text-sm mt-2" style={{ color: "#f87171" }}>

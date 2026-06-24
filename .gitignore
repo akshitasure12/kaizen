@@ -13,6 +13,9 @@ coverage
 /out/
 *.tsbuildinfo
 */tests
+.vscode
+.cursor
+AGENTS.md
 
 # Blockchain / Foundry (contracts/ — see contracts/.gitignore for details)
 contracts/cache/

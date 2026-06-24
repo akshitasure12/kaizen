@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import os from "os";
 import path from "path";
 import { Octokit } from "@octokit/rest";
-import simpleGit from "simple-git";
+import simpleGit, { type SimpleGit } from "simple-git";
 import { pool, query, queryOne } from "../db/client";
 import { env } from "../env";
 import { getGitHubLinkForRepo, getGitHubTokenForUser } from "./github-integration";
@@ -11,10 +11,12 @@ import {
   parseJobCliHints,
   refineCliHintsForWorkspace,
   renderKaizenAgentNote,
+  type CliContextHints,
 } from "./cli-context-hints";
 import {
   generateAutonomousCliPlan,
   generateAutonomousCliRecoveryPlan,
+  extractRequiredArtifactPaths,
   type AutonomousCliPlan,
   type AutonomousCliRecoveryPlan,
 } from "./autonomous-cli-plan";
@@ -24,6 +26,11 @@ import {
   validateToolCommand,
   type ToolExecutionResult as CommandExecutionResult,
 } from "./tool-execution";
+import {
+  editActionsToCommands,
+  sanitizeEditActions,
+  type EditAction,
+} from "./edit-actions";
 
 interface GitJobRow {
   id: string;
@@ -48,9 +55,14 @@ interface GitJobRow {
 interface EditLoopSummary {
   passed: boolean;
   cycles: number;
+  editActionsV1?: EditAction[];
   editCommands: string[];
   verifyCommands: string[];
   fixCommands: string[];
+  strictCandidateCommands?: string[];
+  verifyGateDecision?: VerifyGateDecisionReason;
+  verifyGateReason?: string;
+  probeOnlyVerification?: boolean;
   commandResults: CommandExecutionResult[];
   recoveryPlans: EditLoopRecoverySummary[];
 }
@@ -62,6 +74,7 @@ interface EditLoopRecoverySummary {
   model?: string;
   error?: string;
   failedCommand: string;
+  replacementEditActionsV1?: EditAction[];
   replacementEditCommands: string[];
   recoveryFixCommands: string[];
 }
@@ -72,6 +85,7 @@ interface ResolvedAutonomousPlan {
   model?: string;
   error?: string;
   editCommands: string[];
+  editActionsV1?: EditAction[];
   verifyCommands: string[];
   fixCommands: string[];
 }
@@ -80,6 +94,36 @@ type ErrorClass = "transient" | "permanent";
 
 const workerInstanceId = env.WORKER_INSTANCE_ID || `${os.hostname()}-${process.pid}`;
 const allowedToolCommands = new Set(env.WORKER_ALLOWED_COMMANDS.map((value) => value.toLowerCase()));
+const placeholderPatterns = env.WORKER_PLACEHOLDER_PATTERNS.map((value) => value.toLowerCase());
+
+interface DiffQualityMetrics {
+  addedSubstantiveChars: number;
+  substantiveHunks: number;
+  placeholderLineCount: number;
+}
+
+interface AssignmentExcerpt {
+  title: string;
+  body: string;
+}
+
+type VerifyGateDecisionReason =
+  | "note_only"
+  | "strict_verification_not_required"
+  | "sufficient_strict_commands_found"
+  | "strict_candidates_available_but_not_used"
+  | "probe_only_allowed_no_strict_candidates"
+  | "probe_only_disabled"
+  | "no_verify_commands";
+
+interface VerifyGateDecision {
+  allow: boolean;
+  reason: VerifyGateDecisionReason;
+  strictVerifyCount: number;
+  strictCandidatesAvailable: boolean;
+  probeOnlyVerification: boolean;
+  detail: string;
+}
 
 function slug(s: string): string {
   return (
@@ -89,6 +133,104 @@ function slug(s: string): string {
       .replace(/^-|-$/g, "")
       .slice(0, 40) || "issue"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function extractAssignmentExcerpts(payload: Record<string, unknown> | null): AssignmentExcerpt[] {
+  if (!payload || !isRecord(payload)) return [];
+  const orchestration = payload.orchestration;
+  if (!isRecord(orchestration)) return [];
+
+  const out: AssignmentExcerpt[] = [];
+  const pushAssignment = (entry: unknown) => {
+    if (!isRecord(entry)) return;
+    const title = typeof entry.title === "string" ? entry.title.trim() : "";
+    const body = typeof entry.body === "string" ? entry.body.trim() : "";
+    if (!title && !body) return;
+    out.push({ title, body });
+  };
+
+  if (Array.isArray(orchestration.child_assignments)) {
+    for (const entry of orchestration.child_assignments) {
+      pushAssignment(entry);
+    }
+  }
+
+  const decomposition = orchestration.decomposition;
+  if (isRecord(decomposition) && Array.isArray(decomposition.children)) {
+    for (const entry of decomposition.children) {
+      pushAssignment(entry);
+    }
+  }
+
+  return out;
+}
+
+function buildOrchestrationExecutionBrief(payload: Record<string, unknown> | null): string {
+  if (!payload || !isRecord(payload)) return "";
+  const orchestration = payload.orchestration;
+  if (!isRecord(orchestration)) return "";
+
+  const lines: string[] = [];
+  if (typeof orchestration.mode === "string" && orchestration.mode.trim().length > 0) {
+    lines.push(`Execution mode: ${orchestration.mode.trim()}`);
+  }
+  if (
+    typeof orchestration.parent_issue_id === "string" &&
+    orchestration.parent_issue_id.trim().length > 0
+  ) {
+    lines.push(`Parent issue: ${orchestration.parent_issue_id.trim()}`);
+  }
+
+  const assignments = extractAssignmentExcerpts(payload);
+  if (assignments.length > 0) {
+    lines.push("Child assignment requirements:");
+    for (const assignment of assignments.slice(0, 20)) {
+      const title = assignment.title || "(untitled)";
+      lines.push(`- ${title}`);
+      if (assignment.body) {
+        lines.push(`  ${assignment.body}`);
+      }
+    }
+  }
+
+  return lines.join("\n").trim();
+}
+
+export function deriveRequiredArtifactsForJob(params: {
+  issueTitle: string;
+  issueBody: string;
+  payload: Record<string, unknown> | null;
+  contextHints: CliContextHints | null;
+}): string[] {
+  const snippets: string[] = [params.issueBody || ""];
+  const assignmentExcerpts = extractAssignmentExcerpts(params.payload);
+  for (const assignment of assignmentExcerpts) {
+    if (assignment.title) snippets.push(assignment.title);
+    if (assignment.body) snippets.push(assignment.body);
+  }
+
+  if (params.contextHints?.ranked_files?.length) {
+    snippets.push(
+      ...params.contextHints.ranked_files
+        .slice(0, Math.max(3, env.CLI_CONTEXT_HINTS_MAX_FILES))
+        .map((hint) => hint.path),
+    );
+  }
+
+  return extractRequiredArtifactPaths(params.issueTitle, snippets.join("\n"));
+}
+
+export function buildDefaultBranchName(params: {
+  jobId: string;
+  issueId: string;
+  issueTitle: string;
+}): string {
+  const base = `agent/${params.issueId.slice(0, 8)}-${slug(params.issueTitle)}-${params.jobId.slice(0, 8)}`;
+  return base.slice(0, 120);
 }
 
 async function rmrf(dir: string): Promise<void> {
@@ -118,6 +260,127 @@ export function classifyError(message: string): ErrorClass {
   return "permanent";
 }
 
+export function isNonFastForwardPushError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("non-fast-forward") ||
+    m.includes("fetch first") ||
+    m.includes("failed to push some refs") ||
+    m.includes("updates were rejected because the remote contains work") ||
+    (m.includes("[rejected]") && m.includes("(fetch first)"))
+  );
+}
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function readFetchedHeadSha(git: Pick<SimpleGit, "raw">): Promise<string | null> {
+  try {
+    const output = (await git.raw(["rev-parse", "FETCH_HEAD"])) || "";
+    const value = output.trim().split(/\s+/)[0] || "";
+    return /^[0-9a-f]{40}$/i.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function forcePushWithLease(params: {
+  git: Pick<SimpleGit, "raw">;
+  branchName: string;
+  expectedRemoteSha: string | null;
+}): Promise<void> {
+  const targetRef = `refs/heads/${params.branchName}`;
+  const leaseArg = params.expectedRemoteSha
+    ? `--force-with-lease=${targetRef}:${params.expectedRemoteSha}`
+    : `--force-with-lease=${targetRef}`;
+  await params.git.raw(["push", leaseArg, "origin", `HEAD:${targetRef}`]);
+}
+
+export async function pushBranchWithRecovery(params: {
+  git: Pick<SimpleGit, "push" | "fetch" | "raw">;
+  branchName: string;
+  onRecoveryStart?: (details: { initialError: string }) => Promise<void>;
+}): Promise<{ recovered: boolean; strategy: "none" | "rebase" | "force_with_lease" }> {
+  try {
+    await params.git.push("origin", params.branchName);
+    return { recovered: false, strategy: "none" };
+  } catch (pushError: unknown) {
+    const initialError = toErrorMessage(pushError);
+    if (!isNonFastForwardPushError(initialError)) {
+      throw pushError;
+    }
+
+    if (params.onRecoveryStart) {
+      await params.onRecoveryStart({ initialError });
+    }
+
+    try {
+      await params.git.fetch("origin", params.branchName);
+    } catch (fetchError: unknown) {
+      const fetchMessage = toErrorMessage(fetchError);
+      throw new Error(
+        `Push rejected for '${params.branchName}' (non-fast-forward); failed to fetch remote branch before retry: ${fetchMessage}`,
+      );
+    }
+
+    let fetchedHeadSha = await readFetchedHeadSha(params.git);
+
+    try {
+      // Fetch may update FETCH_HEAD without creating origin/<branch> locally.
+      await params.git.raw(["rebase", "FETCH_HEAD"]);
+    } catch (rebaseError: unknown) {
+      try {
+        await params.git.raw(["rebase", "--abort"]);
+      } catch {
+        // noop: best-effort cleanup after failed rebase
+      }
+      const rebaseMessage = toErrorMessage(rebaseError);
+      try {
+        await forcePushWithLease({
+          git: params.git,
+          branchName: params.branchName,
+          expectedRemoteSha: fetchedHeadSha,
+        });
+        return { recovered: true, strategy: "force_with_lease" };
+      } catch (forceError: unknown) {
+        const forceMessage = toErrorMessage(forceError);
+        throw new Error(
+          `Push rejected for '${params.branchName}' (non-fast-forward); automatic rebase onto fetched remote head failed: ${rebaseMessage}; force-with-lease fallback failed: ${forceMessage}`,
+        );
+      }
+    }
+
+    try {
+      await params.git.push("origin", params.branchName);
+    } catch (retryError: unknown) {
+      const retryMessage = toErrorMessage(retryError);
+      if (isNonFastForwardPushError(retryMessage)) {
+        try {
+          await params.git.fetch("origin", params.branchName);
+          fetchedHeadSha = await readFetchedHeadSha(params.git);
+          await forcePushWithLease({
+            git: params.git,
+            branchName: params.branchName,
+            expectedRemoteSha: fetchedHeadSha,
+          });
+          return { recovered: true, strategy: "force_with_lease" };
+        } catch (forceError: unknown) {
+          const forceMessage = toErrorMessage(forceError);
+          throw new Error(
+            `Push retry failed after reconciling branch '${params.branchName}': ${retryMessage}; force-with-lease fallback failed: ${forceMessage}`,
+          );
+        }
+      }
+      throw new Error(
+        `Push retry failed after reconciling branch '${params.branchName}': ${retryMessage}`,
+      );
+    }
+
+    return { recovered: true, strategy: "rebase" };
+  }
+}
+
 export function retryBackoffMs(attempt: number): number {
   const power = Math.max(0, attempt - 1);
   const value = env.WORKER_BASE_RETRY_MS * Math.pow(2, power);
@@ -126,9 +389,214 @@ export function retryBackoffMs(attempt: number): number {
   return Math.min(env.WORKER_MAX_RETRY_MS, capped + jitter);
 }
 
+export function passesAwaitingMergeScoreGate(params: {
+  score: number;
+  minScore: number;
+}): boolean {
+  if (params.minScore <= 0) return true;
+  return params.score >= params.minScore;
+}
+
 function truncateText(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   return value.slice(value.length - maxLength);
+}
+
+function normalizeForSubstance(value: string): string {
+  return value
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/<!--([\s\S]*?)-->/g, " ")
+    .replace(/(^|\n)\s*\/\/.*$/gm, " ")
+    .replace(/(^|\n)\s*#.*$/gm, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isPlaceholderOnlyLine(value: string): boolean {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (!normalized) return false;
+  const tokens = normalized.split(/\s+/).filter((token) => token.length > 0);
+  if (tokens.length === 0 || tokens.length > 4) return false;
+  return tokens.every((token) => placeholderPatterns.includes(token));
+}
+
+function computeDiffQualityMetrics(diffText: string): DiffQualityMetrics {
+  const lines = diffText.split("\n");
+  let addedSubstantiveChars = 0;
+  let placeholderLineCount = 0;
+  let currentHunkHasSubstantiveChanges = false;
+  let substantiveHunks = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("@@ ")) {
+      if (currentHunkHasSubstantiveChanges) substantiveHunks += 1;
+      currentHunkHasSubstantiveChanges = false;
+      continue;
+    }
+
+    if (!line.startsWith("+") || line.startsWith("+++ ")) {
+      continue;
+    }
+
+    const addedLine = line.slice(1);
+    if (isPlaceholderOnlyLine(addedLine)) {
+      placeholderLineCount += 1;
+    }
+
+    const normalized = normalizeForSubstance(addedLine);
+    if (normalized.length > 0) {
+      currentHunkHasSubstantiveChanges = true;
+      addedSubstantiveChars += normalized.length;
+    }
+  }
+
+  if (currentHunkHasSubstantiveChanges) substantiveHunks += 1;
+
+  return {
+    addedSubstantiveChars,
+    substantiveHunks,
+    placeholderLineCount,
+  };
+}
+
+function countStrictVerificationCommands(commands: string[]): number {
+  return commands.filter((command) => isStrictVerificationCommand(command)).length;
+}
+
+export function resolveVerifyGateDecision(params: {
+  verifyCommands: string[];
+  strictCandidateCommands: string[];
+  requireStrictVerify: boolean;
+  minStrictVerifyCommands: number;
+  allowNoteOnly: boolean;
+  verifyGateMode: "log" | "warn" | "strict";
+  allowProbeOnlyWhenNoStrictCandidates: boolean;
+}): VerifyGateDecision {
+  const strictVerifyCount = countStrictVerificationCommands(params.verifyCommands);
+  const strictCandidatesAvailable = params.strictCandidateCommands.length > 0;
+  const probeOnlyVerification = params.verifyCommands.length > 0 && strictVerifyCount === 0;
+
+  if (params.allowNoteOnly) {
+    return {
+      allow: true,
+      reason: "note_only",
+      strictVerifyCount,
+      strictCandidatesAvailable,
+      probeOnlyVerification,
+      detail: "note_only mode enabled",
+    };
+  }
+
+  if (params.verifyCommands.length === 0) {
+    return {
+      allow: false,
+      reason: "no_verify_commands",
+      strictVerifyCount,
+      strictCandidatesAvailable,
+      probeOnlyVerification,
+      detail: "no verification commands provided",
+    };
+  }
+
+  if (!params.requireStrictVerify) {
+    return {
+      allow: true,
+      reason: "strict_verification_not_required",
+      strictVerifyCount,
+      strictCandidatesAvailable,
+      probeOnlyVerification,
+      detail: "strict verification disabled by policy",
+    };
+  }
+
+  if (strictVerifyCount >= params.minStrictVerifyCommands) {
+    return {
+      allow: true,
+      reason: "sufficient_strict_commands_found",
+      strictVerifyCount,
+      strictCandidatesAvailable,
+      probeOnlyVerification,
+      detail: `strict verification satisfied: required ${params.minStrictVerifyCommands}, got ${strictVerifyCount}`,
+    };
+  }
+
+  if (strictCandidatesAvailable) {
+    const strictMessage = `insufficient_strict_verify: required ${params.minStrictVerifyCommands}, got ${strictVerifyCount}; strict candidates were available`;
+    if (params.verifyGateMode === "strict") {
+      return {
+        allow: false,
+        reason: "strict_candidates_available_but_not_used",
+        strictVerifyCount,
+        strictCandidatesAvailable,
+        probeOnlyVerification,
+        detail: strictMessage,
+      };
+    }
+
+    return {
+      allow: true,
+      reason: "strict_candidates_available_but_not_used",
+      strictVerifyCount,
+      strictCandidatesAvailable,
+      probeOnlyVerification,
+      detail: strictMessage,
+    };
+  }
+
+  if (!params.allowProbeOnlyWhenNoStrictCandidates) {
+    return {
+      allow: false,
+      reason: "probe_only_disabled",
+      strictVerifyCount,
+      strictCandidatesAvailable,
+      probeOnlyVerification,
+      detail: "probe-only verification is disabled by policy when strict candidates are unavailable",
+    };
+  }
+
+  return {
+    allow: true,
+    reason: "probe_only_allowed_no_strict_candidates",
+    strictVerifyCount,
+    strictCandidatesAvailable,
+    probeOnlyVerification,
+    detail: "strict candidates unavailable; probe-only verification allowed with elevated artifact quality checks",
+  };
+}
+
+async function validateRequiredArtifactContent(params: {
+  workDir: string;
+  requiredArtifacts: string[];
+  minSubstantiveChars?: number;
+}): Promise<{ ok: boolean; reason?: string }> {
+  const minSubstantiveChars = Math.max(1, params.minSubstantiveChars ?? 24);
+  for (const artifactPath of params.requiredArtifacts) {
+    const absolutePath = path.resolve(params.workDir, artifactPath);
+    const relativePath = path.relative(params.workDir, absolutePath).replace(/\\/g, "/");
+    if (relativePath.startsWith("../") || path.isAbsolute(relativePath)) {
+      return { ok: false, reason: `required artifact path is unsafe: ${artifactPath}` };
+    }
+
+    let content = "";
+    try {
+      content = await fs.readFile(absolutePath, "utf8");
+    } catch {
+      return { ok: false, reason: `required artifact missing: ${artifactPath}` };
+    }
+
+    const normalized = normalizeForSubstance(content);
+    if (normalized.length < minSubstantiveChars) {
+      return {
+        ok: false,
+        reason: `required artifact content is too small: ${artifactPath} (min ${minSubstantiveChars} substantive chars)`,
+      };
+    }
+    if (isPlaceholderOnlyLine(normalized)) {
+      return { ok: false, reason: `required artifact looks like placeholder-only content: ${artifactPath}` };
+    }
+  }
+
+  return { ok: true };
 }
 
 function toStringArray(value: unknown): string[] {
@@ -164,6 +632,43 @@ function commandLooksLikeNonBlockingProbe(command: string): boolean {
   );
 }
 
+function commandExecutable(command: string): string {
+  const token = command
+    .trim()
+    .split(/\s+/)
+    .map((value) => value.trim())
+    .find((value) => value.length > 0);
+  return token ? token.toLowerCase() : "";
+}
+
+function looksLikeMissingArtifactFailure(result: CommandExecutionResult): boolean {
+  if (result.blockedReason || result.timedOut || result.exitCode === 0) return false;
+
+  const executable = commandExecutable(result.command);
+  const artifactProbeCommand =
+    executable === "ls" ||
+    executable === "cat" ||
+    executable === "sed" ||
+    executable === "grep" ||
+    executable === "rg" ||
+    executable === "find" ||
+    executable === "test" ||
+    executable === "stat";
+
+  if (!artifactProbeCommand) {
+    return false;
+  }
+
+  const output = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    output.includes("no such file") ||
+    output.includes("cannot access") ||
+    output.includes("can't open") ||
+    output.includes("does not exist") ||
+    output.includes("not found")
+  );
+}
+
 function isStrictVerificationCommand(command: string): boolean {
   return !commandLooksLikeNonBlockingProbe(command);
 }
@@ -193,6 +698,323 @@ function uniqStrings(values: string[]): string[] {
   return ordered;
 }
 
+function parseIntSafe(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  }
+  return 0;
+}
+
+export function normalizeWorkflowDiffFiles(
+  files: Array<{ file: string; insertions?: unknown; deletions?: unknown }>,
+): Array<{ file: string; insertions: number; deletions: number }> {
+  return files.map((file) => ({
+    file: file.file,
+    insertions: parseIntSafe(file.insertions),
+    deletions: parseIntSafe(file.deletions),
+  }));
+}
+
+function encodeGitHubPath(pathValue: string): string {
+  return pathValue
+    .split("/")
+    .filter((part) => part.length > 0)
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+function buildGitHubFileUrl(params: {
+  owner: string;
+  repo: string;
+  branchName: string;
+  filePath: string;
+}): string {
+  const encodedPath = encodeGitHubPath(params.filePath);
+  return `https://github.com/${params.owner}/${params.repo}/blob/${encodeURIComponent(params.branchName)}/${encodedPath}`;
+}
+
+export function parseDiffLineAnchors(params: {
+  diffText: string;
+  owner: string;
+  repo: string;
+  branchName: string;
+  maxAnchors?: number;
+}): Array<{ path: string; startLine: number; endLine: number; url: string }> {
+  const maxAnchors = Math.max(1, params.maxAnchors ?? 24);
+  const lines = params.diffText.split("\n");
+  const anchors: Array<{ path: string; startLine: number; endLine: number; url: string }> = [];
+  const seen = new Set<string>();
+  let currentPath: string | null = null;
+  const root = `https://github.com/${params.owner}/${params.repo}/blob/${encodeURIComponent(params.branchName)}`;
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      const parts = line.trim().split(/\s+/);
+      const bPath = parts[3] || "";
+      currentPath = bPath.startsWith("b/") ? bPath.slice(2) : null;
+      continue;
+    }
+
+    if (line.startsWith("+++ ")) {
+      const value = line.slice(4).trim();
+      if (value.startsWith("b/")) {
+        currentPath = value.slice(2);
+      }
+      continue;
+    }
+
+    if (!currentPath || !line.startsWith("@@ ")) {
+      continue;
+    }
+
+    const hunk = line.match(/\+(\d+)(?:,(\d+))?/);
+    if (!hunk) continue;
+    const startLine = Number.parseInt(hunk[1] || "0", 10);
+    if (!Number.isFinite(startLine) || startLine <= 0) continue;
+    const count = Number.parseInt(hunk[2] || "1", 10);
+    const safeCount = Number.isFinite(count) && count > 0 ? count : 1;
+    const endLine = startLine + safeCount - 1;
+    const key = `${currentPath}:${startLine}:${endLine}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const encodedPath = encodeGitHubPath(currentPath);
+    anchors.push({
+      path: currentPath,
+      startLine,
+      endLine,
+      url:
+        endLine > startLine
+          ? `${root}/${encodedPath}#L${startLine}-L${endLine}`
+          : `${root}/${encodedPath}#L${startLine}`,
+    });
+    if (anchors.length >= maxAnchors) break;
+  }
+
+  return anchors;
+}
+
+function summarizeCommandResults(results: CommandExecutionResult[]): {
+  total: number;
+  failed: number;
+  blocked: number;
+  timedOut: number;
+  byPhase: Record<string, number>;
+} {
+  const byPhase: Record<string, number> = { edit: 0, verify: 0, fix: 0 };
+  let failed = 0;
+  let blocked = 0;
+  let timedOut = 0;
+
+  for (const result of results) {
+    byPhase[result.phase] = (byPhase[result.phase] || 0) + 1;
+    if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
+      failed += 1;
+    }
+    if (result.blockedReason) blocked += 1;
+    if (result.timedOut) timedOut += 1;
+  }
+
+  return {
+    total: results.length,
+    failed,
+    blocked,
+    timedOut,
+    byPhase,
+  };
+}
+
+export function buildPullRequestWorkflowBody(params: {
+  job: GitJobRow;
+  issueTitle: string;
+  issueBody: string;
+  owner: string;
+  repo: string;
+  branchName: string;
+  baseBranch: string;
+  agentEns: string;
+  autonomousPlan: ResolvedAutonomousPlan | null;
+  editLoop: EditLoopSummary;
+  diffSummary: {
+    changed: number;
+    insertions: number;
+    deletions: number;
+    files: Array<{ file: string; insertions: number | string; deletions: number | string }>;
+  };
+  diffText: string;
+}): string {
+  const orchestration =
+    params.job.payload && typeof params.job.payload.orchestration === "object"
+      ? (params.job.payload.orchestration as Record<string, unknown>)
+      : null;
+  const mode = typeof orchestration?.mode === "string" ? orchestration.mode : "single_agent";
+  const parentIssueId =
+    typeof orchestration?.parent_issue_id === "string" ? orchestration.parent_issue_id : null;
+  const childIndex =
+    typeof orchestration?.child_index === "number"
+      ? orchestration.child_index
+      : typeof orchestration?.child_index === "string"
+        ? Number.parseInt(orchestration.child_index, 10)
+        : null;
+  const complexityScore =
+    typeof orchestration?.plan_complexity_score === "number"
+      ? orchestration.plan_complexity_score
+      : null;
+  const decomposition =
+    orchestration && typeof orchestration.decomposition === "object"
+      ? (orchestration.decomposition as {
+          used?: unknown;
+          reasons?: unknown;
+          children?: unknown;
+        })
+      : null;
+  const decompositionUsed = decomposition?.used === true;
+  const decompositionReasons = Array.isArray(decomposition?.reasons)
+    ? decomposition.reasons
+        .filter((reason): reason is string => typeof reason === "string" && reason.trim().length > 0)
+        .slice(0, 8)
+    : [];
+  const decompositionChildren = Array.isArray(decomposition?.children)
+    ? decomposition.children
+        .filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null)
+        .map((entry) => ({
+          issueId: typeof entry.issue_id === "string" ? entry.issue_id : "",
+          title: typeof entry.title === "string" ? entry.title : "",
+          body: typeof entry.body === "string" ? entry.body : "",
+          agentEns: typeof entry.agent_ens === "string" ? entry.agent_ens : "",
+          assignmentReason:
+            typeof entry.assignment_reason === "string" ? entry.assignment_reason : "",
+        }))
+        .filter((entry) => entry.issueId || entry.title || entry.agentEns)
+        .slice(0, 20)
+    : [];
+
+  const commandSummary = summarizeCommandResults(params.editLoop.commandResults);
+  const anchors = parseDiffLineAnchors({
+    diffText: params.diffText,
+    owner: params.owner,
+    repo: params.repo,
+    branchName: params.branchName,
+  });
+  const topAnchors = anchors.slice(0, 12);
+  const changedFiles = params.diffSummary.files.slice(0, 20);
+  const changedFilesWithLinks = changedFiles.map((file) => ({
+    ...file,
+    url: buildGitHubFileUrl({
+      owner: params.owner,
+      repo: params.repo,
+      branchName: params.branchName,
+      filePath: file.file,
+    }),
+  }));
+
+  const sections: string[] = [];
+  sections.push(`## Kaizen Workflow Report`);
+  sections.push(`<!-- kaizen-workflow:${params.job.id} -->`);
+  sections.push("");
+  sections.push(`### Issue`);
+  sections.push(`- Title: ${params.issueTitle}`);
+  sections.push(`- Issue ID: \`${params.job.issue_id}\``);
+  if (params.issueBody.trim().length > 0) {
+    sections.push(`- Spec excerpt: ${truncateText(params.issueBody.trim(), 260)}`);
+  }
+  sections.push("");
+  sections.push(`### Agent Attribution`);
+  sections.push(`- Producer agent: \`${params.agentEns}\``);
+  sections.push(`- Job ID: \`${params.job.id}\``);
+  sections.push(`- Branch: \`${params.branchName}\``);
+  sections.push(`- Base branch: \`${params.baseBranch}\``);
+  sections.push("");
+  sections.push(`### Orchestration Decisions`);
+  sections.push(`- Mode: \`${mode}\``);
+  if (parentIssueId) {
+    sections.push(`- Parent issue: \`${parentIssueId}\``);
+  }
+  if (typeof childIndex === "number" && Number.isFinite(childIndex)) {
+    sections.push(`- Child index: ${childIndex}`);
+  }
+  if (complexityScore != null) {
+    sections.push(`- Planner complexity score: ${complexityScore.toFixed(3)}`);
+  }
+  sections.push(`- Decomposition used: ${decompositionUsed}`);
+  if (decompositionReasons.length > 0) {
+    sections.push(`- Decomposition reasons: ${decompositionReasons.join(", ")}`);
+  }
+  if (decompositionChildren.length > 0) {
+    sections.push(`- Decomposition child issues and assigned agents:`);
+    for (const child of decompositionChildren) {
+      const title = child.title || "(untitled child issue)";
+      const childIdSuffix = child.issueId ? ` · ${child.issueId}` : "";
+      const childAgent = child.agentEns ? ` · ${child.agentEns}` : "";
+      const childReason = child.assignmentReason ? ` · ${child.assignmentReason}` : "";
+      sections.push(`  - ${title}${childIdSuffix}${childAgent}${childReason}`);
+      if (child.body) {
+        sections.push(`    - Why: ${truncateText(child.body, 240)}`);
+      }
+    }
+  }
+  sections.push("");
+  sections.push(`### Planning And Execution`);
+  sections.push(`- Autonomous plan source: \`${params.autonomousPlan?.source || "payload_or_manual"}\``);
+  if (params.autonomousPlan?.summary) {
+    sections.push(`- Autonomous plan summary: ${params.autonomousPlan.summary}`);
+  }
+  if (params.autonomousPlan?.model) {
+    sections.push(`- Planner model: \`${params.autonomousPlan.model}\``);
+  }
+  sections.push(`- Edit loop passed: ${params.editLoop.passed}`);
+  sections.push(`- Edit loop cycles: ${params.editLoop.cycles}`);
+  sections.push(`- Recovery plans applied: ${params.editLoop.recoveryPlans.length}`);
+  sections.push(
+    `- Command results: total=${commandSummary.total}, failed=${commandSummary.failed}, blocked=${commandSummary.blocked}, timed_out=${commandSummary.timedOut}`,
+  );
+  sections.push(
+    `- Command phase counts: edit=${commandSummary.byPhase.edit || 0}, verify=${commandSummary.byPhase.verify || 0}, fix=${commandSummary.byPhase.fix || 0}`,
+  );
+  sections.push("");
+  sections.push(`### Diff Summary`);
+  sections.push(
+    `- Changed files: ${params.diffSummary.changed}, insertions: ${params.diffSummary.insertions}, deletions: ${params.diffSummary.deletions}`,
+  );
+  if (changedFiles.length > 0) {
+    sections.push(`- File deltas:`);
+    for (const file of changedFilesWithLinks) {
+      sections.push(
+        `  - [${file.file}](${file.url}) (+${parseIntSafe(file.insertions)}, -${parseIntSafe(file.deletions)})`,
+      );
+    }
+  }
+  if (topAnchors.length > 0) {
+    sections.push(`- File and line links:`);
+    for (const anchor of topAnchors) {
+      const label =
+        anchor.endLine > anchor.startLine
+          ? `${anchor.path}:${anchor.startLine}-${anchor.endLine}`
+          : `${anchor.path}:${anchor.startLine}`;
+      sections.push(`  - [${label}](${anchor.url})`);
+    }
+  }
+  sections.push("");
+  sections.push(`### Changes By Agent`);
+  sections.push(
+    `- ${params.agentEns}: produced this PR's implementation changes across ${changedFilesWithLinks.length} files.`,
+  );
+  if (changedFilesWithLinks.length > 0) {
+    for (const file of changedFilesWithLinks.slice(0, 12)) {
+      sections.push(`  - [${file.file}](${file.url})`);
+    }
+  }
+  sections.push("");
+  sections.push(`### Repository`);
+  sections.push(`- Compare view: https://github.com/${params.owner}/${params.repo}/compare/${encodeURIComponent(params.baseBranch)}...${encodeURIComponent(params.branchName)}`);
+
+  return sections.join("\n");
+}
+
 function isBooleanFalse(value: unknown): boolean {
   return value === false || value === "false" || value === "0";
 }
@@ -219,6 +1041,7 @@ function compactCommandResult(result: CommandExecutionResult): Record<string, un
     command: result.command,
     command_bin: result.executable,
     command_args: result.args,
+    action_type: result.actionType || null,
     exit_code: result.exitCode,
     signal: result.signal,
     duration_ms: result.durationMs,
@@ -270,7 +1093,11 @@ async function recordToolExecution(jobId: string, result: CommandExecutionResult
         result.cycle,
         result.command,
         result.executable,
-        JSON.stringify(result.args),
+        JSON.stringify(
+          result.actionType
+            ? [...result.args, { __action_type: result.actionType }]
+            : result.args,
+        ),
         result.blockedReason ? "blocked" : "executed",
         result.exitCode,
         result.signal,
@@ -305,6 +1132,23 @@ export function resolveVerificationCommands(params: {
   return (strict.length > 0 ? strict : merged).slice(0, env.WORKER_TOOL_MAX_COMMANDS);
 }
 
+function resolveStrictCandidateCommands(params: {
+  contextHints: CliContextHints | null;
+  hintedVerifyCommands: string[];
+  autonomousVerifyCommands?: string[];
+}): string[] {
+  const hintedStrict = toStringArray(params.contextHints?.command_suggestions.strict);
+  const merged = uniqCommands([
+    ...hintedStrict,
+    ...params.hintedVerifyCommands,
+    ...(params.autonomousVerifyCommands || []),
+  ]);
+
+  return merged
+    .filter((command) => isStrictVerificationCommand(command))
+    .slice(0, env.WORKER_TOOL_MAX_COMMANDS);
+}
+
 export function resolveFixCommands(
   payload: Record<string, unknown> | null,
   autonomousFixCommands: string[] = [],
@@ -314,13 +1158,205 @@ export function resolveFixCommands(
   return merged.slice(0, env.WORKER_TOOL_MAX_COMMANDS);
 }
 
+export function resolveEditActions(
+  payload: Record<string, unknown> | null,
+  autonomousEditActionsV1: EditAction[] = [],
+): EditAction[] {
+  const payloadEditActions = sanitizeEditActions({
+    value: payload?.edit_actions_v1,
+    maxActions: env.WORKER_TOOL_MAX_COMMANDS,
+    maxStringLength: Math.min(8000, env.WORKER_COMMAND_MAX_LENGTH * 8),
+  });
+  if (payloadEditActions.length > 0) {
+    return payloadEditActions;
+  }
+
+  return autonomousEditActionsV1.slice(0, env.WORKER_TOOL_MAX_COMMANDS);
+}
+
 export function resolveEditCommands(
   payload: Record<string, unknown> | null,
   autonomousEditCommands: string[] = [],
+  autonomousEditActionsV1: EditAction[] = [],
 ): string[] {
+  const actionCommands = editActionsToCommands({
+    actions: resolveEditActions(payload, autonomousEditActionsV1),
+    maxCommands: env.WORKER_TOOL_MAX_COMMANDS,
+    maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+  });
+  if (actionCommands.length > 0) {
+    return actionCommands;
+  }
+
   const payloadCommands = uniqCommands(toStringArray(payload?.edit_commands));
-  const merged = payloadCommands.length > 0 ? payloadCommands : uniqCommands(autonomousEditCommands);
+  if (payloadCommands.length > 0) {
+    return payloadCommands.slice(0, env.WORKER_TOOL_MAX_COMMANDS);
+  }
+
+  const merged = uniqCommands(autonomousEditCommands);
   return merged.slice(0, env.WORKER_TOOL_MAX_COMMANDS);
+}
+
+function actionCommandLabel(action: EditAction): string {
+  return `edit_action ${action.type} ${action.file_path}`;
+}
+
+function actionResult(params: {
+  action: EditAction;
+  cycle: number;
+  startedAt: number;
+  exitCode: number;
+  stdout?: string;
+  stderr?: string;
+  blockedReason?: string | null;
+}): CommandExecutionResult {
+  return {
+    command: actionCommandLabel(params.action),
+    executable: "edit-action",
+    args: [params.action.type, params.action.file_path],
+    actionType: params.action.type,
+    phase: "edit",
+    cycle: params.cycle,
+    exitCode: params.exitCode,
+    signal: null,
+    durationMs: Date.now() - params.startedAt,
+    timedOut: false,
+    stdout: params.stdout || "",
+    stderr: params.stderr || "",
+    blockedReason: params.blockedReason || null,
+  };
+}
+
+export async function executeEditAction(params: {
+  action: EditAction;
+  cycle: number;
+  workDir: string;
+}): Promise<CommandExecutionResult> {
+  const startedAt = Date.now();
+  const relative = params.action.file_path.replace(/\\/g, "/").replace(/^\.\//, "");
+  const resolved = path.resolve(params.workDir, relative);
+  const rel = path.relative(params.workDir, resolved).replace(/\\/g, "/");
+
+  if (!relative || rel.startsWith("../") || path.isAbsolute(relative)) {
+    return actionResult({
+      action: params.action,
+      cycle: params.cycle,
+      startedAt,
+      exitCode: -1,
+      blockedReason: "path traversal syntax is not allowed",
+    });
+  }
+
+  try {
+    if (params.action.type === "replace_text") {
+      const source = await fs.readFile(resolved, "utf8");
+      if (params.action.old_string === params.action.new_string) {
+        return actionResult({
+          action: params.action,
+          cycle: params.cycle,
+          startedAt,
+          exitCode: 0,
+          stdout: "no-op: old_string equals new_string",
+        });
+      }
+
+      if (!source.includes(params.action.old_string)) {
+        return actionResult({
+          action: params.action,
+          cycle: params.cycle,
+          startedAt,
+          exitCode: 3,
+          stderr: "old_string not found",
+        });
+      }
+
+      let next = source;
+      if (params.action.replace_all) {
+        next = source.split(params.action.old_string).join(params.action.new_string);
+      } else {
+        const first = source.indexOf(params.action.old_string);
+        const second = source.indexOf(params.action.old_string, first + params.action.old_string.length);
+        if (second >= 0) {
+          return actionResult({
+            action: params.action,
+            cycle: params.cycle,
+            startedAt,
+            exitCode: 4,
+            stderr: "old_string is not unique; set replace_all or provide more context",
+          });
+        }
+        next = source.replace(params.action.old_string, params.action.new_string);
+      }
+
+      if (next !== source) {
+        await fs.writeFile(resolved, next, "utf8");
+      }
+      return actionResult({
+        action: params.action,
+        cycle: params.cycle,
+        startedAt,
+        exitCode: 0,
+      });
+    }
+
+    if (params.action.type === "append_text") {
+      const source = await fs.readFile(resolved, "utf8");
+      if (source.includes(params.action.content)) {
+        return actionResult({
+          action: params.action,
+          cycle: params.cycle,
+          startedAt,
+          exitCode: 0,
+          stdout: "no-op: content already present",
+        });
+      }
+      const next = `${source.replace(/\s*$/, "")}\n\n${params.action.content}\n`;
+      await fs.writeFile(resolved, next, "utf8");
+      return actionResult({
+        action: params.action,
+        cycle: params.cycle,
+        startedAt,
+        exitCode: 0,
+      });
+    }
+
+    const parent = path.dirname(resolved);
+    if (params.action.create_if_missing) {
+      await fs.mkdir(parent, { recursive: true });
+    }
+
+    let existing: string | null = null;
+    try {
+      existing = await fs.readFile(resolved, "utf8");
+    } catch (error) {
+      if (!params.action.create_if_missing) {
+        throw error;
+      }
+    }
+
+    if (existing !== params.action.content) {
+      await fs.writeFile(resolved, params.action.content, "utf8");
+    }
+
+    return actionResult({
+      action: params.action,
+      cycle: params.cycle,
+      startedAt,
+      exitCode: 0,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const lower = message.toLowerCase();
+    const notFound =
+      lower.includes("enoent") || lower.includes("no such file") || lower.includes("not found");
+    return actionResult({
+      action: params.action,
+      cycle: params.cycle,
+      startedAt,
+      exitCode: notFound ? 2 : 1,
+      stderr: message,
+    });
+  }
 }
 
 async function runEditVerifyFixLoop(params: {
@@ -330,13 +1366,19 @@ async function runEditVerifyFixLoop(params: {
   issueBody: string;
   payload: Record<string, unknown> | null;
   hintedVerifyCommands: string[];
+  strictCandidateCommands: string[];
   autonomousPlan?: ResolvedAutonomousPlan | null;
   enableAutonomousRecovery: boolean;
   leaseToken: string | null;
 }): Promise<EditLoopSummary> {
+  const initialEditActions = resolveEditActions(
+    params.payload,
+    params.autonomousPlan?.editActionsV1 ?? [],
+  );
   const initialEditCommands = resolveEditCommands(
     params.payload,
     params.autonomousPlan ? params.autonomousPlan.editCommands : [],
+    params.autonomousPlan?.editActionsV1 ?? [],
   );
   const verifyCommands = resolveVerificationCommands({
     payload: params.payload,
@@ -347,17 +1389,66 @@ async function runEditVerifyFixLoop(params: {
     params.payload,
     params.autonomousPlan ? params.autonomousPlan.fixCommands : [],
   );
+  let pendingEditActions = [...initialEditActions];
   let pendingEditCommands = [...initialEditCommands];
+  let plannedEditActions = [...initialEditActions];
   let plannedEditCommands = [...initialEditCommands];
   const recoveryPlans: EditLoopRecoverySummary[] = [];
+  const allowNoteOnly = params.payload?.allow_note_only === true;
+  const verifyGateDecision = resolveVerifyGateDecision({
+    verifyCommands,
+    strictCandidateCommands: params.strictCandidateCommands,
+    requireStrictVerify: env.WORKER_REQUIRE_STRICT_VERIFY,
+    minStrictVerifyCommands: env.WORKER_MIN_STRICT_VERIFY_COMMANDS,
+    allowNoteOnly,
+    verifyGateMode: env.WORKER_VERIFY_GATE_MODE,
+    allowProbeOnlyWhenNoStrictCandidates: env.WORKER_ALLOW_PROBE_ONLY_WHEN_NO_STRICT_CANDIDATES,
+  });
+  if (!verifyGateDecision.allow) {
+    const gateFailure: CommandExecutionResult = {
+      command: "quality_gate verify_gate_decision",
+      executable: null,
+      args: [],
+      phase: "verify",
+      cycle: 0,
+      exitCode: -1,
+      signal: null,
+      durationMs: 0,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      blockedReason: verifyGateDecision.detail,
+    };
 
-  if (pendingEditCommands.length === 0 && verifyCommands.length === 0) {
+    await recordToolExecution(params.jobId, gateFailure);
     return {
-      passed: true,
+      passed: false,
       cycles: 0,
+      editActionsV1: plannedEditActions,
       editCommands: plannedEditCommands,
       verifyCommands,
       fixCommands: activeFixCommands,
+      strictCandidateCommands: params.strictCandidateCommands,
+      verifyGateDecision: verifyGateDecision.reason,
+      verifyGateReason: verifyGateDecision.detail,
+      probeOnlyVerification: verifyGateDecision.probeOnlyVerification,
+      commandResults: [gateFailure],
+      recoveryPlans,
+    };
+  }
+
+  if (pendingEditActions.length === 0 && pendingEditCommands.length === 0 && verifyCommands.length === 0) {
+    return {
+      passed: true,
+      cycles: 0,
+      editActionsV1: plannedEditActions,
+      editCommands: plannedEditCommands,
+      verifyCommands,
+      fixCommands: activeFixCommands,
+      strictCandidateCommands: params.strictCandidateCommands,
+      verifyGateDecision: verifyGateDecision.reason,
+      verifyGateReason: verifyGateDecision.detail,
+      probeOnlyVerification: verifyGateDecision.probeOnlyVerification,
       commandResults: [],
       recoveryPlans,
     };
@@ -374,31 +1465,49 @@ async function runEditVerifyFixLoop(params: {
     await setStage(params.jobId, "editing", {
       edit_loop_cycle: cycle,
       edit_loop_max_cycles: maxCycles,
+      edit_action_count: plannedEditActions.length,
       edit_command_count: plannedEditCommands.length,
       verify_command_count: verifyCommands.length,
       fix_command_count: activeFixCommands.length,
     }, params.leaseToken);
 
-    if (pendingEditCommands.length > 0) {
+    if (pendingEditActions.length > 0 || pendingEditCommands.length > 0) {
+      const actionsForCycle = [...pendingEditActions];
       const commandsForCycle = [...pendingEditCommands];
       let failedEditResult: CommandExecutionResult | null = null;
 
-      for (const command of commandsForCycle) {
-        const result = await executeToolCommand({
-          command,
-          phase: "edit",
-          cycle,
-          cwd: params.workDir,
-          timeoutMs: env.WORKER_COMMAND_TIMEOUT_MS,
-          maxOutputBytes: env.WORKER_COMMAND_MAX_OUTPUT_BYTES,
-          maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
-          allowedCommands: allowedToolCommands,
-        });
-        commandResults.push(result);
-        await recordToolExecution(params.jobId, result);
-        if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
-          failedEditResult = result;
-          break;
+      if (actionsForCycle.length > 0) {
+        for (const action of actionsForCycle) {
+          const result = await executeEditAction({
+            action,
+            cycle,
+            workDir: params.workDir,
+          });
+          commandResults.push(result);
+          await recordToolExecution(params.jobId, result);
+          if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
+            failedEditResult = result;
+            break;
+          }
+        }
+      } else {
+        for (const command of commandsForCycle) {
+          const result = await executeToolCommand({
+            command,
+            phase: "edit",
+            cycle,
+            cwd: params.workDir,
+            timeoutMs: env.WORKER_COMMAND_TIMEOUT_MS,
+            maxOutputBytes: env.WORKER_COMMAND_MAX_OUTPUT_BYTES,
+            maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+            allowedCommands: allowedToolCommands,
+          });
+          commandResults.push(result);
+          await recordToolExecution(params.jobId, result);
+          if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
+            failedEditResult = result;
+            break;
+          }
         }
       }
 
@@ -450,6 +1559,7 @@ async function runEditVerifyFixLoop(params: {
           }
         }
 
+        const recoveryEditActions = recoveryPlan?.editActionsV1 ?? [];
         const recoveryEditCommands = recoveryPlan
           ? filterExecutableCommands(recoveryPlan.editCommands).slice(0, env.WORKER_TOOL_MAX_COMMANDS)
           : [];
@@ -465,6 +1575,7 @@ async function runEditVerifyFixLoop(params: {
             ...(recoveryPlan.model ? { model: recoveryPlan.model } : {}),
             ...(recoveryPlan.error ? { error: recoveryPlan.error } : {}),
             failedCommand: failedEditResult.command,
+            replacementEditActionsV1: recoveryEditActions,
             replacementEditCommands: recoveryEditCommands,
             recoveryFixCommands,
           });
@@ -475,10 +1586,15 @@ async function runEditVerifyFixLoop(params: {
             ? recoveryFixCommands
             : activeFixCommands;
 
-        const hasNovelRecoveryEdits = recoveryEditCommands.some(
-          (command) => !plannedEditCommands.includes(command),
-        );
-        const recoveryPathExists = recoveryEditCommands.length > 0 || repairCommands.length > 0;
+        const hasNovelRecoveryEdits =
+          recoveryEditActions.some(
+            (action) => !plannedEditActions.some((existing) => JSON.stringify(existing) === JSON.stringify(action)),
+          ) ||
+          recoveryEditCommands.some(
+            (command) => !plannedEditCommands.includes(command),
+          );
+        const recoveryPathExists =
+          recoveryEditActions.length > 0 || recoveryEditCommands.length > 0 || repairCommands.length > 0;
         const repeatedFailureStall =
           failureCount >= 2 && !hasNovelRecoveryEdits && recoveryFixCommands.length === 0;
         const continuationBudgetExhausted = recoveryContinuationCount >= maxRecoveryContinuations;
@@ -493,6 +1609,7 @@ async function runEditVerifyFixLoop(params: {
                 ? "Recovery circuit breaker: repeated identical edit failure without novel recovery actions"
                 : "Recovery circuit breaker: recovery continuation budget exhausted",
             failedCommand: failedEditResult.command,
+            replacementEditActionsV1: recoveryEditActions,
             replacementEditCommands: recoveryEditCommands,
             recoveryFixCommands,
           });
@@ -540,17 +1657,28 @@ async function runEditVerifyFixLoop(params: {
           env.WORKER_TOOL_MAX_COMMANDS,
         );
 
-        if (recoveryEditCommands.length > 0) {
-          plannedEditCommands = uniqCommands([
-            ...plannedEditCommands,
-            ...recoveryEditCommands,
-          ]).slice(0, env.WORKER_TOOL_MAX_COMMANDS * 2);
-          pendingEditCommands = recoveryEditCommands;
+        if (recoveryEditActions.length > 0 || recoveryEditCommands.length > 0) {
+          if (recoveryEditActions.length > 0) {
+            plannedEditActions = [...plannedEditActions, ...recoveryEditActions].slice(
+              0,
+              env.WORKER_TOOL_MAX_COMMANDS * 2,
+            );
+            pendingEditActions = recoveryEditActions;
+            pendingEditCommands = [];
+          } else {
+            plannedEditCommands = uniqCommands([
+              ...plannedEditCommands,
+              ...recoveryEditCommands,
+            ]).slice(0, env.WORKER_TOOL_MAX_COMMANDS * 2);
+            pendingEditActions = [];
+            pendingEditCommands = recoveryEditCommands;
+          }
           recoveryContinuationCount += 1;
           continue;
         }
 
         if (repairCommands.length > 0) {
+          pendingEditActions = actionsForCycle;
           pendingEditCommands = commandsForCycle;
           recoveryContinuationCount += 1;
           continue;
@@ -567,23 +1695,62 @@ async function runEditVerifyFixLoop(params: {
         };
       }
 
+      pendingEditActions = [];
       pendingEditCommands = [];
     }
 
     if (verifyCommands.length === 0) {
+      if (env.WORKER_REQUIRE_STRICT_VERIFY && !allowNoteOnly) {
+        const gateFailure: CommandExecutionResult = {
+          command: "quality_gate strict_verify_missing",
+          executable: null,
+          args: [],
+          phase: "verify",
+          cycle,
+          exitCode: -1,
+          signal: null,
+          durationMs: 0,
+          timedOut: false,
+          stdout: "",
+          stderr: "",
+          blockedReason: "insufficient_strict_verify: no verification commands provided",
+        };
+        commandResults.push(gateFailure);
+        await recordToolExecution(params.jobId, gateFailure);
+        return {
+          passed: false,
+          cycles: cycle,
+          editActionsV1: plannedEditActions,
+          editCommands: plannedEditCommands,
+          verifyCommands,
+          fixCommands: activeFixCommands,
+          commandResults,
+          recoveryPlans,
+        };
+      }
+
       return {
         passed: true,
         cycles: cycle,
+        editActionsV1: plannedEditActions,
         editCommands: plannedEditCommands,
         verifyCommands,
         fixCommands: activeFixCommands,
+        strictCandidateCommands: params.strictCandidateCommands,
+        verifyGateDecision: verifyGateDecision.reason,
+        verifyGateReason: verifyGateDecision.detail,
+        probeOnlyVerification: verifyGateDecision.probeOnlyVerification,
         commandResults,
         recoveryPlans,
       };
     }
 
     let cyclePassed = true;
+    const hasStrictVerificationCommands = verifyCommands.some((command) =>
+      isStrictVerificationCommand(command),
+    );
     let strictChecksExecuted = false;
+    let missingArtifactFailure = false;
     for (const command of verifyCommands) {
       const strictCheck = isStrictVerificationCommand(command);
       if (strictCheck) strictChecksExecuted = true;
@@ -602,7 +1769,16 @@ async function runEditVerifyFixLoop(params: {
       await recordToolExecution(params.jobId, result);
 
       const failed = result.blockedReason || result.timedOut || result.exitCode !== 0;
-      if (failed && strictCheck) {
+      const blockedFailure = Boolean(result.blockedReason);
+      const missingArtifact = failed && looksLikeMissingArtifactFailure(result);
+      if (missingArtifact) {
+        missingArtifactFailure = true;
+      }
+      const enforceWithoutStrict =
+        !hasStrictVerificationCommands &&
+        (result.timedOut || missingArtifact);
+
+      if (failed && (blockedFailure || strictCheck || missingArtifact || enforceWithoutStrict)) {
         cyclePassed = false;
         break;
       }
@@ -613,6 +1789,7 @@ async function runEditVerifyFixLoop(params: {
       "editing",
       {
         verify_strict_checks_executed: strictChecksExecuted,
+        verify_missing_artifact_failure: missingArtifactFailure,
       },
       params.leaseToken,
     );
@@ -621,9 +1798,14 @@ async function runEditVerifyFixLoop(params: {
       return {
         passed: true,
         cycles: cycle,
+        editActionsV1: plannedEditActions,
         editCommands: plannedEditCommands,
         verifyCommands,
         fixCommands: activeFixCommands,
+        strictCandidateCommands: params.strictCandidateCommands,
+        verifyGateDecision: verifyGateDecision.reason,
+        verifyGateReason: verifyGateDecision.detail,
+        probeOnlyVerification: verifyGateDecision.probeOnlyVerification,
         commandResults,
         recoveryPlans,
       };
@@ -650,6 +1832,7 @@ async function runEditVerifyFixLoop(params: {
         return {
           passed: false,
           cycles: cycle,
+          editActionsV1: plannedEditActions,
           editCommands: plannedEditCommands,
           verifyCommands,
           fixCommands: activeFixCommands,
@@ -663,6 +1846,7 @@ async function runEditVerifyFixLoop(params: {
   return {
     passed: false,
     cycles: maxCycles,
+    editActionsV1: plannedEditActions,
     editCommands: plannedEditCommands,
     verifyCommands,
     fixCommands: activeFixCommands,
@@ -726,6 +1910,8 @@ type WorkerEvent =
   | "clone_completed"
   | "branch_created"
   | "commit_created"
+  | "push_retrying"
+  | "push_recovered"
   | "push_completed"
   | "pr_opened"
   | "judge_completed"
@@ -868,6 +2054,12 @@ export async function processGitJobById(jobId: string): Promise<void> {
     return;
   }
 
+  const agent = await queryOne<{ ens_name: string }>(
+    "SELECT ens_name FROM agents WHERE id = $1 LIMIT 1",
+    [job.agent_id],
+  );
+  const agentEns = agent?.ens_name || job.agent_id;
+
   const bounty = await bountyService.getIssueBounty(job.issue_id);
   const tmpRoot = ensureTmpScopedPath(getTmpRoot());
   await fs.mkdir(tmpRoot, { recursive: true });
@@ -876,6 +2068,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
   let cleaned = false;
   let finalBranchName: string | null = null;
   let finalPrNumber: number | null = null;
+  let finalJudgeScore: number | null = null;
   let didSucceed = false;
   const dryRun = env.WORKER_DRY_RUN;
 
@@ -901,10 +2094,17 @@ export async function processGitJobById(jobId: string): Promise<void> {
       dry_run: dryRun,
     });
 
+    const orchestrationBrief = buildOrchestrationExecutionBrief(job.payload);
+    const planningIssueBody = [issue.body || "", orchestrationBrief]
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0)
+      .join("\n\n");
+
     await setStage(job.id, "planning", {
       issue_title: issue.title,
-      issue_len: (issue.body || "").length,
+      issue_len: planningIssueBody.length,
       base_branch: base,
+      orchestration_brief_len: orchestrationBrief.length,
     }, job.lease_token);
 
     await setStage(job.id, "cloning", undefined, job.lease_token);
@@ -932,7 +2132,13 @@ export async function processGitJobById(jobId: string): Promise<void> {
     await heartbeat(job.id, job.lease_token);
 
     const git = simpleGit(workDir);
-    const branchName = job.branch_name || `agent/${job.issue_id.slice(0, 8)}-${slug(issue.title)}`;
+    const branchName =
+      job.branch_name ||
+      buildDefaultBranchName({
+        jobId: job.id,
+        issueId: job.issue_id,
+        issueTitle: issue.title,
+      });
     await git.checkoutBranch(branchName, base);
     logWorkerEvent("branch_created", {
       job_id: job.id,
@@ -946,7 +2152,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
       ? await refineCliHintsForWorkspace({
           git,
           issueTitle: issue.title,
-          issueBody: issue.body || "",
+          issueBody: planningIssueBody,
           seedHints: parsedHints.contextHints,
           maxFiles: env.CLI_CONTEXT_HINTS_MAX_FILES,
           maxTests: env.CLI_CONTEXT_HINTS_MAX_TESTS,
@@ -954,24 +2160,33 @@ export async function processGitJobById(jobId: string): Promise<void> {
         })
       : parsedHints.contextHints;
 
+    const requiredArtifacts = deriveRequiredArtifactsForJob({
+      issueTitle: issue.title,
+      issueBody: planningIssueBody,
+      payload: job.payload,
+      contextHints,
+    });
+
     const hintedVerifyCommands = uniqCommands([
       ...toStringArray(parsedHints.verificationHints?.suggested_test_commands),
       ...toStringArray(contextHints?.command_suggestions.verify),
     ]);
 
     let autonomousPlan: ResolvedAutonomousPlan | null = null;
+    const payloadEditActions = resolveEditActions(job.payload);
     const payloadEditCommands = resolveEditCommands(job.payload);
     const autonomousEditingAllowed =
       env.WORKER_AUTONOMOUS_EDITING_ENABLED && !isBooleanFalse(job.payload?.autonomous_editing);
     const autonomousRecoveryAllowed =
       env.WORKER_AUTONOMOUS_EDITING_ENABLED && !isBooleanFalse(job.payload?.autonomous_recovery);
-    if (autonomousEditingAllowed && payloadEditCommands.length === 0) {
+    if (autonomousEditingAllowed && payloadEditActions.length === 0 && payloadEditCommands.length === 0) {
       try {
         const planned: AutonomousCliPlan = await generateAutonomousCliPlan({
           issueTitle: issue.title,
-          issueBody: issue.body || "",
+          issueBody: planningIssueBody,
           contextHints,
           verificationHints: parsedHints.verificationHints,
+          requiredArtifacts,
           allowedCommands: Array.from(allowedToolCommands.values()).sort(),
           maxCommands: env.WORKER_TOOL_MAX_COMMANDS,
           maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
@@ -980,6 +2195,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
         autonomousPlan = {
           ...planned,
           editCommands: filterExecutableCommands(planned.editCommands),
+          ...(planned.editActionsV1 ? { editActionsV1: planned.editActionsV1 } : {}),
           verifyCommands: filterExecutableCommands(planned.verifyCommands),
           fixCommands: filterExecutableCommands(planned.fixCommands),
         };
@@ -1007,15 +2223,24 @@ export async function processGitJobById(jobId: string): Promise<void> {
       autonomous_editing_summary: autonomousPlan?.summary ?? null,
       autonomous_editing_model: autonomousPlan?.model ?? null,
       autonomous_editing_error: autonomousPlan?.error ?? null,
+      autonomous_edit_action_count: autonomousPlan?.editActionsV1?.length ?? 0,
       autonomous_edit_command_count: autonomousPlan?.editCommands.length ?? 0,
       autonomous_verify_command_count: autonomousPlan?.verifyCommands.length ?? 0,
       autonomous_fix_command_count: autonomousPlan?.fixCommands.length ?? 0,
+      required_artifact_count: requiredArtifacts.length,
+      required_artifacts: requiredArtifacts,
     }, job.lease_token);
+
+    const strictCandidateCommands = resolveStrictCandidateCommands({
+      contextHints,
+      hintedVerifyCommands,
+      autonomousVerifyCommands: autonomousPlan?.verifyCommands ?? [],
+    });
 
     const agentNote = path.join(workDir, "KAIZEN_AGENT.md");
     const agentNoteContent = renderKaizenAgentNote({
       issueTitle: issue.title,
-      issueBody: issue.body || "",
+      issueBody: planningIssueBody,
       contextHints,
       verificationHints: parsedHints.verificationHints,
     });
@@ -1029,9 +2254,10 @@ export async function processGitJobById(jobId: string): Promise<void> {
       jobId: job.id,
       workDir,
       issueTitle: issue.title,
-      issueBody: issue.body || "",
+      issueBody: planningIssueBody,
       payload: job.payload,
       hintedVerifyCommands,
+      strictCandidateCommands,
       autonomousPlan,
       enableAutonomousRecovery: autonomousRecoveryAllowed,
       leaseToken: job.lease_token,
@@ -1040,9 +2266,14 @@ export async function processGitJobById(jobId: string): Promise<void> {
     await setStage(job.id, "editing", {
       edit_loop_passed: editLoop.passed,
       edit_loop_cycles: editLoop.cycles,
+      edit_loop_edit_actions_v1: editLoop.editActionsV1 ?? [],
       edit_loop_edit_commands: editLoop.editCommands,
       edit_loop_verify_commands: editLoop.verifyCommands,
       edit_loop_fix_commands: editLoop.fixCommands,
+      edit_loop_strict_candidate_commands: editLoop.strictCandidateCommands ?? [],
+      edit_loop_verify_gate_decision: editLoop.verifyGateDecision ?? null,
+      edit_loop_verify_gate_reason: editLoop.verifyGateReason ?? null,
+      edit_loop_probe_only_verification: editLoop.probeOnlyVerification ?? null,
       edit_loop_recovery_count: editLoop.recoveryPlans.length,
       edit_loop_recovery_plans: editLoop.recoveryPlans,
       edit_loop_results: editLoop.commandResults.map(compactCommandResult),
@@ -1075,6 +2306,86 @@ export async function processGitJobById(jobId: string): Promise<void> {
       );
     }
 
+    if (!allowNoteOnly && implementationChanges.length < env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED) {
+      await setStage(job.id, "editing", {
+        quality_gate_failure: "insufficient_implementation_files",
+        implementation_file_count: implementationChanges.length,
+        required_implementation_files: env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED,
+      }, job.lease_token);
+      throw new Error(
+        `Implementation diff touched ${implementationChanges.length} file(s); minimum required is ${env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED}`,
+      );
+    }
+
+    if (!allowNoteOnly) {
+      const artifactCheck = await validateRequiredArtifactContent({
+        workDir,
+        requiredArtifacts,
+        minSubstantiveChars: editLoop.probeOnlyVerification
+          ? env.WORKER_PROBE_ONLY_MIN_ARTIFACT_SUBSTANCE
+          : 24,
+      });
+      if (!artifactCheck.ok) {
+        await setStage(job.id, "editing", {
+          quality_gate_failure: "required_artifact_content",
+          quality_gate_reason: artifactCheck.reason,
+        }, job.lease_token);
+        throw new Error(artifactCheck.reason || "Required artifact content check failed");
+      }
+    }
+
+    const preCommitDiffText = (await git.diff()) || "";
+    const diffQuality = computeDiffQualityMetrics(preCommitDiffText);
+    if (!allowNoteOnly) {
+      if (diffQuality.addedSubstantiveChars < env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS) {
+        await setStage(job.id, "editing", {
+          quality_gate_failure: "insufficient_substantive_diff",
+          added_substantive_chars: diffQuality.addedSubstantiveChars,
+          required_substantive_chars: env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS,
+          substantive_hunks: diffQuality.substantiveHunks,
+        }, job.lease_token);
+        throw new Error(
+          `Substantive added content ${diffQuality.addedSubstantiveChars} chars is below required ${env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS}`,
+        );
+      }
+
+      if (diffQuality.substantiveHunks < env.WORKER_MIN_SUBSTANTIVE_HUNKS) {
+        await setStage(job.id, "editing", {
+          quality_gate_failure: "insufficient_substantive_hunks",
+          substantive_hunks: diffQuality.substantiveHunks,
+          required_substantive_hunks: env.WORKER_MIN_SUBSTANTIVE_HUNKS,
+        }, job.lease_token);
+        throw new Error(
+          `Substantive hunk count ${diffQuality.substantiveHunks} is below required ${env.WORKER_MIN_SUBSTANTIVE_HUNKS}`,
+        );
+      }
+
+      if (env.WORKER_REJECT_PLACEHOLDER_DIFFS && diffQuality.placeholderLineCount > 0) {
+        await setStage(job.id, "editing", {
+          quality_gate_failure: "placeholder_detected",
+          placeholder_line_count: diffQuality.placeholderLineCount,
+        }, job.lease_token);
+        throw new Error(
+          `Placeholder content detected in implementation diff (${diffQuality.placeholderLineCount} line(s))`,
+        );
+      }
+    }
+
+    await setStage(job.id, "editing", {
+      quality_gate_passed: true,
+      quality_added_substantive_chars: diffQuality.addedSubstantiveChars,
+      quality_substantive_hunks: diffQuality.substantiveHunks,
+      quality_placeholder_line_count: diffQuality.placeholderLineCount,
+      quality_implementation_file_count: implementationChanges.length,
+      quality_strict_verify_count: countStrictVerificationCommands(editLoop.verifyCommands),
+      quality_strict_candidate_count: editLoop.strictCandidateCommands?.length ?? 0,
+      quality_verify_gate_decision: editLoop.verifyGateDecision ?? null,
+      quality_verify_gate_reason: editLoop.verifyGateReason ?? null,
+      quality_probe_only_verification: editLoop.probeOnlyVerification ?? null,
+      quality_required_artifact_count: requiredArtifacts.length,
+      quality_required_artifacts: requiredArtifacts,
+    }, job.lease_token);
+
     await setStage(job.id, "committing", { branch_name: branchName }, job.lease_token);
     await git.add(["-A"]);
     await git.commit(`feat: agent implementation for issue (${job.issue_id.slice(0, 8)})`);
@@ -1087,11 +2398,36 @@ export async function processGitJobById(jobId: string): Promise<void> {
 
     if (!dryRun) {
       await setStage(job.id, "pushing", { branch_name: branchName }, job.lease_token);
-      await git.push("origin", branchName);
+      const pushResult = await pushBranchWithRecovery({
+        git,
+        branchName,
+        onRecoveryStart: async ({ initialError }) => {
+          logWorkerEvent("push_retrying", {
+            job_id: job.id,
+            branch_name: branchName,
+            message: truncateText(initialError, 400),
+          });
+          await setStage(job.id, "pushing", {
+            branch_name: branchName,
+            push_retry_reason: "non_fast_forward",
+            push_retry_message: truncateText(initialError, 600),
+          }, job.lease_token);
+          await heartbeat(job.id, job.lease_token);
+        },
+      });
       await heartbeat(job.id, job.lease_token);
+      if (pushResult.recovered) {
+        logWorkerEvent("push_recovered", {
+          job_id: job.id,
+          branch_name: branchName,
+          recovery_strategy: pushResult.strategy,
+        });
+      }
       logWorkerEvent("push_completed", {
         job_id: job.id,
         branch_name: branchName,
+        recovered_from_non_fast_forward: pushResult.recovered,
+        recovery_strategy: pushResult.strategy,
       });
     } else {
       await setStage(job.id, "judging", {
@@ -1120,7 +2456,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
           title: `[Kaizen] ${issue.title}`,
           head: branchName,
           base: link.default_branch || job.base_branch,
-          body: `Automated agent work for internal issue \`${job.issue_id}\`.`,
+          body: `Automated agent work for internal issue \`${job.issue_id}\` by \`${agentEns}\`.`,
         });
         prNumber = prData.number;
       }
@@ -1169,6 +2505,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
       issueBody: issue.body || "",
       diffText,
       scorecard,
+      knowledgeSnippets: contextHints?.knowledge_snippets || [],
       toolEvidence: editLoop.commandResults.map((result) => ({
         phase: result.phase,
         command: result.command,
@@ -1186,6 +2523,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
       mock: judgeResult.is_mock,
       dry_run: dryRun,
     });
+    finalJudgeScore = judgeResult.verdict.code_quality_score;
 
     const analysis =
       `## Judge (${judgeResult.is_mock ? "mock" : "LLM"})\n\n` +
@@ -1197,6 +2535,35 @@ export async function processGitJobById(jobId: string): Promise<void> {
       prNumber: prNumber ?? null,
       commentBody: analysis,
     });
+
+    if (!dryRun && prNumber != null) {
+      const prBody = buildPullRequestWorkflowBody({
+        job,
+        issueTitle: issue.title,
+        issueBody: issue.body || "",
+        owner: link.github_owner,
+        repo: link.github_repo,
+        branchName,
+        baseBranch: link.default_branch || job.base_branch,
+        agentEns,
+        autonomousPlan,
+        editLoop,
+        diffSummary: {
+          changed: diffSummary.changed,
+          insertions: diffSummary.insertions,
+          deletions: diffSummary.deletions,
+          files: normalizeWorkflowDiffFiles(diffSummary.files),
+        },
+        diffText,
+      });
+
+      await octokit.rest.pulls.update({
+        owner: link.github_owner,
+        repo: link.github_repo,
+        pull_number: prNumber,
+        body: prBody,
+      });
+    }
 
     if (bounty && !dryRun) {
       await bountyService.persistGitHubJudgeOnBounty(
@@ -1385,6 +2752,30 @@ export async function processGitJobById(jobId: string): Promise<void> {
       await setStage(job.id, "comment_posted", undefined, job.lease_token);
     }
 
+    const minMergeScore = env.WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE;
+    if (!dryRun && minMergeScore > 0) {
+      const scoreGatePassed = passesAwaitingMergeScoreGate({
+        score: judgeResult.verdict.code_quality_score,
+        minScore: minMergeScore,
+      });
+      await setStage(
+        job.id,
+        "judging",
+        {
+          judge_score_gate_min: minMergeScore,
+          judge_score_gate_score: judgeResult.verdict.code_quality_score,
+          judge_score_gate_passed: scoreGatePassed,
+        },
+        job.lease_token,
+      );
+
+      if (!scoreGatePassed) {
+        throw new Error(
+          `Judge score gate failed: ${judgeResult.verdict.code_quality_score}/10 is below required minimum ${minMergeScore}/10`,
+        );
+      }
+    }
+
     finalBranchName = branchName;
     finalPrNumber = prNumber;
     didSucceed = true;
@@ -1452,6 +2843,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
         job_id: job.id,
         branch_name: finalBranchName,
         pr_number: finalPrNumber,
+        judge_score: finalJudgeScore,
         dry_run: dryRun,
       });
     } else {

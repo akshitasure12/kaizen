@@ -131,6 +131,16 @@ Ensure Postgres is reachable, then:
 bun run migrate
 ```
 
+By default this applies **incremental** SQL files from `backend/src/db/migrations/`
+(tracked in `schema_migrations`) without dropping existing data. For a local
+destructive reset that replays full `schema.sql`:
+
+```bash
+bun run migrate -- --full
+```
+
+Or set `MIGRATE_FULL=1`.
+
 ### 4. Run (development)
 
 ```bash
@@ -155,6 +165,60 @@ In another process (same `.env`):
 ```bash
 bun run dev:worker
 ```
+
+### 7. Repository Knowledge Base (RAG)
+
+The backend supports repository-scoped user-ingested knowledge documents that are
+retrieved and injected into:
+
+- git job context hints (worker note generation)
+- agent assignment relevance scoring
+- judge prompt context
+
+Documents are scoped to the **repo importer** (`owner_user_id` on upload). Deletes
+are soft (`status = deleted`).
+
+Enable and tune from `.env`:
+
+- `KB_RAG_ENABLED`
+- `KB_MAX_DOCUMENT_BYTES`
+- `KB_CHUNK_SIZE_CHARS`
+- `KB_CHUNK_OVERLAP_CHARS`
+- `KB_RETRIEVAL_TOP_K`
+- `KB_HINT_MAX_SNIPPETS`
+- `KB_HINT_SNIPPET_MAX_CHARS`
+- `KB_ASSIGNMENT_TOP_K`
+- `KB_JUDGE_TOP_K`
+- `KB_JUDGE_SNIPPET_MAX_CHARS`
+- `KB_JUDGE_CONTEXT_MAX_CHARS`
+
+Worker judge gate:
+
+- `WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE`
+
+Repository KB API endpoints (auth required, repository must belong to caller):
+
+- `POST /repositories/:repoId/knowledge-base/documents`
+  - Text ingest: send `content` (plus optional `title`, `filename`, `mime_type`, `metadata`)
+  - PDF ingest: send `mime_type=application/pdf` with `file_base64`
+- `GET /repositories/:repoId/knowledge-base/documents?limit=&offset=`
+- `POST /repositories/:repoId/knowledge-base/search` with `{ "query": "...", "limit": 8 }`
+- `DELETE /repositories/:repoId/knowledge-base/documents/:documentId`
+
+Accepted upload formats in current UI/API flow: `.pdf`, `.md`, `.txt`, `.json`.
+
+### 8. Issue resolve orchestration (single PR)
+
+`POST /repositories/:repoId/issues/:issueId/resolve` always enqueues **one parent
+git job** that produces a single PR. Child issues (new or reused) are included as
+requirements in the job payload (`child_assignments`); they are not assigned
+separate agents or per-child git jobs.
+
+- Child bounty posting during resolve is **disabled**; use the decompose endpoint or
+  parent issue bounty instead.
+- Omitted `allocation_strategy` on decompose defaults to **`difficulty`**.
+- Per-child git job fanout remains available via the **git-jobs** API (`fanout_children`),
+  not via resolve.
 
 ---
 
@@ -192,3 +256,18 @@ bun run dev:worker
 | `frontend/`  | Next.js app (`NEXT_PUBLIC_API_URL`)                                                          |
 | `contracts/` | Foundry: AgentBranchToken, BountyPayment, deploy script (`forge build`, `forge test`)        |
 | `ref/`       | Optional local reference snapshot only — **not** required for builds or deploys              |
+
+## AI agent development
+
+Agent configuration for Cursor and compatible tools:
+
+| Layer | Path |
+|-------|------|
+| Entry | [AGENTS.md](AGENTS.md) |
+| Hub (SSOT, workflow, roadmap) | [.cursor/README.md](.cursor/README.md) |
+| Orchestration + invariants | `.cursor/rules/kaizen-orchestration.mdc`, `kaizen-project.mdc` |
+| Package rules | `.cursor/rules/backend.mdc`, `worker.mdc`, `frontend.mdc`, `contracts.mdc` |
+| Skills catalog | [.cursor/skills/README.md](.cursor/skills/README.md) |
+| SWE discipline | [.cursor/instructions/coding-behavior.md](.cursor/instructions/coding-behavior.md) |
+
+Auto skills: `kaizen-triage`, `kaizen-testing`, `kaizen-validate`. Manual: `/worker-roadmap` (`kaizen-worker-roadmap`), `/code-review` (`kaizen-review`). See [Cursor agent best practices](https://cursor.com/blog/agent-best-practices).

@@ -16,6 +16,7 @@
     "build": "bun run --cwd backend build && bun run --cwd frontend build",
     "build:backend": "bun run --cwd backend build",
     "build:worker": "bun run --cwd worker build",
+    "typecheck:worker": "bun run --cwd worker typecheck",
     "build:frontend": "bun run --cwd frontend build",
     "test:gemini": "bun run --cwd backend test:gemini && bun run --cwd worker test:gemini",
     "start:api": "bun run --cwd backend start",

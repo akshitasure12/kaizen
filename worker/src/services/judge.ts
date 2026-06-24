@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { query } from "../db/client";
+import { env } from "../env";
 import {
   buildGeminiThinkingConfig,
   getReasoningLevel,
@@ -35,6 +36,13 @@ export interface JudgeResult {
   is_mock: boolean;
 }
 
+interface KnowledgeSnippetInput {
+  title: string;
+  source_filename?: string | null;
+  content: string;
+  score?: number;
+}
+
 function uniqueStrings(values: unknown[]): string[] {
   const seen = new Set<string>();
   const ordered: string[] = [];
@@ -68,11 +76,41 @@ function normalizeScorecard(raw: Partial<Scorecard> | null | undefined): Scoreca
   };
 }
 
+function formatKnowledgeSnippetBlock(snippets: KnowledgeSnippetInput[]): string {
+  if (!env.KB_RAG_ENABLED || snippets.length === 0) return "";
+
+  const lines: string[] = ["## Repository knowledge snippets"];
+  let used = lines[0]!.length + 1;
+  const maxChars = env.KB_JUDGE_CONTEXT_MAX_CHARS;
+
+  for (const snippet of snippets.slice(0, env.KB_JUDGE_TOP_K)) {
+    const title = (snippet.title || "Knowledge snippet").trim();
+    const source = snippet.source_filename?.trim() ? ` | source: ${snippet.source_filename.trim()}` : "";
+    const score =
+      typeof snippet.score === "number" && Number.isFinite(snippet.score)
+        ? ` | score: ${Math.max(0, Math.min(1, snippet.score)).toFixed(2)}`
+        : "";
+    const content = (snippet.content || "").replace(/\s+/g, " ").trim();
+    if (!content) continue;
+    const excerpt =
+      content.length > env.KB_JUDGE_SNIPPET_MAX_CHARS
+        ? `${content.slice(0, env.KB_JUDGE_SNIPPET_MAX_CHARS - 1).trimEnd()}…`
+        : content;
+    const line = `- ${title}${source}${score}\n  ${excerpt}`;
+    if (used + line.length > maxChars) break;
+    lines.push(line);
+    used += line.length + 1;
+  }
+
+  return lines.length > 1 ? lines.join("\n") : "";
+}
+
 export async function judgeGitDiffContext(params: {
   issueTitle: string;
   issueBody: string;
   diffText: string;
   scorecard: Partial<Scorecard>;
+  knowledgeSnippets?: KnowledgeSnippetInput[];
   toolEvidence?: Array<{
     phase: string;
     command: string;
@@ -83,9 +121,11 @@ export async function judgeGitDiffContext(params: {
     stderr_tail?: string;
   }>;
 }): Promise<JudgeResult> {
+  const knowledgeBlock = formatKnowledgeSnippetBlock(params.knowledgeSnippets || []);
   const blob =
     `## Issue\n${params.issueTitle}\n\n${params.issueBody || ""}` +
     `\n\n## Proposed changes (git diff)\n\`\`\`diff\n${params.diffText.slice(0, 12000)}\n\`\`\`` +
+    (knowledgeBlock ? `\n\n${knowledgeBlock}` : "") +
     `\n\n## Tool execution evidence\n\`\`\`json\n${JSON.stringify(params.toolEvidence || [], null, 2).slice(0, 5000)}\n\`\`\``;
   return judgeSubmission(blob, normalizeScorecard(params.scorecard));
 }

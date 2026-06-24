@@ -11,12 +11,23 @@ export interface CliCommandSuggestions {
   discover: string[];
   inspect: string[];
   verify: string[];
+  strict: string[];
+}
+
+export interface CliKnowledgeSnippet {
+  document_id: string;
+  chunk_id: string;
+  title: string;
+  source_filename: string | null;
+  content: string;
+  score: number;
 }
 
 export interface CliContextHints {
   search_terms: string[];
   ranked_files: CliRankedPathHint[];
   ranked_tests: CliRankedPathHint[];
+  knowledge_snippets: CliKnowledgeSnippet[];
   command_suggestions: CliCommandSuggestions;
   source: 'history' | 'issue_text' | 'seed+live' | 'live' | 'seed';
   generated_at: string;
@@ -119,6 +130,38 @@ function toHintArray(value: unknown): CliRankedPathHint[] {
   return hints;
 }
 
+function toKnowledgeSnippetArray(value: unknown): CliKnowledgeSnippet[] {
+  if (!Array.isArray(value)) return [];
+  const snippets: CliKnowledgeSnippet[] = [];
+
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    if (typeof item.document_id !== 'string' || !item.document_id.trim()) continue;
+    if (typeof item.chunk_id !== 'string' || !item.chunk_id.trim()) continue;
+    if (typeof item.title !== 'string' || !item.title.trim()) continue;
+    if (typeof item.content !== 'string' || !item.content.trim()) continue;
+
+    const score =
+      typeof item.score === 'number' && Number.isFinite(item.score)
+        ? clamp01(item.score)
+        : 0;
+
+    snippets.push({
+      document_id: item.document_id.trim(),
+      chunk_id: item.chunk_id.trim(),
+      title: item.title.trim(),
+      source_filename:
+        typeof item.source_filename === 'string' && item.source_filename.trim()
+          ? item.source_filename.trim()
+          : null,
+      content: item.content.trim(),
+      score: Number(score.toFixed(4)),
+    });
+  }
+
+  return snippets.slice(0, 20);
+}
+
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
@@ -132,6 +175,7 @@ function buildDefaultCommandSuggestions(params: {
   searchTerms: string[];
   rankedFiles: CliRankedPathHint[];
   rankedTests: CliRankedPathHint[];
+  strictCandidates?: string[];
 }): CliCommandSuggestions {
   const termPattern =
     params.searchTerms.length > 0
@@ -145,9 +189,7 @@ function buildDefaultCommandSuggestions(params: {
 
   const verify: string[] = [
     `rg -n --ignore-case '${termPattern}' .`,
-    'if [ -f package.json ]; then npm test -- --help || true; fi',
-    'if [ -f bun.lockb ] || [ -f bun.lock ]; then bun test --help || true; fi',
-    'if [ -f pyproject.toml ] || [ -f pytest.ini ]; then pytest -q || true; fi',
+    'find . -maxdepth 4 -type f',
   ];
 
   if (params.rankedTests.length > 0) {
@@ -166,7 +208,28 @@ function buildDefaultCommandSuggestions(params: {
     ],
     inspect,
     verify,
+    strict: toStringArray(params.strictCandidates || []),
   };
+}
+
+function deriveStrictCandidatesFromTrackedFiles(trackedFiles: string[]): string[] {
+  const lower = new Set(trackedFiles.map((value) => value.toLowerCase()));
+  const strict: string[] = [];
+
+  if (lower.has('package.json')) {
+    strict.push('bun run test', 'bun run typecheck', 'bun run build');
+  }
+  if (lower.has('cargo.toml')) {
+    strict.push('cargo test', 'cargo check');
+  }
+  if (lower.has('go.mod')) {
+    strict.push('go test ./...');
+  }
+  if (lower.has('pytest.ini') || lower.has('pyproject.toml') || lower.has('requirements.txt')) {
+    strict.push('pytest -q');
+  }
+
+  return uniq(strict);
 }
 
 export function parseJobCliHints(payload: Record<string, unknown> | null): ParsedJobHints {
@@ -183,17 +246,20 @@ export function parseJobCliHints(payload: Record<string, unknown> | null): Parse
     const searchTerms = toStringArray(contextValue.search_terms);
     const rankedFiles = toHintArray(contextValue.ranked_files);
     const rankedTests = toHintArray(contextValue.ranked_tests);
+    const knowledgeSnippets = toKnowledgeSnippetArray(contextValue.knowledge_snippets);
 
     const commands = isRecord(contextValue.command_suggestions)
       ? {
           discover: toStringArray(contextValue.command_suggestions.discover),
           inspect: toStringArray(contextValue.command_suggestions.inspect),
           verify: toStringArray(contextValue.command_suggestions.verify),
+          strict: toStringArray(contextValue.command_suggestions.strict),
         }
       : {
           discover: [],
           inspect: [],
           verify: [],
+          strict: [],
         };
 
     const source =
@@ -205,6 +271,7 @@ export function parseJobCliHints(payload: Record<string, unknown> | null): Parse
       search_terms: searchTerms,
       ranked_files: rankedFiles,
       ranked_tests: rankedTests,
+      knowledge_snippets: knowledgeSnippets,
       command_suggestions: commands,
       source,
       generated_at:
@@ -323,18 +390,21 @@ export async function refineCliHintsForWorkspace(params: {
     params.seedHints &&
     (params.seedHints.command_suggestions.discover.length > 0 ||
       params.seedHints.command_suggestions.inspect.length > 0 ||
-      params.seedHints.command_suggestions.verify.length > 0)
+      params.seedHints.command_suggestions.verify.length > 0 ||
+      params.seedHints.command_suggestions.strict.length > 0)
       ? params.seedHints.command_suggestions
       : buildDefaultCommandSuggestions({
           searchTerms,
           rankedFiles,
           rankedTests,
+          strictCandidates: deriveStrictCandidatesFromTrackedFiles(trackedFiles),
         });
 
   return {
     search_terms: searchTerms,
     ranked_files: rankedFiles,
     ranked_tests: rankedTests,
+    knowledge_snippets: params.seedHints?.knowledge_snippets || [],
     command_suggestions: commandSuggestions,
     source: params.seedHints ? 'seed+live' : 'live',
     generated_at: new Date().toISOString(),
@@ -342,7 +412,7 @@ export async function refineCliHintsForWorkspace(params: {
 }
 
 function pushCommandSection(lines: string[], title: string, commands: string[]): void {
-  if (commands.length === 0) return;
+  if (!Array.isArray(commands) || commands.length === 0) return;
   lines.push(`### ${title}`);
   lines.push('```bash');
   for (const command of commands) {
@@ -383,9 +453,20 @@ export function renderKaizenAgentNote(params: {
       lines.push('');
     }
 
+    if (params.contextHints.knowledge_snippets.length > 0) {
+      lines.push('### Repository knowledge snippets');
+      for (const snippet of params.contextHints.knowledge_snippets) {
+        const sourceSuffix = snippet.source_filename ? ` · source ${snippet.source_filename}` : '';
+        lines.push(`- ${snippet.title} (score ${snippet.score.toFixed(2)}${sourceSuffix})`);
+        lines.push(`  ${snippet.content}`);
+      }
+      lines.push('');
+    }
+
     pushCommandSection(lines, 'Discovery commands', params.contextHints.command_suggestions.discover);
     pushCommandSection(lines, 'Inspection commands', params.contextHints.command_suggestions.inspect);
     pushCommandSection(lines, 'Verification commands', params.contextHints.command_suggestions.verify);
+    pushCommandSection(lines, 'Strict verification candidates', params.contextHints.command_suggestions.strict);
   }
 
   const checklist = params.verificationHints?.checklist || [];

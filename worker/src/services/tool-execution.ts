@@ -6,6 +6,7 @@ export interface ToolExecutionResult {
   command: string;
   executable: string | null;
   args: string[];
+  actionType?: string;
   phase: ToolExecutionPhase;
   cycle: number;
   exitCode: number | null;

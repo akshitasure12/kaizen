@@ -13,10 +13,20 @@ export interface CliCommandSuggestions {
   verify: string[];
 }
 
+export interface CliKnowledgeSnippet {
+  document_id: string;
+  chunk_id: string;
+  title: string;
+  source_filename: string | null;
+  content: string;
+  score: number;
+}
+
 export interface CliContextHints {
   search_terms: string[];
   ranked_files: CliRankedPathHint[];
   ranked_tests: CliRankedPathHint[];
+  knowledge_snippets: CliKnowledgeSnippet[];
   command_suggestions: CliCommandSuggestions;
   source: 'history' | 'issue_text';
   generated_at: string;
@@ -27,6 +37,7 @@ export interface BuildCliContextHintsParams {
   issueBody: string;
   scorecard?: Partial<Scorecard> | null;
   historicalPaths?: string[];
+  knowledgeSnippets?: CliKnowledgeSnippet[];
   topFileCount?: number;
   topTestCount?: number;
 }
@@ -79,6 +90,39 @@ interface ScoreBreakdown {
 
 function uniq(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function sanitizeKnowledgeSnippets(value: unknown): CliKnowledgeSnippet[] {
+  if (!Array.isArray(value)) return [];
+
+  const snippets: CliKnowledgeSnippet[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const item = entry as Partial<CliKnowledgeSnippet>;
+    if (typeof item.document_id !== 'string' || !item.document_id.trim()) continue;
+    if (typeof item.chunk_id !== 'string' || !item.chunk_id.trim()) continue;
+    if (typeof item.title !== 'string' || !item.title.trim()) continue;
+    if (typeof item.content !== 'string' || !item.content.trim()) continue;
+
+    const score =
+      typeof item.score === 'number' && Number.isFinite(item.score)
+        ? Math.min(1, Math.max(0, item.score))
+        : 0;
+
+    snippets.push({
+      document_id: item.document_id.trim(),
+      chunk_id: item.chunk_id.trim(),
+      title: item.title.trim(),
+      source_filename:
+        typeof item.source_filename === 'string' && item.source_filename.trim()
+          ? item.source_filename.trim()
+          : null,
+      content: item.content.trim(),
+      score: Number(score.toFixed(4)),
+    });
+  }
+
+  return snippets.slice(0, 20);
 }
 
 function escapeRegex(value: string): string {
@@ -171,9 +215,7 @@ function buildCommandSuggestions(params: {
 
   const verifyCommands: string[] = [
     `rg -n --ignore-case '${termPattern}' .`,
-    'if [ -f package.json ]; then npm test -- --help || true; fi',
-    'if [ -f bun.lockb ] || [ -f bun.lock ]; then bun test --help || true; fi',
-    'if [ -f pyproject.toml ] || [ -f pytest.ini ]; then pytest -q || true; fi',
+    'find . -maxdepth 4 -type f',
   ];
 
   if (params.rankedTests.length > 0) {
@@ -198,6 +240,7 @@ function buildCommandSuggestions(params: {
 export function buildCliContextHints(params: BuildCliContextHintsParams): CliContextHints {
   const topFileCount = Math.max(1, Math.min(50, params.topFileCount ?? 8));
   const topTestCount = Math.max(1, Math.min(30, params.topTestCount ?? 5));
+  const knowledgeSnippets = sanitizeKnowledgeSnippets(params.knowledgeSnippets ?? []);
 
   const unitTestNames = Array.isArray(params.scorecard?.unit_tests)
     ? params.scorecard!.unit_tests
@@ -249,6 +292,7 @@ export function buildCliContextHints(params: BuildCliContextHintsParams): CliCon
     search_terms: searchTerms,
     ranked_files: rankedFiles,
     ranked_tests: rankedTests,
+    knowledge_snippets: knowledgeSnippets,
     command_suggestions: buildCommandSuggestions({
       searchTerms,
       rankedFiles,
