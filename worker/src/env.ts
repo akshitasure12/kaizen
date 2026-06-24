@@ -98,6 +98,25 @@ const envSchema = z.object({
 
   WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE: z.coerce.number().min(0).max(10).default(0),
 
+  WORKER_REQUIRE_READ_BEFORE_EDIT: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  WORKER_VERIFY_LOG_PERSIST: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  WORKER_POST_GATE_SOFT_CONTINUE: z.coerce.number().int().min(0).max(2).default(0),
+  WORKER_REPLAN_MAX_PER_CYCLE: z.coerce.number().int().min(0).max(2).default(1),
+  WORKER_KAIZEN_PLAN_ENABLED: z
+    .string()
+    .default("true")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+  WORKER_PRE_PR_JUDGE_SELF_CHECK: z
+    .string()
+    .default("false")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.toLowerCase())),
+
   PAYOUT_MIN_SCORE: z.coerce.number().min(0).max(1).optional(),
   PAYOUT_SCORE_FLOOR: z.coerce.number().min(0).max(1).default(0.4),
   PAYOUT_MIN_ABOVE_FLOOR: z.coerce.number().min(0).max(1).default(0.25),

@@ -6,6 +6,11 @@ import {
   getReasoningLevel,
   pickGeminiModel,
 } from "./gemini-orchestration";
+import {
+  buildJudgeEvaluationPrompt,
+  buildJudgeSystemPrompt,
+  JUDGE_VERDICT_JSON_SCHEMA,
+} from "./judge-agent";
 
 const geminiApiKey = process.env.GEMINI_API_KEY;
 const gemini = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
@@ -105,6 +110,23 @@ function formatKnowledgeSnippetBlock(snippets: KnowledgeSnippetInput[]): string 
   return lines.length > 1 ? lines.join("\n") : "";
 }
 
+export function passesPrePrJudgeSelfCheck(params: {
+  enabled: boolean;
+  score: number;
+  minScore: number;
+}): { passed: boolean; reason?: string } {
+  if (!params.enabled || params.minScore <= 0) {
+    return { passed: true };
+  }
+  if (params.score >= params.minScore) {
+    return { passed: true };
+  }
+  return {
+    passed: false,
+    reason: `Pre-PR judge self-check failed: ${params.score}/10 is below required ${params.minScore}/10`,
+  };
+}
+
 export async function judgeGitDiffContext(params: {
   issueTitle: string;
   issueBody: string;
@@ -155,30 +177,12 @@ async function judgeWithGemini(submissionContent: string, scorecard: Scorecard):
   const model = pickGeminiModel(reasoningLevel);
   const thinkingConfig = buildGeminiThinkingConfig(model, reasoningLevel);
 
-  const systemPrompt = [
-    "You are an expert code judge for agentic software tasks.",
-    "Follow these rules strictly:",
-    "1) Evaluate only using evidence in the provided submission content and scorecard.",
-    "2) Use conservative pass/fail decisions for listed tests.",
-    "3) Keep reasoning concrete and action-oriented.",
-    "4) Return valid JSON matching the schema; do not include markdown.",
-  ].join("\n");
-
-  const evaluationPrompt = [
-    "<scorecard>",
-    `difficulty: ${scorecard.difficulty}`,
-    `base_points: ${scorecard.base_points}`,
-    `unit_tests: ${JSON.stringify(scorecard.unit_tests)}`,
-    `bonus_criteria: ${JSON.stringify(scorecard.bonus_criteria)}`,
-    `bonus_points_per_criterion: ${scorecard.bonus_points_per_criterion}`,
-    scorecard.required_language
-      ? `required_language: ${scorecard.required_language}`
-      : "required_language: none",
-    "</scorecard>",
-    "<submission>",
-    submissionContent.slice(0, 12000),
-    "</submission>",
-  ].join("\n");
+  const systemPrompt = buildJudgeSystemPrompt();
+  const evaluationPrompt = buildJudgeEvaluationPrompt({
+    scorecard,
+    submissionContent,
+    maxSubmissionChars: 12000,
+  });
 
   const response = await gemini!.models.generateContent({
     model,
@@ -187,27 +191,7 @@ async function judgeWithGemini(submissionContent: string, scorecard: Scorecard):
       systemInstruction: systemPrompt,
       thinkingConfig,
       responseMimeType: "application/json",
-      responseJsonSchema: {
-        type: "object",
-        properties: {
-          passed_tests: { type: "array", items: { type: "string" } },
-          failed_tests: { type: "array", items: { type: "string" } },
-          bonus_achieved: { type: "array", items: { type: "string" } },
-          bonus_missed: { type: "array", items: { type: "string" } },
-          code_quality_score: { type: "integer", minimum: 1, maximum: 10 },
-          reasoning: { type: "string" },
-          suggestions: { type: "array", items: { type: "string" } },
-        },
-        required: [
-          "passed_tests",
-          "failed_tests",
-          "bonus_achieved",
-          "bonus_missed",
-          "code_quality_score",
-          "reasoning",
-          "suggestions",
-        ],
-      },
+      responseJsonSchema: JUDGE_VERDICT_JSON_SCHEMA,
     },
   });
 

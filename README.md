@@ -1,273 +1,138 @@
 # Kaizen
 
-Scaffold for the **Demo-ready GitHub Git** stack (Fastify API, git worker process, Next.js UI, Postgres). Implementation follows the internal plan: GitHub as code SoT, merge webhook for bounties, shared temp clone for agent + judge.
+Kaizen is an AI agent orchestration platform for GitHub repositories. Teams define issues and bounties, assign agents to work them, and let a background worker clone the repo, implement changes, verify them, open a pull request, and score the result with an LLM judge. **GitHub remains the source of truth** for code; merge webhooks drive bounty settlement when optional on-chain payments are enabled.
 
-## Prereqs
+```mermaid
+flowchart LR
+  UI[Next.js UI] --> API[Fastify API]
+  API --> DB[(Postgres)]
+  API -->|enqueue| Jobs[git_jobs]
+  Worker[Git worker] -->|claim| Jobs
+  Worker -->|clone / edit / verify / PR| GH[GitHub]
+  Worker -->|judge| Gemini[Gemini]
+  API -->|webhook| GH
+  API -->|optional| Chain[Base Sepolia]
+```
 
-- **Node 20+** and **[Bun](https://bun.sh)** (package manager / runtime used by this repo)
-- **Docker** (optional, for Postgres / full stack images)
-- **Foundry** (`curl -L https://foundry.paradigm.xyz | bash` then `foundryup`) — only if you deploy or compile `contracts/`
+## Quick start
 
-## Env
-
-1. `cp .env.example .env` at the **repo root**.
-2. Adjust secrets before any production deploy (`JWT_SECRET`, GitHub fields, `OPENAI_API_KEY`, etc.).
-
-The API, worker, and Next config all try to load a root `.env` by walking up from the current working directory.
-
----
-
-## Blockchain (Solidity — Base Sepolia)
-
-Canonical Foundry project lives in **`contracts/`**.
-
-### 1. Install contract dependencies
-
-From the repo root:
+**Prerequisites:** Node 20+, [Bun](https://bun.sh), Postgres (local or Docker).
 
 ```bash
-git submodule update --init --recursive
+cp .env.example .env
+bun install
+docker compose up -d postgres   # optional if Postgres runs elsewhere
+bun run migrate
 ```
 
-If submodules are missing, install Foundry deps inside `contracts/`:
+Run each service in its own terminal (all read the **repo root** `.env`):
 
 ```bash
-cd contracts
-forge install
+bun run dev:api        # http://localhost:3001
+bun run dev:frontend   # http://localhost:5173
+bun run dev:worker
 ```
 
-### 2. Build and test
+Smoke-check the API: `curl http://localhost:3001/health`
 
-```bash
-cd contracts
-forge build
-forge test
-```
+Set `GEMINI_API_KEY` in `.env` for autonomous planning and judging. See [.env.example](.env.example) for the full variable list.
 
-### 3. Configure deploy secrets
+## Core concepts
 
-Export (or place in a shell profile / CI secrets):
+| Concept | Description |
+| -------- | ------------- |
+| **Repository** | Linked GitHub remote; issues and knowledge-base documents are scoped per repo. |
+| **Issue** | Unit of work with an optional scorecard (tests, bonus criteria, difficulty). |
+| **Agent** | Registered participant that can be assigned to issues and git jobs. |
+| **Git job** | Durable work item: clone → edit/verify/fix loop → commit → push → PR → judge. |
+| **Resolve** | Orchestrates a parent issue into **one** git job and **one** PR; child issues are requirements in the payload, not separate agent assignments. |
+| **Knowledge base** | Repo-scoped RAG documents (PDF, markdown, text, JSON) injected into worker hints, assignment scoring, and judge context. |
+| **Bounty** | Optional payout tied to PR merge; supports mock mode or Base Sepolia contracts. |
 
-| Variable               | Purpose                                                                                                            |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `BASE_SEPOLIA_RPC_URL` | JSON-RPC for Base Sepolia (e.g. `https://sepolia.base.org` or an Alchemy/Infura URL)                               |
-| `PRIVATE_KEY`          | Deployer EOA private key (hex, with `0x` prefix as Forge expects) — must hold a little ETH on Base Sepolia for gas |
-| `TREASURY_ADDRESS`     | Address that receives protocol fees and agent-registration flows per the contracts                                 |
+## Git worker pipeline
 
-Optional for contract verification on Basescan: `BASESCAN_API_KEY`.
+The worker (`worker/`) polls `git_jobs`, leases work, and runs `processGitJobById`:
 
-### 4. Deploy
+1. Clone the target branch into a temp workspace.
+2. Build context (`KAIZEN_AGENT.md`, optional `KAIZEN_PLAN.json`, CLI hints).
+3. Run a bounded **edit → verify → fix** loop with sandboxed CLI commands and structured `edit_actions_v1`.
+4. Enforce quality gates (substantive diff, artifacts, placeholder rejection).
+5. Commit, push, open or update a PR.
+6. Judge the diff with Gemini; optionally block low scores before merge.
 
-Dry run (simulation only):
-
-```bash
-cd contracts
-forge script script/Deploy.s.sol --rpc-url "$BASE_SEPOLIA_RPC_URL"
-```
-
-Broadcast to the network:
-
-```bash
-forge script script/Deploy.s.sol --rpc-url "$BASE_SEPOLIA_RPC_URL" --broadcast
-```
-
-The script logs **`ABT_CONTRACT_ADDRESS`** and **`BOUNTY_CONTRACT_ADDRESS`**. Copy them into the **repo root** `.env` (and optionally mirror the `NEXT_PUBLIC_*` lines for the frontend):
-
-```env
-BASE_SEPOLIA_RPC_URL=https://sepolia.base.org
-ABT_CONTRACT_ADDRESS=0x...
-BOUNTY_CONTRACT_ADDRESS=0x...
-TREASURY_ADDRESS=0x...
-```
-
-Optional verification (after `--broadcast`):
-
-```bash
-forge script script/Deploy.s.sol --rpc-url "$BASE_SEPOLIA_RPC_URL" --broadcast --verify
-```
-
-### 5. What the backend uses
-
-With **`BASE_SEPOLIA_RPC_URL`** and **`ABT_CONTRACT_ADDRESS`** set, the API will:
-
-- Expose chain config on `GET /blockchain/config`
-- Verify **`AgentBranchToken.depositForAgent`** transactions when registering an agent (`POST /blockchain/register-agent` with `deposit_tx_hash`)
-
-If those variables are unset, blockchain features stay in **mock** mode (no RPC calls).
-
-For a full walkthrough of wallet setup, faucet funding, env configuration, deployment, and UI flow, see [docs/blockchain-setup.md](docs/blockchain-setup.md).
-
----
+Worker commands are allowlisted (no shell chaining). Tunables live under `WORKER_*` in `.env.example`.
 
 ## Backend API
 
-### 1. Configure
+Fastify app in `backend/` — auth, repositories, issues, git jobs, knowledge base, webhooks, optional blockchain.
 
-From the repo root `.env`, set at minimum:
+| Task | Command |
+| ------ | --------- |
+| Dev server | `bun run dev:api` |
+| Production build | `bun run build:backend && bun run start:api` |
+| Migrations (incremental) | `bun run migrate` |
+| Destructive local reset | `bun run migrate -- --full` |
 
-| Variable        | Required            | Notes                                                   |
-| --------------- | ------------------- | ------------------------------------------------------- |
-| `DATABASE_URL`  | Yes (for real data) | Postgres URL, e.g. from `docker compose up -d postgres` |
-| `JWT_SECRET`    | Yes in production   | Long random string                                      |
-| `PORT` / `HOST` | Optional            | Default API: `http://0.0.0.0:3001`                      |
+**Required for real data:** `DATABASE_URL`, `JWT_SECRET` (production).
 
-For **on-chain** agent deposit verification, also set **`BASE_SEPOLIA_RPC_URL`** and **`ABT_CONTRACT_ADDRESS`** as in the blockchain section.
+**GitHub webhooks** (merge/refund): set `GITHUB_WEBHOOK_SECRET` and `GITHUB_WEBHOOK_CALLBACK_URL`, then import a repo via the dashboard. See [docs/github-webhook-testing.md](docs/github-webhook-testing.md).
 
-For **GitHub PR webhooks** (merge/refund), set **`GITHUB_WEBHOOK_SECRET`** and **`GITHUB_WEBHOOK_CALLBACK_URL`**. Linking a GitHub remote and installing the webhook happens only via **`POST /repositories/import-from-github`** (dashboard **Import from GitHub**). See [docs/github-webhook-testing.md](docs/github-webhook-testing.md).
+### Knowledge base
 
-### 2. Install dependencies
+Upload and search repository documents via the API (`/repositories/:repoId/knowledge-base/...`). Ingest is transactional; deletes are soft. Accepted formats: PDF, markdown, plain text, JSON.
 
-From the **repo root**:
+Enable with `KB_RAG_ENABLED` and related `KB_*` variables in [.env.example](.env.example).
 
-```bash
-bun install
-```
+### Issue resolve
 
-### 3. Database migrations
+`POST /repositories/:repoId/issues/:issueId/resolve` enqueues a **single parent git job** that produces one PR. Child issues appear as `child_assignments` (requirements metadata only)—no per-child agent picks or parallel child jobs from resolve.
 
-Ensure Postgres is reachable, then:
+For explicit multi-job fanout, use the git-jobs API directly (`fanout_children`).
 
-```bash
-bun run migrate
-```
+## Blockchain (optional)
 
-By default this applies **incremental** SQL files from `backend/src/db/migrations/`
-(tracked in `schema_migrations`) without dropping existing data. For a local
-destructive reset that replays full `schema.sql`:
+Foundry contracts in `contracts/` (`AgentBranchToken`, `BountyPayment`) deploy to **Base Sepolia**. Without `BASE_SEPOLIA_RPC_URL` and contract addresses, chain features run in mock mode.
+
+Full setup: [docs/blockchain-setup.md](docs/blockchain-setup.md).
 
 ```bash
-bun run migrate -- --full
+cd contracts && forge build && forge test
+# Deploy: see docs/blockchain-setup.md
 ```
-
-Or set `MIGRATE_FULL=1`.
-
-### 4. Run (development)
-
-```bash
-bun run dev:api
-```
-
-API listens on `http://localhost:3001` by default (`GET /health`, `GET /status`).
-
-### 5. Run (production-style)
-
-```bash
-bun run build:backend
-bun run start:api
-```
-
-Use `NODE_ENV=production` and a strong `JWT_SECRET`. Put the API behind HTTPS and restrict `CORS_ORIGIN` to your frontend origin(s).
-
-### 6. Worker (git jobs)
-
-In another process (same `.env`):
-
-```bash
-bun run dev:worker
-```
-
-### 7. Repository Knowledge Base (RAG)
-
-The backend supports repository-scoped user-ingested knowledge documents that are
-retrieved and injected into:
-
-- git job context hints (worker note generation)
-- agent assignment relevance scoring
-- judge prompt context
-
-Documents are scoped to the **repo importer** (`owner_user_id` on upload). Deletes
-are soft (`status = deleted`).
-
-Enable and tune from `.env`:
-
-- `KB_RAG_ENABLED`
-- `KB_MAX_DOCUMENT_BYTES`
-- `KB_CHUNK_SIZE_CHARS`
-- `KB_CHUNK_OVERLAP_CHARS`
-- `KB_RETRIEVAL_TOP_K`
-- `KB_HINT_MAX_SNIPPETS`
-- `KB_HINT_SNIPPET_MAX_CHARS`
-- `KB_ASSIGNMENT_TOP_K`
-- `KB_JUDGE_TOP_K`
-- `KB_JUDGE_SNIPPET_MAX_CHARS`
-- `KB_JUDGE_CONTEXT_MAX_CHARS`
-
-Worker judge gate:
-
-- `WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE`
-
-Repository KB API endpoints (auth required, repository must belong to caller):
-
-- `POST /repositories/:repoId/knowledge-base/documents`
-  - Text ingest: send `content` (plus optional `title`, `filename`, `mime_type`, `metadata`)
-  - PDF ingest: send `mime_type=application/pdf` with `file_base64`
-- `GET /repositories/:repoId/knowledge-base/documents?limit=&offset=`
-- `POST /repositories/:repoId/knowledge-base/search` with `{ "query": "...", "limit": 8 }`
-- `DELETE /repositories/:repoId/knowledge-base/documents/:documentId`
-
-Accepted upload formats in current UI/API flow: `.pdf`, `.md`, `.txt`, `.json`.
-
-### 8. Issue resolve orchestration (single PR)
-
-`POST /repositories/:repoId/issues/:issueId/resolve` always enqueues **one parent
-git job** that produces a single PR. Child issues (new or reused) are included as
-requirements in the job payload (`child_assignments`); they are not assigned
-separate agents or per-child git jobs.
-
-- Child bounty posting during resolve is **disabled**; use the decompose endpoint or
-  parent issue bounty instead.
-- Omitted `allocation_strategy` on decompose defaults to **`difficulty`**.
-- Per-child git job fanout remains available via the **git-jobs** API (`fanout_children`),
-  not via resolve.
-
----
-
-## Local dev (full stack quick path)
-
-```bash
-bun install
-docker compose up -d postgres   # optional
-bun run migrate
-bun run dev:api                   # http://localhost:3001
-bun run dev:frontend              # http://localhost:5173 (see frontend package)
-bun run dev:worker
-```
-
----
 
 ## Docker
 
-- **Postgres only:** `docker compose up -d postgres`
-- **API + worker + web + Postgres:** `docker compose --profile stack up --build`  
-  Point `NEXT_PUBLIC_API_URL` at wherever the browser can reach the API (for real demos, rebuild the `web` image with the public API URL).
-- **GitHub webhooks from localhost:** add profile **`tunnel`** and set `NGROK_AUTHTOKEN` + `GITHUB_WEBHOOK_SECRET` in `.env`, then  
-  `docker compose --profile stack --profile tunnel up --build`  
-  Use **http://localhost:4040** for the public HTTPS URL. Step-by-step: [docs/github-webhook-testing.md](docs/github-webhook-testing.md).
-- **API on host + ngrok CLI:** `bun run tunnel:ngrok` (requires `ngrok` on your `PATH`; forwards to port 3001).
+| Profile | Command |
+| -------- | --------- |
+| Postgres only | `docker compose up -d postgres` |
+| Full stack | `docker compose --profile stack up --build` |
+| + ngrok tunnel | `docker compose --profile stack --profile tunnel up --build` |
 
----
+Set `NEXT_PUBLIC_API_URL` to a URL the browser can reach when using the `web` image. Webhook tunneling: [docs/github-webhook-testing.md](docs/github-webhook-testing.md).
 
-## Layout
+Host-only ngrok: `bun run tunnel:ngrok` (forwards to port 3001).
 
-| Path         | Role                                                                                         |
-| ------------ | -------------------------------------------------------------------------------------------- |
-| `backend/`   | Fastify API (`/health`, `/status`), env validation, `src/db/migrate.ts`, `src/db/schema.sql` |
-| `worker/`    | Thin alias that runs the backend worker script                                               |
-| `frontend/`  | Next.js app (`NEXT_PUBLIC_API_URL`)                                                          |
-| `contracts/` | Foundry: AgentBranchToken, BountyPayment, deploy script (`forge build`, `forge test`)        |
-| `ref/`       | Optional local reference snapshot only — **not** required for builds or deploys              |
+## Testing
 
-## AI agent development
+```bash
+cd backend && bun run test
+cd worker && bun run test
+```
 
-Agent configuration for Cursor and compatible tools:
+## Repository layout
 
-| Layer | Path |
-|-------|------|
-| Entry | [AGENTS.md](AGENTS.md) |
-| Hub (SSOT, workflow, roadmap) | [.cursor/README.md](.cursor/README.md) |
-| Orchestration + invariants | `.cursor/rules/kaizen-orchestration.mdc`, `kaizen-project.mdc` |
-| Package rules | `.cursor/rules/backend.mdc`, `worker.mdc`, `frontend.mdc`, `contracts.mdc` |
-| Skills catalog | [.cursor/skills/README.md](.cursor/skills/README.md) |
-| SWE discipline | [.cursor/instructions/coding-behavior.md](.cursor/instructions/coding-behavior.md) |
+| Path | Role |
+| ------ | ------ |
+| `backend/` | Fastify API, Postgres schema, migrations, webhooks |
+| `worker/` | Git job processor, planner, judge, tool sandbox |
+| `frontend/` | Next.js dashboard |
+| `contracts/` | Foundry — agent deposits and bounty settlement |
+| `docs/` | Webhooks, blockchain, judge design |
 
-Auto skills: `kaizen-triage`, `kaizen-testing`, `kaizen-validate`. Manual: `/worker-roadmap` (`kaizen-worker-roadmap`), `/code-review` (`kaizen-review`). See [Cursor agent best practices](https://cursor.com/blog/agent-best-practices).
+## Documentation
+
+| Topic | Guide |
+| ------- | ------- |
+| GitHub webhooks & ngrok | [docs/github-webhook-testing.md](docs/github-webhook-testing.md) |
+| Base Sepolia & contracts | [docs/blockchain-setup.md](docs/blockchain-setup.md) |
+| Judge rubric & schema | [docs/judge-agent.md](docs/judge-agent.md) |

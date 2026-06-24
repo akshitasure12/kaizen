@@ -763,13 +763,15 @@ export async function generateAutonomousCliPlan(params: {
 export async function generateAutonomousCliRecoveryPlan(params: {
   issueTitle: string;
   issueBody: string;
-  failedPhase: "edit" | "verify" | "fix";
+  failedPhase: "edit" | "verify" | "fix" | "quality_gate";
   failedCommand: string;
   failedExitCode: number | null;
   failedTimedOut: boolean;
   failedBlockedReason: string | null;
   failedStdout: string;
   failedStderr: string;
+  failedLogPath?: string;
+  failedLogSummary?: string;
   previousEditCommands: string[];
   previousFixCommands: string[];
   allowedCommands: string[];
@@ -804,6 +806,8 @@ export async function generateAutonomousCliRecoveryPlan(params: {
     failed_blocked_reason: params.failedBlockedReason,
     failed_stdout_tail: truncateTail(params.failedStdout, 600),
     failed_stderr_tail: truncateTail(params.failedStderr, 1200),
+    ...(params.failedLogPath ? { failed_log_path: params.failedLogPath } : {}),
+    ...(params.failedLogSummary ? { failed_log_summary: params.failedLogSummary } : {}),
     previous_edit_commands: uniqCommands(params.previousEditCommands).slice(0, params.maxCommands),
     previous_fix_commands: uniqCommands(params.previousFixCommands).slice(0, params.maxCommands),
     allowed_commands: params.allowedCommands,

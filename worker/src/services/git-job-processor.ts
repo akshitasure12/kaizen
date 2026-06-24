@@ -20,7 +20,7 @@ import {
   type AutonomousCliPlan,
   type AutonomousCliRecoveryPlan,
 } from "./autonomous-cli-plan";
-import { judgeGitDiffContext, storeJudgement, type Scorecard } from "./judge";
+import { judgeGitDiffContext, passesPrePrJudgeSelfCheck, storeJudgement, type JudgeResult, type Scorecard } from "./judge";
 import {
   executeToolCommand,
   validateToolCommand,
@@ -31,6 +31,21 @@ import {
   sanitizeEditActions,
   type EditAction,
 } from "./edit-actions";
+import {
+  collectEditActionPaths,
+  FileEditStateTracker,
+} from "./file-edit-state";
+import {
+  persistCommandLog,
+  summarizeLogForRecovery,
+} from "./command-log-persistence";
+import { evaluatePostLoopQualityGates, type PostLoopGateResult } from "./post-loop-quality-gates";
+import {
+  buildInitialKaizenPlan,
+  summarizeKaizenPlanPhases,
+  updateKaizenPlanArtifact,
+  writeKaizenPlanArtifact,
+} from "./kaizen-plan-artifact";
 
 interface GitJobRow {
   id: string;
@@ -65,6 +80,8 @@ interface EditLoopSummary {
   probeOnlyVerification?: boolean;
   commandResults: CommandExecutionResult[];
   recoveryPlans: EditLoopRecoverySummary[];
+  lastFailedVerifyLogPath?: string;
+  lastFailedVerifyLogSummary?: string;
 }
 
 interface EditLoopRecoverySummary {
@@ -420,7 +437,7 @@ function isPlaceholderOnlyLine(value: string): boolean {
   return tokens.every((token) => placeholderPatterns.includes(token));
 }
 
-function computeDiffQualityMetrics(diffText: string): DiffQualityMetrics {
+export function computeDiffQualityMetrics(diffText: string): DiffQualityMetrics {
   const lines = diffText.split("\n");
   let addedSubstantiveChars = 0;
   let placeholderLineCount = 0;
@@ -597,6 +614,53 @@ async function validateRequiredArtifactContent(params: {
   }
 
   return { ok: true };
+}
+
+async function evaluatePostLoopGatesForWorkspace(params: {
+  git: SimpleGit;
+  workDir: string;
+  requiredArtifacts: string[];
+  allowNoteOnly: boolean;
+  probeOnlyVerification?: boolean;
+}): Promise<{
+  gateResult: PostLoopGateResult;
+  implementationChanges: string[];
+  diffQuality: DiffQualityMetrics;
+}> {
+  const workspaceStatus = await params.git.status();
+  const changedPaths = workspaceStatus.files.map((file) => file.path);
+  const implementationChanges = changedPaths.filter((value) => value !== "KAIZEN_AGENT.md");
+
+  let artifactCheckOk = true;
+  let artifactCheckReason: string | undefined;
+  if (!params.allowNoteOnly) {
+    const artifactCheck = await validateRequiredArtifactContent({
+      workDir: params.workDir,
+      requiredArtifacts: params.requiredArtifacts,
+      minSubstantiveChars: params.probeOnlyVerification
+        ? env.WORKER_PROBE_ONLY_MIN_ARTIFACT_SUBSTANCE
+        : 24,
+    });
+    artifactCheckOk = artifactCheck.ok;
+    artifactCheckReason = artifactCheck.reason;
+  }
+
+  const preCommitDiffText = (await params.git.diff()) || "";
+  const diffQuality = computeDiffQualityMetrics(preCommitDiffText);
+  const gateResult = evaluatePostLoopQualityGates({
+    workspaceFileCount: workspaceStatus.files.length,
+    implementationFileCount: implementationChanges.length,
+    allowNoteOnly: params.allowNoteOnly,
+    artifactCheckOk,
+    artifactCheckReason,
+    diffQuality,
+    minImplementationFiles: env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED,
+    minSubstantiveChars: env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS,
+    minSubstantiveHunks: env.WORKER_MIN_SUBSTANTIVE_HUNKS,
+    rejectPlaceholderDiffs: env.WORKER_REJECT_PLACEHOLDER_DIFFS,
+  });
+
+  return { gateResult, implementationChanges, diffQuality };
 }
 
 function toStringArray(value: unknown): string[] {
@@ -1231,11 +1295,14 @@ export async function executeEditAction(params: {
   action: EditAction;
   cycle: number;
   workDir: string;
+  fileEditState?: FileEditStateTracker;
+  requireReadBeforeEdit?: boolean;
 }): Promise<CommandExecutionResult> {
   const startedAt = Date.now();
   const relative = params.action.file_path.replace(/\\/g, "/").replace(/^\.\//, "");
   const resolved = path.resolve(params.workDir, relative);
   const rel = path.relative(params.workDir, resolved).replace(/\\/g, "/");
+  const requireReadBeforeEdit = params.requireReadBeforeEdit !== false;
 
   if (!relative || rel.startsWith("../") || path.isAbsolute(relative)) {
     return actionResult({
@@ -1247,9 +1314,43 @@ export async function executeEditAction(params: {
     });
   }
 
+  const assertFileState = async (
+    content: string,
+    mtimeMs: number,
+  ): Promise<CommandExecutionResult | null> => {
+    if (!requireReadBeforeEdit || !params.fileEditState) {
+      return null;
+    }
+    const check = params.fileEditState.assertUnchanged(rel, content, mtimeMs);
+    if (!check.ok) {
+      return actionResult({
+        action: params.action,
+        cycle: params.cycle,
+        startedAt,
+        exitCode: 5,
+        stderr: check.reason,
+      });
+    }
+    return null;
+  };
+
+  const recordAfterWrite = async (content: string): Promise<void> => {
+    if (!params.fileEditState) return;
+    try {
+      const stat = await fs.stat(resolved);
+      params.fileEditState.recordSnapshot(rel, content, stat.mtimeMs);
+    } catch {
+      // noop
+    }
+  };
+
   try {
     if (params.action.type === "replace_text") {
+      const stat = await fs.stat(resolved);
       const source = await fs.readFile(resolved, "utf8");
+      const stale = await assertFileState(source, stat.mtimeMs);
+      if (stale) return stale;
+
       if (params.action.old_string === params.action.new_string) {
         return actionResult({
           action: params.action,
@@ -1290,6 +1391,7 @@ export async function executeEditAction(params: {
 
       if (next !== source) {
         await fs.writeFile(resolved, next, "utf8");
+        await recordAfterWrite(next);
       }
       return actionResult({
         action: params.action,
@@ -1300,7 +1402,11 @@ export async function executeEditAction(params: {
     }
 
     if (params.action.type === "append_text") {
+      const stat = await fs.stat(resolved);
       const source = await fs.readFile(resolved, "utf8");
+      const stale = await assertFileState(source, stat.mtimeMs);
+      if (stale) return stale;
+
       if (source.includes(params.action.content)) {
         return actionResult({
           action: params.action,
@@ -1312,6 +1418,7 @@ export async function executeEditAction(params: {
       }
       const next = `${source.replace(/\s*$/, "")}\n\n${params.action.content}\n`;
       await fs.writeFile(resolved, next, "utf8");
+      await recordAfterWrite(next);
       return actionResult({
         action: params.action,
         cycle: params.cycle,
@@ -1326,8 +1433,13 @@ export async function executeEditAction(params: {
     }
 
     let existing: string | null = null;
+    let existingMtime = 0;
     try {
+      const stat = await fs.stat(resolved);
+      existingMtime = stat.mtimeMs;
       existing = await fs.readFile(resolved, "utf8");
+      const stale = await assertFileState(existing, existingMtime);
+      if (stale) return stale;
     } catch (error) {
       if (!params.action.create_if_missing) {
         throw error;
@@ -1336,6 +1448,7 @@ export async function executeEditAction(params: {
 
     if (existing !== params.action.content) {
       await fs.writeFile(resolved, params.action.content, "utf8");
+      await recordAfterWrite(params.action.content);
     }
 
     return actionResult({
@@ -1359,6 +1472,20 @@ export async function executeEditAction(params: {
   }
 }
 
+export function shouldAttemptVerifyReplan(params: {
+  enableAutonomousRecovery: boolean;
+  replanCountThisCycle: number;
+  replanMaxPerCycle: number;
+  hasFailedVerifyResult: boolean;
+}): boolean {
+  return (
+    params.hasFailedVerifyResult &&
+    params.enableAutonomousRecovery &&
+    params.replanMaxPerCycle > 0 &&
+    params.replanCountThisCycle < params.replanMaxPerCycle
+  );
+}
+
 async function runEditVerifyFixLoop(params: {
   jobId: string;
   workDir: string;
@@ -1370,16 +1497,19 @@ async function runEditVerifyFixLoop(params: {
   autonomousPlan?: ResolvedAutonomousPlan | null;
   enableAutonomousRecovery: boolean;
   leaseToken: string | null;
+  recoveryOnlyEditActions?: EditAction[];
+  recoveryOnlyEditCommands?: string[];
 }): Promise<EditLoopSummary> {
-  const initialEditActions = resolveEditActions(
-    params.payload,
-    params.autonomousPlan?.editActionsV1 ?? [],
-  );
-  const initialEditCommands = resolveEditCommands(
-    params.payload,
-    params.autonomousPlan ? params.autonomousPlan.editCommands : [],
-    params.autonomousPlan?.editActionsV1 ?? [],
-  );
+  const initialEditActions =
+    params.recoveryOnlyEditActions ??
+    resolveEditActions(params.payload, params.autonomousPlan?.editActionsV1 ?? []);
+  const initialEditCommands =
+    params.recoveryOnlyEditCommands ??
+    resolveEditCommands(
+      params.payload,
+      params.autonomousPlan ? params.autonomousPlan.editCommands : [],
+      params.autonomousPlan?.editActionsV1 ?? [],
+    );
   const verifyCommands = resolveVerificationCommands({
     payload: params.payload,
     hintedVerifyCommands: params.hintedVerifyCommands,
@@ -1460,8 +1590,53 @@ async function runEditVerifyFixLoop(params: {
   const editFailureSignatures = new Map<string, number>();
   let recoveryContinuationCount = 0;
   const maxRecoveryContinuations = Math.max(1, Math.min(4, maxCycles));
+  const fileEditState = new FileEditStateTracker();
+  const requireReadBeforeEdit = env.WORKER_REQUIRE_READ_BEFORE_EDIT;
+  let lastFailedVerifyLogPath: string | undefined;
+  let lastFailedVerifyLogSummary: string | undefined;
+
+  const persistToolResultLog = async (
+    result: CommandExecutionResult,
+    phase: string,
+    cycle: number,
+  ): Promise<void> => {
+    if (!env.WORKER_VERIFY_LOG_PERSIST) return;
+    try {
+      const relPath = await persistCommandLog({
+        workDir: params.workDir,
+        cycle,
+        phase,
+        command: result.command,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+      if (
+        phase === "verify" &&
+        (result.blockedReason || result.timedOut || result.exitCode !== 0)
+      ) {
+        const fullText = await fs.readFile(path.join(params.workDir, relPath), "utf8");
+        lastFailedVerifyLogPath = relPath;
+        lastFailedVerifyLogSummary = summarizeLogForRecovery(fullText);
+        await setStage(
+          params.jobId,
+          "editing",
+          { last_verify_log_path: relPath },
+          params.leaseToken,
+        );
+      }
+    } catch {
+      // Log persistence is best-effort.
+    }
+  };
+
+  const finalizeLoopSummary = (summary: Omit<EditLoopSummary, "lastFailedVerifyLogPath" | "lastFailedVerifyLogSummary">): EditLoopSummary => ({
+    ...summary,
+    ...(lastFailedVerifyLogPath ? { lastFailedVerifyLogPath } : {}),
+    ...(lastFailedVerifyLogSummary ? { lastFailedVerifyLogSummary } : {}),
+  });
 
   for (let cycle = 1; cycle <= maxCycles; cycle += 1) {
+    let verifyReplanCountThisCycle = 0;
     await setStage(params.jobId, "editing", {
       edit_loop_cycle: cycle,
       edit_loop_max_cycles: maxCycles,
@@ -1477,11 +1652,17 @@ async function runEditVerifyFixLoop(params: {
       let failedEditResult: CommandExecutionResult | null = null;
 
       if (actionsForCycle.length > 0) {
+        await fileEditState.primeFromDisk(
+          params.workDir,
+          collectEditActionPaths(actionsForCycle),
+        );
         for (const action of actionsForCycle) {
           const result = await executeEditAction({
             action,
             cycle,
             workDir: params.workDir,
+            fileEditState,
+            requireReadBeforeEdit,
           });
           commandResults.push(result);
           await recordToolExecution(params.jobId, result);
@@ -1517,7 +1698,7 @@ async function runEditVerifyFixLoop(params: {
         editFailureSignatures.set(failureSignature, failureCount);
 
         if (cycle >= maxCycles) {
-          return {
+          return finalizeLoopSummary({
             passed: false,
             cycles: cycle,
             editCommands: plannedEditCommands,
@@ -1525,7 +1706,7 @@ async function runEditVerifyFixLoop(params: {
             fixCommands: activeFixCommands,
             commandResults,
             recoveryPlans,
-          };
+          });
         }
 
         let recoveryPlan: AutonomousCliRecoveryPlan | null = null;
@@ -1541,6 +1722,8 @@ async function runEditVerifyFixLoop(params: {
               failedBlockedReason: failedEditResult.blockedReason,
               failedStdout: failedEditResult.stdout,
               failedStderr: failedEditResult.stderr,
+              failedLogPath: lastFailedVerifyLogPath,
+              failedLogSummary: lastFailedVerifyLogSummary,
               previousEditCommands: plannedEditCommands,
               previousFixCommands: activeFixCommands,
               allowedCommands: Array.from(allowedToolCommands.values()).sort(),
@@ -1613,7 +1796,7 @@ async function runEditVerifyFixLoop(params: {
             replacementEditCommands: recoveryEditCommands,
             recoveryFixCommands,
           });
-          return {
+          return finalizeLoopSummary({
             passed: false,
             cycles: cycle,
             editCommands: plannedEditCommands,
@@ -1621,7 +1804,7 @@ async function runEditVerifyFixLoop(params: {
             fixCommands: activeFixCommands,
             commandResults,
             recoveryPlans,
-          };
+          });
         }
 
         if (repairCommands.length > 0) {
@@ -1638,8 +1821,9 @@ async function runEditVerifyFixLoop(params: {
             });
             commandResults.push(fixResult);
             await recordToolExecution(params.jobId, fixResult);
+            await persistToolResultLog(fixResult, "fix", cycle);
             if (fixResult.blockedReason || fixResult.timedOut || fixResult.exitCode !== 0) {
-              return {
+              return finalizeLoopSummary({
                 passed: false,
                 cycles: cycle,
                 editCommands: plannedEditCommands,
@@ -1647,7 +1831,7 @@ async function runEditVerifyFixLoop(params: {
                 fixCommands: activeFixCommands,
                 commandResults,
                 recoveryPlans,
-              };
+              });
             }
           }
         }
@@ -1684,7 +1868,7 @@ async function runEditVerifyFixLoop(params: {
           continue;
         }
 
-        return {
+        return finalizeLoopSummary({
           passed: false,
           cycles: cycle,
           editCommands: plannedEditCommands,
@@ -1692,7 +1876,7 @@ async function runEditVerifyFixLoop(params: {
           fixCommands: activeFixCommands,
           commandResults,
           recoveryPlans,
-        };
+        });
       }
 
       pendingEditActions = [];
@@ -1717,7 +1901,7 @@ async function runEditVerifyFixLoop(params: {
         };
         commandResults.push(gateFailure);
         await recordToolExecution(params.jobId, gateFailure);
-        return {
+        return finalizeLoopSummary({
           passed: false,
           cycles: cycle,
           editActionsV1: plannedEditActions,
@@ -1726,10 +1910,10 @@ async function runEditVerifyFixLoop(params: {
           fixCommands: activeFixCommands,
           commandResults,
           recoveryPlans,
-        };
+        });
       }
 
-      return {
+      return finalizeLoopSummary({
         passed: true,
         cycles: cycle,
         editActionsV1: plannedEditActions,
@@ -1742,7 +1926,7 @@ async function runEditVerifyFixLoop(params: {
         probeOnlyVerification: verifyGateDecision.probeOnlyVerification,
         commandResults,
         recoveryPlans,
-      };
+      });
     }
 
     let cyclePassed = true;
@@ -1751,6 +1935,7 @@ async function runEditVerifyFixLoop(params: {
     );
     let strictChecksExecuted = false;
     let missingArtifactFailure = false;
+    let failedVerifyResult: CommandExecutionResult | null = null;
     for (const command of verifyCommands) {
       const strictCheck = isStrictVerificationCommand(command);
       if (strictCheck) strictChecksExecuted = true;
@@ -1767,6 +1952,7 @@ async function runEditVerifyFixLoop(params: {
       });
       commandResults.push(result);
       await recordToolExecution(params.jobId, result);
+      await persistToolResultLog(result, "verify", cycle);
 
       const failed = result.blockedReason || result.timedOut || result.exitCode !== 0;
       const blockedFailure = Boolean(result.blockedReason);
@@ -1780,6 +1966,7 @@ async function runEditVerifyFixLoop(params: {
 
       if (failed && (blockedFailure || strictCheck || missingArtifact || enforceWithoutStrict)) {
         cyclePassed = false;
+        failedVerifyResult = result;
         break;
       }
     }
@@ -1790,12 +1977,13 @@ async function runEditVerifyFixLoop(params: {
       {
         verify_strict_checks_executed: strictChecksExecuted,
         verify_missing_artifact_failure: missingArtifactFailure,
+        ...(failedVerifyResult ? { verify_replan_count_this_cycle: verifyReplanCountThisCycle } : {}),
       },
       params.leaseToken,
     );
 
     if (cyclePassed) {
-      return {
+      return finalizeLoopSummary({
         passed: true,
         cycles: cycle,
         editActionsV1: plannedEditActions,
@@ -1808,10 +1996,114 @@ async function runEditVerifyFixLoop(params: {
         probeOnlyVerification: verifyGateDecision.probeOnlyVerification,
         commandResults,
         recoveryPlans,
-      };
+      });
     }
 
-    if (cycle >= maxCycles || activeFixCommands.length === 0) {
+    let scheduledRecoveryEdits = false;
+    if (
+      failedVerifyResult &&
+      shouldAttemptVerifyReplan({
+        enableAutonomousRecovery: params.enableAutonomousRecovery,
+        replanCountThisCycle: verifyReplanCountThisCycle,
+        replanMaxPerCycle: env.WORKER_REPLAN_MAX_PER_CYCLE,
+        hasFailedVerifyResult: true,
+      })
+    ) {
+      const verifyFailure = failedVerifyResult;
+      verifyReplanCountThisCycle += 1;
+      let recoveryPlan: AutonomousCliRecoveryPlan | null = null;
+      try {
+        recoveryPlan = await generateAutonomousCliRecoveryPlan({
+          issueTitle: params.issueTitle,
+          issueBody: params.issueBody,
+          failedPhase: "verify",
+          failedCommand: verifyFailure.command,
+          failedExitCode: verifyFailure.exitCode,
+          failedTimedOut: verifyFailure.timedOut,
+          failedBlockedReason: verifyFailure.blockedReason,
+          failedStdout: verifyFailure.stdout,
+          failedStderr: verifyFailure.stderr,
+          failedLogPath: lastFailedVerifyLogPath,
+          failedLogSummary: lastFailedVerifyLogSummary,
+          previousEditCommands: plannedEditCommands,
+          previousFixCommands: activeFixCommands,
+          allowedCommands: Array.from(allowedToolCommands.values()).sort(),
+          maxCommands: env.WORKER_TOOL_MAX_COMMANDS,
+          maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        recoveryPlan = {
+          source: "heuristic",
+          summary: "verify replan failed",
+          error: truncateText(message, 500),
+          editCommands: [],
+          fixCommands: [],
+        };
+      }
+
+      const recoveryEditActions = recoveryPlan?.editActionsV1 ?? [];
+      const recoveryEditCommands = recoveryPlan
+        ? filterExecutableCommands(recoveryPlan.editCommands).slice(0, env.WORKER_TOOL_MAX_COMMANDS)
+        : [];
+      const recoveryFixCommands = recoveryPlan
+        ? filterExecutableCommands(recoveryPlan.fixCommands).slice(0, env.WORKER_TOOL_MAX_COMMANDS)
+        : [];
+
+      if (recoveryPlan) {
+        recoveryPlans.push({
+          cycle,
+          source: recoveryPlan.source,
+          summary: recoveryPlan.summary,
+          ...(recoveryPlan.model ? { model: recoveryPlan.model } : {}),
+          ...(recoveryPlan.error ? { error: recoveryPlan.error } : {}),
+          failedCommand: verifyFailure.command,
+          replacementEditActionsV1: recoveryEditActions,
+          replacementEditCommands: recoveryEditCommands,
+          recoveryFixCommands,
+        });
+      }
+
+      if (recoveryEditActions.length > 0 || recoveryEditCommands.length > 0) {
+        if (recoveryEditActions.length > 0) {
+          plannedEditActions = [...plannedEditActions, ...recoveryEditActions].slice(
+            0,
+            env.WORKER_TOOL_MAX_COMMANDS * 2,
+          );
+          pendingEditActions = recoveryEditActions;
+          pendingEditCommands = [];
+        } else {
+          plannedEditCommands = uniqCommands([
+            ...plannedEditCommands,
+            ...recoveryEditCommands,
+          ]).slice(0, env.WORKER_TOOL_MAX_COMMANDS * 2);
+          pendingEditActions = [];
+          pendingEditCommands = recoveryEditCommands;
+        }
+        scheduledRecoveryEdits = true;
+      }
+
+      if (recoveryFixCommands.length > 0) {
+        activeFixCommands = uniqCommands([...activeFixCommands, ...recoveryFixCommands]).slice(
+          0,
+          env.WORKER_TOOL_MAX_COMMANDS,
+        );
+      }
+
+      await setStage(
+        params.jobId,
+        "editing",
+        {
+          verify_replan_count_this_cycle: verifyReplanCountThisCycle,
+          verify_replan_summary: recoveryPlan?.summary ?? null,
+          verify_replan_scheduled_edits: scheduledRecoveryEdits,
+        },
+        params.leaseToken,
+      );
+    }
+
+    const hasContinuationPath = scheduledRecoveryEdits || activeFixCommands.length > 0;
+    if (cycle >= maxCycles || !hasContinuationPath) {
       break;
     }
 
@@ -1828,8 +2120,9 @@ async function runEditVerifyFixLoop(params: {
       });
       commandResults.push(result);
       await recordToolExecution(params.jobId, result);
+      await persistToolResultLog(result, "fix", cycle);
       if (result.blockedReason || result.timedOut || result.exitCode !== 0) {
-        return {
+        return finalizeLoopSummary({
           passed: false,
           cycles: cycle,
           editActionsV1: plannedEditActions,
@@ -1838,12 +2131,12 @@ async function runEditVerifyFixLoop(params: {
           fixCommands: activeFixCommands,
           commandResults,
           recoveryPlans,
-        };
+        });
       }
     }
   }
 
-  return {
+  return finalizeLoopSummary({
     passed: false,
     cycles: maxCycles,
     editActionsV1: plannedEditActions,
@@ -1852,7 +2145,7 @@ async function runEditVerifyFixLoop(params: {
     fixCommands: activeFixCommands,
     commandResults,
     recoveryPlans,
-  };
+  });
 }
 
 async function commitWorkerMemory(params: {
@@ -2212,6 +2505,45 @@ export async function processGitJobById(jobId: string): Promise<void> {
       }
     }
 
+    let kaizenPlanPath: string | null = null;
+    let kaizenPlanPhases: Array<{ name: string; status: string }> | null = null;
+    if (env.WORKER_KAIZEN_PLAN_ENABLED) {
+      const plannedEditActionsForPlan = resolveEditActions(
+        job.payload,
+        autonomousPlan?.editActionsV1 ?? [],
+      );
+      const plannedEditCommandsForPlan = resolveEditCommands(
+        job.payload,
+        autonomousPlan?.editCommands ?? [],
+        autonomousPlan?.editActionsV1 ?? [],
+      );
+      const plannedVerifyCommandsForPlan = resolveVerificationCommands({
+        payload: job.payload,
+        hintedVerifyCommands,
+        autonomousVerifyCommands: autonomousPlan?.verifyCommands ?? [],
+      });
+      const plannedFixCommandsForPlan = resolveFixCommands(
+        job.payload,
+        autonomousPlan?.fixCommands ?? [],
+      );
+      const kaizenPlan = buildInitialKaizenPlan({
+        issueTitle: issue.title,
+        rankedFiles: (contextHints?.ranked_files || []).map((file) => file.path),
+        rankedTests: (contextHints?.ranked_tests || []).map((test) => test.path),
+        searchTerms: contextHints?.search_terms || [],
+        verifyHints: hintedVerifyCommands,
+        requiredArtifacts,
+        implementSummary: autonomousPlan?.summary,
+        editActionsV1: plannedEditActionsForPlan,
+        editCommands: plannedEditCommandsForPlan,
+        verifyCommands: plannedVerifyCommandsForPlan,
+        fixCommands: plannedFixCommandsForPlan,
+        autonomousPlanSource: autonomousPlan?.source ?? null,
+      });
+      kaizenPlanPath = await writeKaizenPlanArtifact(workDir, kaizenPlan);
+      kaizenPlanPhases = summarizeKaizenPlanPhases(kaizenPlan);
+    }
+
     await setStage(job.id, "editing", {
       context_hint_count: contextHints?.ranked_files.length ?? 0,
       test_hint_count: contextHints?.ranked_tests.length ?? 0,
@@ -2229,6 +2561,12 @@ export async function processGitJobById(jobId: string): Promise<void> {
       autonomous_fix_command_count: autonomousPlan?.fixCommands.length ?? 0,
       required_artifact_count: requiredArtifacts.length,
       required_artifacts: requiredArtifacts,
+      ...(kaizenPlanPath && kaizenPlanPhases
+        ? {
+            kaizen_plan_path: kaizenPlanPath,
+            kaizen_plan_phases: kaizenPlanPhases,
+          }
+        : {}),
     }, job.lease_token);
 
     const strictCandidateCommands = resolveStrictCandidateCommands({
@@ -2297,91 +2635,178 @@ export async function processGitJobById(jobId: string): Promise<void> {
       throw new Error("Edit loop produced no file changes; refusing to open PR with empty diff.");
     }
 
-    const changedPaths = workspaceStatus.files.map((file) => file.path);
-    const implementationChanges = changedPaths.filter((value) => value !== "KAIZEN_AGENT.md");
     const allowNoteOnly = job.payload?.allow_note_only === true;
-    if (!allowNoteOnly && implementationChanges.length === 0) {
-      throw new Error(
-        "No implementation diff detected beyond KAIZEN_AGENT.md. Provide payload.edit_commands or fix commands that modify source files.",
-      );
-    }
+    let editLoopResult = editLoop;
+    let softContinueCount = 0;
+    const softContinueBudget = env.WORKER_POST_GATE_SOFT_CONTINUE;
+    let softContinueUsed = false;
+    let gateEvaluation = await evaluatePostLoopGatesForWorkspace({
+      git,
+      workDir,
+      requiredArtifacts,
+      allowNoteOnly,
+      probeOnlyVerification: editLoopResult.probeOnlyVerification,
+    });
 
-    if (!allowNoteOnly && implementationChanges.length < env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED) {
-      await setStage(job.id, "editing", {
-        quality_gate_failure: "insufficient_implementation_files",
-        implementation_file_count: implementationChanges.length,
-        required_implementation_files: env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED,
-      }, job.lease_token);
-      throw new Error(
-        `Implementation diff touched ${implementationChanges.length} file(s); minimum required is ${env.WORKER_MIN_IMPLEMENTATION_FILES_CHANGED}`,
+    while (!gateEvaluation.gateResult.ok) {
+      const gateFailure = gateEvaluation.gateResult;
+      await setStage(
+        job.id,
+        "editing",
+        {
+          quality_gate_failure: gateFailure.failureType,
+          quality_gate_reason: gateFailure.reason,
+          ...(gateFailure.detail ?? {}),
+        },
+        job.lease_token,
       );
-    }
 
-    if (!allowNoteOnly) {
-      const artifactCheck = await validateRequiredArtifactContent({
+      if (
+        softContinueCount >= softContinueBudget ||
+        !autonomousRecoveryAllowed ||
+        softContinueBudget <= 0
+      ) {
+        throw new Error(gateFailure.reason);
+      }
+
+      let recoveryPlan: AutonomousCliRecoveryPlan | null = null;
+      try {
+        recoveryPlan = await generateAutonomousCliRecoveryPlan({
+          issueTitle: issue.title,
+          issueBody: planningIssueBody,
+          failedPhase: "quality_gate",
+          failedCommand: gateFailure.failureType,
+          failedExitCode: -1,
+          failedTimedOut: false,
+          failedBlockedReason: gateFailure.reason,
+          failedStdout: "",
+          failedStderr: gateFailure.detail
+            ? `${gateFailure.reason}\n${JSON.stringify(gateFailure.detail)}`
+            : gateFailure.reason,
+          failedLogPath: editLoopResult.lastFailedVerifyLogPath,
+          failedLogSummary: editLoopResult.lastFailedVerifyLogSummary,
+          previousEditCommands: editLoopResult.editCommands,
+          previousFixCommands: editLoopResult.fixCommands,
+          allowedCommands: Array.from(allowedToolCommands.values()).sort(),
+          maxCommands: env.WORKER_TOOL_MAX_COMMANDS,
+          maxCommandLength: env.WORKER_COMMAND_MAX_LENGTH,
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Post-loop quality gate failed (${gateFailure.failureType}) and recovery planning failed: ${message}`,
+        );
+      }
+
+      const recoveryEditActions = recoveryPlan.editActionsV1 ?? [];
+      const recoveryEditCommands = filterExecutableCommands(recoveryPlan.editCommands).slice(
+        0,
+        env.WORKER_TOOL_MAX_COMMANDS,
+      );
+      if (recoveryEditActions.length === 0 && recoveryEditCommands.length === 0) {
+        throw new Error(gateFailure.reason);
+      }
+
+      softContinueCount += 1;
+      softContinueUsed = true;
+      await setStage(
+        job.id,
+        "editing",
+        {
+          soft_continue_used: true,
+          soft_continue_count: softContinueCount,
+          soft_continue_recovery_summary: recoveryPlan.summary,
+        },
+        job.lease_token,
+      );
+
+      editLoopResult = await runEditVerifyFixLoop({
+        jobId: job.id,
+        workDir,
+        issueTitle: issue.title,
+        issueBody: planningIssueBody,
+        payload: job.payload,
+        hintedVerifyCommands,
+        strictCandidateCommands,
+        autonomousPlan: null,
+        enableAutonomousRecovery: true,
+        leaseToken: job.lease_token,
+        recoveryOnlyEditActions:
+          recoveryEditActions.length > 0 ? recoveryEditActions : undefined,
+        recoveryOnlyEditCommands:
+          recoveryEditActions.length === 0 ? recoveryEditCommands : undefined,
+      });
+
+      if (!editLoopResult.passed) {
+        const failed = editLoopResult.commandResults.find(
+          (result) => result.blockedReason || result.timedOut || result.exitCode !== 0,
+        );
+        if (failed) {
+          const blocked = failed.blockedReason ? `, blocked_reason=${failed.blockedReason}` : "";
+          throw new Error(
+            `Soft-continue edit/verify loop failed: ${failed.command} (exit=${failed.exitCode}, timed_out=${failed.timedOut}${blocked})`,
+          );
+        }
+        throw new Error("Soft-continue edit/verify loop failed");
+      }
+
+      gateEvaluation = await evaluatePostLoopGatesForWorkspace({
+        git,
         workDir,
         requiredArtifacts,
-        minSubstantiveChars: editLoop.probeOnlyVerification
-          ? env.WORKER_PROBE_ONLY_MIN_ARTIFACT_SUBSTANCE
-          : 24,
+        allowNoteOnly,
+        probeOnlyVerification: editLoopResult.probeOnlyVerification,
       });
-      if (!artifactCheck.ok) {
-        await setStage(job.id, "editing", {
-          quality_gate_failure: "required_artifact_content",
-          quality_gate_reason: artifactCheck.reason,
-        }, job.lease_token);
-        throw new Error(artifactCheck.reason || "Required artifact content check failed");
-      }
     }
 
-    const preCommitDiffText = (await git.diff()) || "";
-    const diffQuality = computeDiffQualityMetrics(preCommitDiffText);
-    if (!allowNoteOnly) {
-      if (diffQuality.addedSubstantiveChars < env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS) {
-        await setStage(job.id, "editing", {
-          quality_gate_failure: "insufficient_substantive_diff",
-          added_substantive_chars: diffQuality.addedSubstantiveChars,
-          required_substantive_chars: env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS,
-          substantive_hunks: diffQuality.substantiveHunks,
-        }, job.lease_token);
-        throw new Error(
-          `Substantive added content ${diffQuality.addedSubstantiveChars} chars is below required ${env.WORKER_MIN_SUBSTANTIVE_ADDED_CHARS}`,
-        );
-      }
+    const { implementationChanges, diffQuality } = gateEvaluation;
 
-      if (diffQuality.substantiveHunks < env.WORKER_MIN_SUBSTANTIVE_HUNKS) {
-        await setStage(job.id, "editing", {
-          quality_gate_failure: "insufficient_substantive_hunks",
-          substantive_hunks: diffQuality.substantiveHunks,
-          required_substantive_hunks: env.WORKER_MIN_SUBSTANTIVE_HUNKS,
-        }, job.lease_token);
-        throw new Error(
-          `Substantive hunk count ${diffQuality.substantiveHunks} is below required ${env.WORKER_MIN_SUBSTANTIVE_HUNKS}`,
-        );
-      }
-
-      if (env.WORKER_REJECT_PLACEHOLDER_DIFFS && diffQuality.placeholderLineCount > 0) {
-        await setStage(job.id, "editing", {
-          quality_gate_failure: "placeholder_detected",
-          placeholder_line_count: diffQuality.placeholderLineCount,
-        }, job.lease_token);
-        throw new Error(
-          `Placeholder content detected in implementation diff (${diffQuality.placeholderLineCount} line(s))`,
-        );
-      }
+    if (env.WORKER_KAIZEN_PLAN_ENABLED && kaizenPlanPath) {
+      await updateKaizenPlanArtifact(workDir, (plan) => ({
+        ...plan,
+        phases: plan.phases.map((phase) =>
+          phase.name === "implement"
+            ? {
+                ...phase,
+                status: editLoopResult.passed ? "completed" : "failed",
+                edit_loop_cycles: editLoopResult.cycles,
+                edit_loop_passed: editLoopResult.passed,
+                edit_actions_v1: editLoopResult.editActionsV1 ?? phase.edit_actions_v1,
+                edit_commands: editLoopResult.editCommands,
+                verify_commands: editLoopResult.verifyCommands,
+                fix_commands: editLoopResult.fixCommands,
+              }
+            : phase,
+        ),
+      }));
+      kaizenPlanPhases = [
+        { name: "explore", status: "completed" },
+        {
+          name: "implement",
+          status: editLoopResult.passed ? "completed" : "failed",
+        },
+      ];
     }
 
     await setStage(job.id, "editing", {
       quality_gate_passed: true,
+      soft_continue_used: softContinueUsed,
+      ...(softContinueUsed ? { soft_continue_count: softContinueCount } : {}),
+      ...(kaizenPlanPath && kaizenPlanPhases
+        ? {
+            kaizen_plan_path: kaizenPlanPath,
+            kaizen_plan_phases: kaizenPlanPhases,
+          }
+        : {}),
       quality_added_substantive_chars: diffQuality.addedSubstantiveChars,
       quality_substantive_hunks: diffQuality.substantiveHunks,
       quality_placeholder_line_count: diffQuality.placeholderLineCount,
       quality_implementation_file_count: implementationChanges.length,
-      quality_strict_verify_count: countStrictVerificationCommands(editLoop.verifyCommands),
-      quality_strict_candidate_count: editLoop.strictCandidateCommands?.length ?? 0,
-      quality_verify_gate_decision: editLoop.verifyGateDecision ?? null,
-      quality_verify_gate_reason: editLoop.verifyGateReason ?? null,
-      quality_probe_only_verification: editLoop.probeOnlyVerification ?? null,
+      quality_strict_verify_count: countStrictVerificationCommands(editLoopResult.verifyCommands),
+      quality_strict_candidate_count: editLoopResult.strictCandidateCommands?.length ?? 0,
+      quality_verify_gate_decision: editLoopResult.verifyGateDecision ?? null,
+      quality_verify_gate_reason: editLoopResult.verifyGateReason ?? null,
+      quality_probe_only_verification: editLoopResult.probeOnlyVerification ?? null,
       quality_required_artifact_count: requiredArtifacts.length,
       quality_required_artifacts: requiredArtifacts,
     }, job.lease_token);
@@ -2389,12 +2814,58 @@ export async function processGitJobById(jobId: string): Promise<void> {
     await setStage(job.id, "committing", { branch_name: branchName }, job.lease_token);
     await git.add(["-A"]);
     await git.commit(`feat: agent implementation for issue (${job.issue_id.slice(0, 8)})`);
+    const committedStatus = await git.status();
     logWorkerEvent("commit_created", {
       job_id: job.id,
       branch_name: branchName,
       dry_run: dryRun,
-      edited_file_count: workspaceStatus.files.length,
+      edited_file_count: committedStatus.files.length,
     });
+
+    const scorecard = (issue.scorecard || {}) as Partial<Scorecard>;
+    let cachedJudgeResult: JudgeResult | null = null;
+    if (env.WORKER_PRE_PR_JUDGE_SELF_CHECK) {
+      const prePrDiffText =
+        (await git.diff([`${base}...HEAD`])) ||
+        (await git.show(["--pretty=format:", "HEAD"])) ||
+        "";
+      cachedJudgeResult = await judgeGitDiffContext({
+        issueTitle: issue.title,
+        issueBody: issue.body || "",
+        diffText: prePrDiffText,
+        scorecard,
+        knowledgeSnippets: contextHints?.knowledge_snippets || [],
+        toolEvidence: editLoopResult.commandResults.map((result) => ({
+          phase: result.phase,
+          command: result.command,
+          exit_code: result.exitCode,
+          timed_out: result.timedOut,
+          blocked_reason: result.blockedReason,
+          stdout_tail: truncateText(result.stdout, 500),
+          stderr_tail: truncateText(result.stderr, 500),
+        })),
+      });
+      const prePrCheck = passesPrePrJudgeSelfCheck({
+        enabled: true,
+        score: cachedJudgeResult.verdict.code_quality_score,
+        minScore: env.WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE,
+      });
+      await setStage(
+        job.id,
+        "judging",
+        {
+          pre_pr_judge_self_check: true,
+          pre_pr_judge_score: cachedJudgeResult.verdict.code_quality_score,
+          pre_pr_judge_passed: prePrCheck.passed,
+          pre_pr_judge_min_score: env.WORKER_JUDGE_MIN_SCORE_FOR_AWAITING_MERGE,
+        },
+        job.lease_token,
+      );
+      if (!prePrCheck.passed) {
+        throw new Error(prePrCheck.reason || "Pre-PR judge self-check failed");
+      }
+      finalJudgeScore = cachedJudgeResult.verdict.code_quality_score;
+    }
 
     if (!dryRun) {
       await setStage(job.id, "pushing", { branch_name: branchName }, job.lease_token);
@@ -2499,23 +2970,24 @@ export async function processGitJobById(jobId: string): Promise<void> {
     await setStage(job.id, "judging", undefined, job.lease_token);
     await heartbeat(job.id, job.lease_token);
 
-    const scorecard = (issue.scorecard || {}) as Partial<Scorecard>;
-    const judgeResult = await judgeGitDiffContext({
-      issueTitle: issue.title,
-      issueBody: issue.body || "",
-      diffText,
-      scorecard,
-      knowledgeSnippets: contextHints?.knowledge_snippets || [],
-      toolEvidence: editLoop.commandResults.map((result) => ({
-        phase: result.phase,
-        command: result.command,
-        exit_code: result.exitCode,
-        timed_out: result.timedOut,
-        blocked_reason: result.blockedReason,
-        stdout_tail: truncateText(result.stdout, 500),
-        stderr_tail: truncateText(result.stderr, 500),
-      })),
-    });
+    const judgeResult =
+      cachedJudgeResult ??
+      (await judgeGitDiffContext({
+        issueTitle: issue.title,
+        issueBody: issue.body || "",
+        diffText,
+        scorecard,
+        knowledgeSnippets: contextHints?.knowledge_snippets || [],
+        toolEvidence: editLoopResult.commandResults.map((result) => ({
+          phase: result.phase,
+          command: result.command,
+          exit_code: result.exitCode,
+          timed_out: result.timedOut,
+          blocked_reason: result.blockedReason,
+          stdout_tail: truncateText(result.stdout, 500),
+          stderr_tail: truncateText(result.stderr, 500),
+        })),
+      }));
 
     logWorkerEvent("judge_completed", {
       job_id: job.id,
@@ -2547,7 +3019,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
         baseBranch: link.default_branch || job.base_branch,
         agentEns,
         autonomousPlan,
-        editLoop,
+        editLoop: editLoopResult,
         diffSummary: {
           changed: diffSummary.changed,
           insertions: diffSummary.insertions,
@@ -2577,8 +3049,8 @@ export async function processGitJobById(jobId: string): Promise<void> {
       }
     }
 
-    const compactLoopResults = editLoop.commandResults.map(compactCommandResult);
-    const failedToolEvidence = editLoop.commandResults
+    const compactLoopResults = editLoopResult.commandResults.map(compactCommandResult);
+    const failedToolEvidence = editLoopResult.commandResults
       .filter((result) => result.blockedReason || result.timedOut || result.exitCode !== 0)
       .map((result) => {
         const note = result.blockedReason
@@ -2623,10 +3095,10 @@ export async function processGitJobById(jobId: string): Promise<void> {
               files: diffSummary.files,
             },
             edit_loop: {
-              passed: editLoop.passed,
-              cycles: editLoop.cycles,
-              verify_commands: editLoop.verifyCommands,
-              fix_commands: editLoop.fixCommands,
+              passed: editLoopResult.passed,
+              cycles: editLoopResult.cycles,
+              verify_commands: editLoopResult.verifyCommands,
+              fix_commands: editLoopResult.fixCommands,
               results: compactLoopResults,
             },
             generated_at: new Date().toISOString(),
@@ -2637,7 +3109,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
         knowledgeContext: {
           decisions: [
             `Judge score ${judgeResult.verdict.code_quality_score}/10`,
-            `Loop cycles ${editLoop.cycles}`,
+            `Loop cycles ${editLoopResult.cycles}`,
           ],
           next_steps:
             judgeResult.verdict.code_quality_score >= 7
@@ -2666,7 +3138,7 @@ export async function processGitJobById(jobId: string): Promise<void> {
             job_id: job.id,
             pr_number: prNumber,
             score: judgeResult.verdict.code_quality_score,
-            edit_loop_cycles: editLoop.cycles,
+            edit_loop_cycles: editLoopResult.cycles,
           },
           tools: [
             {
